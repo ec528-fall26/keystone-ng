@@ -1,6 +1,6 @@
 # EC528 Project — Keystone-NG: OpenStack Identity and Access Management in Rust
 
-**Team:** <names>Kevin Wang, Thinh Nguyen \
+**Team:** <names>Kevin Wang, Thinh Nguyen, Dominic Murphy \
 **Mentor:** Artem Goncharov (OpenStack Keystone) \
 **Project:** <one sentence: what this system does>
 
