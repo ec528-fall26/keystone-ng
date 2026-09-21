@@ -6,8 +6,7 @@ progress is graded against for the rest of the semester — see the
 
 ## 1. Problem
 
-What problem are you solving, and why does it matter? Who has this problem today,
-and what do they do about it now?
+Currently, Openstack Keystone utilizes Python for identiy and authenticaiton fucntionality. While Python has its advantages, introducing modern authentication methods such as OAuth2 and OIDC can be challenging due to sensitive protocls, performance requirments, and integration with existing services. This project aims to explore the Rust programming language as an alternative to address these challenges while still being compatiblity with existing Openstack services. 
 
 OpenStack Keystone is the primary tool for identity verification and access authorization in OpenStack. Keystone is responsible for verifying request into its service including authentication, authorization and the user' scope. As such, it is a critical component of the service as its failure can result in illegitimate user access to cloud resources and accidentally granting access to sensitive information.
 
@@ -18,19 +17,16 @@ A new Rust-based Keystone branched is being developed which aims to be deployed 
 
 ## 2. Proposed design
 
-What are you going to build? Include at least one architecture diagram.
-Call out the design decisions you are making and the alternatives you rejected.
+Our project doesn't have a "design" per se, as the system already exists. Instead, we have a list of features that need to be implemented in Keystone. Each feature will require a different design and implementation approach, depending on the requirements, resources, and technical considerations involved. At the moment, we are planning to work on OAuth 2.0 Client Credentials support. This allows a client to obtain an OAuth 2.0 access token from Keystone and use it to access protected OpenStack service APIs on behalf of a user, without requiring a browser-based login flow for each API interaction. Keystone middleware can then validate the access token and provide the relevant user and authorization context to the OpenStack service.
+
 
 ## 3. What makes this hard
 
-The single most technically difficult part of this project, and why it is not
-solved by wiring existing services together. *(This is what the `challenge`
-criterion is graded on.)*
+As Openstack is an industry level software the difficulty comes from ensure this coding meets the standards for use by not only a multilde of scenarios, companies, and user cases. But also compatible with the variety of Openstack services. Another challenge is correctly implementing security-sensitive protocols. OAuth 2.0 and OIDC involve security critical operations such as token issuance and validation, client authentication, cryptographic verification, expiration handling, scopes, and protection against common authentication attacks. Small implementation errors can have significant consequences, so the implementation must follow protocol specifications and OpenStack's security requirements rather than simply implementing a basic version of the protocol. These functions and protocols must then be peer reviewed and checked by contributors of Openstack, and revelent personnel before implementation.
 
 ## 4. How you will know it worked
 
-The measurements that will show your system does what you claim: what you will
-measure, against what baseline, and what result would count as success.
+
 
 ## 5. Milestones
 
