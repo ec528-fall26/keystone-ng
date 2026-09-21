@@ -57,6 +57,10 @@ Risk 2: Performance bottlenecks with jti caching. Implementing stateful caching 
 
 Mitigation 2: Leverage a fast, lock-free, TTL-based in-memory cache (e.g., Redis or an async Rust equivalent) strictly tailored for short-lived assertions. 
 
+Risk 3: Unclear external-token requirements. Different identity providers may issue different audiences and claims, making a single validation policy unsuitable.
+
+Mitigation 3: Define the supported issuer and token profiles before implementation, and reject tokens that do not satisfy their configured requirements.
+
 ## 7. Sources
 
 https://github.com/openstack-experimental/keystone/issues/945 
