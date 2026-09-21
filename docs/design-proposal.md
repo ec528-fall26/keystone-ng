@@ -48,7 +48,7 @@ and its justification at the demo and you are graded against the revised plan.
 Silently dropping a milestone counts as a miss.*
 
 ## 6. Risks
-
+Token Exchange Part
 Risk 1: Breaking existing validation. Refactoring verify.rs from a hardcoded constant to a per-subject profile might inadvertently break existing Keystone-native app credential flows.   
 
 Mitigation 1: Write extensive regression tests for the current behavior of verify.rs before introducing the dynamic profile, ensuring 100% backward compatibility for internal Keystone tokens.
