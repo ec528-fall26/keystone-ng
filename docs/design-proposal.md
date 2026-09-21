@@ -12,12 +12,12 @@ OpenStack Keystone is the primary tool for identity verification and access auth
 
 The current Python Keystone implementation is reliable and widely used. Nevertheless, it lacks several modern authentication methods as well as being more limited in performance, concurrency and its maintainability from legacy code and dependencies. For future developments, accumulating legacy code debts and redundant dependencies can often be substantial hurdle both for maintaining as well as continued service development.
 
-A new Rust-based Keystone branched is being developed which aims to be deployed side by side with the current Python Keystone, allowing for seamless integration and performance improvements without disrupting the current operational version. The project aims to // IDENTIFY WHICH SPECIFIC GOALS TO TARGET!!!!!
+A new Rust-based Keystone branch is being developed which aims to be deployed side by side with the current Python Keystone, allowing for seamless integration and performance improvements without disrupting the current operational version. The project aims to implement a fully compliant RFC 8693 OAuth 2.0 Token Exchange mechanism within the Rust branch. This will replace the non-compliant method of exchanging external IdP JWTs for Keystone tokens, ensuring secure, standards-based identity federation.
 
 
 ## 2. Proposed design
 
-Our project doesn't have a "design" per se, as the system already exists. Instead, we have a list of features that need to be implemented in Keystone. Each feature will require a different design and implementation approach, depending on the requirements, resources, and technical considerations involved. At the moment, we are planning to work on OAuth 2.0 Client Credentials support. This allows a client to obtain an OAuth 2.0 access token from Keystone and use it to access protected OpenStack service APIs on behalf of a user, without requiring a browser-based login flow for each API interaction. Keystone middleware can then validate the access token and provide the relevant user and authorization context to the OpenStack service.
+Our project doesn't have a "design" per se, as the system already exists. Instead, we have a list of features that need to be implemented in Keystone. Each feature will require a different design and implementation approach, depending on the requirements, resources, and technical considerations involved. At the moment, we are planning to implement the RFC-8693 token exchange. To do this efficiently, we will reuse the existing grant-agnostic mapping engine (authenticate_by_mapping and evaluate_ruleset). The implementation requires adding a new branch on the /token endpoint dispatch that handles grant_type=token-exchange and discriminates based on the subject_token_type being an external JWT (urn:ietf:params:oauth:token-type:jwt) rather than creating a parallel endpoint.   Once the request is routed, the system will verify the external token's signature against a trusted-issuer JWKS. We will then flatten the verified claims into a HashMap, create a new IdentitySource::TokenExchange variant, and pass it through the existing pipeline to hydrate the security context and mint the OpenStack access token identical to every other ingress path. 
 
 
 ## 3. What makes this hard
@@ -26,7 +26,7 @@ As Openstack is an industry level software the difficulty comes from ensure this
 
 ## 4. How you will know it worked
 
-
+We will know it worked when an automated test harness can successfully submit an external IdP JWT (e.g., from Okta or Google) to the Rust Keystone /token endpoint and receive a valid OpenStack access token in exchange. Specifically, the tests must prove that:   The endpoint successfully parses the grant_type=token-exchange and routes the request based on the subject_token_type.   The new validation profile correctly verifies the external JWKS signature and explicitly rejects tokens with invalid audiences or replayed jti claims.   The external claims are successfully mapped to OpenStack roles using the existing evaluate_ruleset and authenticate_by_mapping pipeline. 
 
 ## 5. Milestones
 
