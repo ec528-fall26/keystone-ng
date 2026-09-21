@@ -49,4 +49,16 @@ Silently dropping a milestone counts as a miss.*
 
 ## 6. Risks
 
-What could stop you, and what you will do about it.
+Risk 1: Breaking existing validation. Refactoring verify.rs from a hardcoded constant to a per-subject profile might inadvertently break existing Keystone-native app credential flows.   
+
+Mitigation 1: Write extensive regression tests for the current behavior of verify.rs before introducing the dynamic profile, ensuring 100% backward compatibility for internal Keystone tokens.
+
+Risk 2: Performance bottlenecks with jti caching. Implementing stateful caching for the jti mitigation against replay attacks could introduce high-latency database locks under heavy load.   
+
+Mitigation 2: Leverage a fast, lock-free, TTL-based in-memory cache (e.g., Redis or an async Rust equivalent) strictly tailored for short-lived assertions. 
+
+## 7. Sources
+
+https://github.com/openstack-experimental/keystone/issues/945 
+
+Guidance from https://gemini.google.com/
