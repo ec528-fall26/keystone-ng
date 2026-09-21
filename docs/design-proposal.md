@@ -9,6 +9,13 @@ progress is graded against for the rest of the semester — see the
 What problem are you solving, and why does it matter? Who has this problem today,
 and what do they do about it now?
 
+OpenStack Keystone is the primary tool for identity verification and access authorization in OpenStack. Keystone is responsible for verifying request into its service including authentication, authorization and the user' scope. As such, it is a critical component of the service as its failure can result in illegitimate user access to cloud resources and accidentally granting access to sensitive information.
+
+The current Python Keystone implementation is reliable and widely used. Nevertheless, it lacks several modern authentication methods as well as being more limited in performance, concurrency and its maintainability from legacy code and dependencies. For future developments, accumulating legacy code debts and redundant dependencies can often be substantial hurdle both for maintaining as well as continued service development.
+
+A new Rust-based Keystone branched is being developed which aims to be deployed side by side with the current Python Keystone, allowing for seamless integration and performance improvements without disrupting the current operational version. The project aims to // IDENTIFY WHICH SPECIFIC GOALS TO TARGET!!!!!
+
+
 ## 2. Proposed design
 
 What are you going to build? Include at least one architecture diagram.
