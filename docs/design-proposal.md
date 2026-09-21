@@ -66,3 +66,4 @@ Mitigation 3: Define the supported issuer and token profiles before implementati
 https://github.com/openstack-experimental/keystone/issues/945 
 
 Guidance from https://gemini.google.com/
+Guidance from https://chatgpt.com/
