@@ -12,7 +12,7 @@ OpenStack Keystone is the primary tool for identity verification and access auth
 
 The current Python Keystone implementation is reliable and widely used. Nevertheless, it lacks several modern authentication methods as well as being more limited in performance, concurrency and its maintainability from legacy code and dependencies. For future developments, accumulating legacy code debts and redundant dependencies can often be substantial hurdle both for maintaining as well as continued service development.
 
-A new Rust-based Keystone branched is being developed which aims to be deployed side by side with the current Python Keystone, allowing for seamless integration and performance improvements without disrupting the current operational version. The project aims to mTLS+Webauthn (RFC 8705) authentication method and OAuth2 token exchange functio.
+A new Rust-based Keystone branched is being developed which aims to be deployed side by side with the current Python Keystone, allowing for seamless integration and performance improvements without disrupting the current operational version. The project aims to mTLS+Webauthn (RFC 8705) authentication method and OAuth2 token exchange function.
 
 
 ## 2. Proposed design
