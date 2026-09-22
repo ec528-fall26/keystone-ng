@@ -30,22 +30,13 @@ We will know it worked when an automated test harness can successfully submit an
 
 ## 5. Milestones
 
-**Milestones must be verifiable.** A milestone is verifiable if a reader can tell,
-without asking you, whether it is done. "Improve performance" is not verifiable;
-"end-to-end write latency under 50 ms at 1k req/s, measured by
-`experiments/latency.sh`" is.
-
 | Demo | Date | Milestone | How we will demonstrate it |
 | --- | --- | --- | --- |
-| Demo 2 | 10/21 | | |
-| Demo 2 | 10/21 | | |
-| Demo 3 | 11/16 | | |
-| Demo 3 | 11/16 | | |
-| Final | 12/09 | | |
-
-*You may revise these later — real projects change direction. Announce the change
-and its justification at the demo and you are graded against the revised plan.
-Silently dropping a milestone counts as a miss.*
+| Demo 2 | 10/21 | Endpoint Dispatch & Validation Profile | Unit tests confirming /token correctly routes grant_type=token-exchange, and verify.rs successfully accepts dynamic per-subject validation profiles instead of hardcoded constants |
+| Demo 2 | 10/21 | Signature Verification | Integration test demonstrating successful fetching of an external JWKS and verification of a mock subject_token signature. |
+| Demo 3 | 11/16 | Identity Sourcing & Claims Mapping | Test matrix proving flattened claims bound to IdentitySource::TokenExchange correctly output a minted OpenStack token via evaluate_ruleset. |
+| Demo 3 | 11/16 | Confused-Deputy Mitigation | Test vectors proving external tokens are rejected if they exceed a 300s lifetime, contain the wrong aud, or have a replayed jti. |
+| Final | 12/09 | End-to-End Integration & Doc Amendments | End-to-end integration script generating a mapped token from an external JWT, alongside the submitted ADR 0026 §1 documentation amendment. |
 
 ## 6. Risks
 
