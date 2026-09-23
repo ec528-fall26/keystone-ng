@@ -22,7 +22,7 @@ Our project doesn’t have a traditional “design” phase, as the system alrea
 
 ## 3. What makes this hard
 
-As OpenStack is an industry-level software platform, one of the primary challenges is ensuring that the implementation meets the standards required to support a wide range of scenarios, organizations, and use cases while remaining compatible with OpenStack services. This requires careful consideration of interoperability, maintainability, scalability, and adherence to established OpenStack development practices. Another significant challenge is the correct implementation of security protocols such as OAuth 2.0 and OIDC. These protocols involve security critical operations, including token issuance and validation, client authentication, cryptographic verification, expiration handling, scope management, and protection against common authentication attack; even small implementation errors can have significant security consequences. Therefore, the implementation must strictly follow the relevant protocol specifications and OpenStack's security requirement. Finally, these functions and protocols must undergo thorough peer review and testing by OpenStack contributors and faculty before they can be considered for implementation. This review process ensures that the code is secure, interoperable, maintainable, and consistent with OpenStack's standards and practices.
+As OpenStack is an industry-level software platform, one of the primary challenges is ensuring that the implementation meets the standards required to support a wide range of scenarios, organizations, and use cases while remaining compatible with OpenStack services. This requires careful consideration of interoperability, maintainability, scalability, and adherence to established OpenStack development practices. Another significant challenge is the correct implementation of security protocols such as OAuth 2.0 and OIDC. These protocols involve security critical operations, including token issuance and validation, client authentication, cryptographic verification, expiration handling, scope management, and protection against common authentication attack; as small implementation errors can have significant security consequences. Therefore, the implementation must strictly follow the relevant protocol specifications and OpenStack's security requirement. Finally, these functions and protocols must undergo thorough peer review and testing by OpenStack contributors and faculty before they can be considered for implementation. This review process ensures that the code is secure, interoperable, maintainable, and consistent with OpenStack's standards and practices.
 
 ## 4. How you will know it worked
 
@@ -55,7 +55,7 @@ Mitigation 3: Define the supported issuer and token profiles before implementati
 
 ## 7. Sources
 
-OAuth Token Exchange tracking: https://github.com/openstack-experimental/keystone/issues/945 
+OAuth Token Exchange tracking: https://github.com/openstack-experimental/keystone/issues/945 \
 RFC8693 Spec: https://datatracker.ietf.org/doc/html/rfc8693
 
 Guidance from https://gemini.google.com/
