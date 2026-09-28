@@ -93,6 +93,31 @@ pub struct MintedToken {
     pub public_key_pem: String,
 }
 
+pub struct TestReport {
+    passed: bool,
+}
+
+impl TestReport {
+    pub fn start(test_name: &str) -> Self {
+        let title = test_name.replace('_', " ");
+        println!("\n{}", "=".repeat(72));
+        println!("TEST: {title}");
+        println!("{}", "-".repeat(72));
+        Self { passed: false }
+    }
+
+    pub fn pass(&mut self) {
+        self.passed = true;
+    }
+}
+
+impl Drop for TestReport {
+    fn drop(&mut self) {
+        println!("RESULT: {}", if self.passed { "PASS" } else { "FAIL" });
+        println!("{}", "=".repeat(72));
+    }
+}
+
 impl MintedToken {
     pub fn as_bearer(&self) -> String {
         format!("Bearer {}", self.token)
@@ -110,42 +135,41 @@ impl MintedToken {
     pub fn describe(&self, label: &str) {
         let now = now_secs();
 
-        println!("  [token]  {label}");
-        println!("           iss : {}", self.claims.iss);
+        println!("JWT claims ({label}):");
+        println!("  Issuer: {}", self.claims.iss);
 
         match &self.claims.aud {
-            AudienceClaim::Single(a) => println!("           aud : {a}"),
-            AudienceClaim::Multiple(av) => println!("           aud : {:?}", av),
+            AudienceClaim::Single(a) => println!("  Audience: {a}"),
+            AudienceClaim::Multiple(av) => println!("  Audience: {:?}", av),
         }
 
-        println!("           sub : {}", self.claims.sub);
+        println!("  Subject: {}", self.claims.sub);
 
         match self.claims.exp {
             Some(exp) if exp > now => {
-                println!("           exp : {exp}  (valid, expires in {}s)", exp - now)
+                println!("  Expires: {exp} (valid for {}s)", exp - now)
             }
             Some(exp) => {
-                println!("           exp : {exp}  (expired {}s ago)", now - exp)
+                println!("  Expires: {exp} (expired {}s ago)", now - exp)
             }
-            None => println!("           exp : <absent>  (no expiry claim)"),
+            None => println!("  Expires: <missing>"),
         }
 
-        println!("           iat : {}", self.claims.iat);
+        println!("  Issued at: {}", self.claims.iat);
 
         if self.claims.jti.is_empty() {
-            println!("           jti : <empty string>");
+            println!("  JWT ID: <empty>");
         } else {
-            println!("           jti : {}", self.claims.jti);
+            println!("  JWT ID: {}", self.claims.jti);
         }
 
         if !self.claims.extra.is_empty() {
-            println!("           extra:");
+            println!("  Additional claims:");
             for (k, v) in &self.claims.extra {
-                println!("             {k} : {v}");
+                println!("    {k}: {v}");
             }
         }
-
-        println!("           jwt : <omitted>");
+        println!("  JWT: <omitted>");
     }
 }
 
@@ -342,7 +366,7 @@ mod factory_tests {
 
     #[test]
     fn default_token_passes_full_verification() {
-        println!("\n  -- default_token_passes_full_verification --");
+        let mut report = TestReport::start("default_token_passes_full_verification");
         let minted = MockJwtBuilder::new().mint();
         minted.describe("default token");
 
@@ -361,10 +385,12 @@ mod factory_tests {
         let exp = claims.exp.unwrap();
         println!("  exp valid : {exp} > {}", now_secs());
         assert!(exp > now_secs());
+        report.pass();
     }
 
     #[test]
     fn claim_overrides_are_encoded_in_a_test_key_signed_jwt() {
+        let mut report = TestReport::start("claim_overrides_are_encoded_in_a_test_key_signed_jwt");
         let exp = now_secs() + 600;
         let minted = MockJwtBuilder::new()
             .audience("api://custom")
@@ -397,11 +423,12 @@ mod factory_tests {
         assert_eq!(claims.iss, "https://issuer.example.test");
         assert_eq!(claims.exp, Some(exp));
         assert_eq!(claims.jti, "custom-jti");
+        report.pass();
     }
 
     #[test]
     fn extra_claims_appear_as_top_level_fields() {
-        println!("\n  -- extra_claims_appear_as_top_level_fields --");
+        let mut report = TestReport::start("extra_claims_appear_as_top_level_fields");
         let minted = MockJwtBuilder::new()
             .claim("scp", json!("read:api write:api"))
             .claim("groups", json!(["admins", "developers"]))
@@ -417,11 +444,12 @@ mod factory_tests {
             json!(["admins", "developers"])
         );
         println!("  Both extra claims are present as top-level fields");
+        report.pass();
     }
 
     #[test]
     fn multi_audience_serialises_as_array() {
-        println!("\n  -- multi_audience_serialises_as_array --");
+        let mut report = TestReport::start("multi_audience_serialises_as_array");
         let minted = MockJwtBuilder::new()
             .audiences(vec!["api://default", "api://mobile"])
             .mint();
@@ -435,33 +463,36 @@ mod factory_tests {
             ])
         );
         println!("  aud is serialized as a JSON array");
+        report.pass();
     }
 
     #[test]
     fn expired_token_has_past_exp() {
-        println!("\n  -- expired_token_has_past_exp --");
+        let mut report = TestReport::start("expired_token_has_past_exp");
         let minted = negative_vectors::expired();
         minted.describe("expired token (negative vector)");
 
         let exp = minted.claims.exp.unwrap();
         println!("  exp {} < now {}", exp, now_secs());
         assert!(exp < now_secs());
+        report.pass();
     }
 
     #[test]
     fn no_expiry_token_omits_exp_field() {
-        println!("\n  -- no_expiry_token_omits_exp_field --");
+        let mut report = TestReport::start("no_expiry_token_omits_exp_field");
         let minted = negative_vectors::no_expiry();
         minted.describe("no-expiry token (negative vector)");
 
         println!("  exp field : {:?}", minted.claims.exp);
         assert!(minted.claims.exp.is_none(), "exp should be absent");
         println!("  exp is absent from the payload");
+        report.pass();
     }
 
     #[test]
     fn invalid_signature_token_fails_verification() {
-        println!("\n  -- invalid_signature_token_fails_verification --");
+        let mut report = TestReport::start("invalid_signature_token_fails_verification");
         let minted = negative_vectors::invalid_signature();
         minted.describe("rogue-signed token (negative vector)");
 
@@ -476,10 +507,13 @@ mod factory_tests {
             "Must fail - signed with untrusted rogue key"
         );
         println!("  Rejected as expected");
+        report.pass();
     }
 
     #[test]
     fn signed_negative_claim_vectors_fail_the_expected_validation() {
+        let mut report =
+            TestReport::start("signed_negative_claim_vectors_fail_the_expected_validation");
         let expired = negative_vectors::expired();
         assert!(matches!(
             verify(&expired).unwrap_err().kind(),
@@ -497,19 +531,23 @@ mod factory_tests {
             verify(&wrong_issuer).unwrap_err().kind(),
             ErrorKind::InvalidIssuer
         ));
+        report.pass();
     }
 
     #[test]
     fn empty_jti_vector_remains_signed_and_has_an_empty_claim() {
+        let mut report =
+            TestReport::start("empty_jti_vector_remains_signed_and_has_an_empty_claim");
         let minted = negative_vectors::empty_jti();
         let claims = verify(&minted).expect("Empty jti should not invalidate JWT signature");
 
         assert!(claims.jti.is_empty());
+        report.pass();
     }
 
     #[test]
     fn each_default_token_has_unique_jti() {
-        println!("\n  -- each_default_token_has_unique_jti --");
+        let mut report = TestReport::start("each_default_token_has_unique_jti");
         let a = MockJwtBuilder::new().mint();
         let b = MockJwtBuilder::new().mint();
 
@@ -517,5 +555,6 @@ mod factory_tests {
         println!("  jti B : {}", b.claims.jti);
         assert_ne!(a.claims.jti, b.claims.jti);
         println!("  Each call produces a unique jti");
+        report.pass();
     }
 }
