@@ -1,0 +1,207 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use thiserror::Error;
+
+use openstack_keystone_config::SecurityComplianceError;
+
+use crate::auth::AuthenticationError;
+use crate::credential::CredentialProviderError;
+use crate::error::BuilderError;
+use crate::idmapping::IdMappingProviderError;
+use crate::resource::ResourceProviderError;
+
+/// Identity provider error.
+#[derive(Error, Debug)]
+pub enum IdentityProviderError {
+    /// Authentication error.
+    #[error(transparent)]
+    Authentication {
+        #[from]
+        source: AuthenticationError,
+    },
+
+    /// Conflict.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
+    /// A group membership was requested between a user and a group that live
+    /// in different identity backends. Mirrors python-keystone's
+    /// `CrossBackendNotAllowed` (surfaced as 403).
+    #[error(
+        "cannot add user {user_id} to group {group_id}: they belong to different identity backends"
+    )]
+    CrossBackendNotAllowed {
+        /// The user's public id.
+        user_id: String,
+        /// The group's public id.
+        group_id: String,
+    },
+
+    /// Credential provider error, surfaced when cascading a user deletion
+    /// into `delete_credentials_for_user` (ADR 0019 §3).
+    #[error(transparent)]
+    CredentialProvider {
+        #[from]
+        source: CredentialProviderError,
+    },
+
+    #[error("Date calculation error")]
+    DateError,
+
+    /// Id-mapping provider error, surfaced when a domain-specific-driver
+    /// create/delete cascades into `create_id_mapping`/`delete_id_mapping`.
+    #[error(transparent)]
+    IdMappingProvider {
+        #[from]
+        source: IdMappingProviderError,
+    },
+
+    /// Driver error.
+    #[error("backend driver error: {0}")]
+    Driver(String),
+
+    /// The group has not been found.
+    #[error("group {0} not found")]
+    GroupNotFound(String),
+
+    #[error("{}", source)]
+    Join {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    /// LDAP connection, bind, TLS, or pool acquisition failure (ADR-0027
+    /// §12).
+    #[error("LDAP connection error: {0}")]
+    LdapConnection(String),
+
+    /// LDAP filter construction failure; should not occur with correct
+    /// escaping (ADR-0027 §12).
+    #[error("LDAP filter build error: {0}")]
+    LdapFilterBuild(String),
+
+    #[error("corrupted database entries for user {0}")]
+    MalformedUser(String),
+
+    /// No data for local_user and passwords.
+    #[error("no passwords for the user {0}")]
+    NoPasswordsForUser(String),
+
+    /// Row does not contain password hash.
+    #[error("no passwords hash on the row id: {0}")]
+    NoPasswordHash(String),
+
+    /// No entry in the `user` table for the user.
+    #[error("no entry in the `user` table found for user_id: {0}")]
+    NoMainUserEntry(String),
+
+    /// The operation has no equivalent in the configured backend, e.g.
+    /// expiring group membership or service accounts against an LDAP
+    /// identity backend (ADR-0027 §12).
+    #[error("operation not implemented by backend: {0}")]
+    NotImplemented(String),
+
+    /// Password hashing error.
+    #[error("{}", source)]
+    PasswordHash {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    /// Operation rejected because the configured backend is read-only, e.g.
+    /// any mutation against the LDAP identity backend (ADR-0027 §12).
+    #[error("operation not permitted: backend is read-only ({0})")]
+    Readonly(String),
+
+    /// Resource provider error.
+    #[error(transparent)]
+    ResourceProvider {
+        #[from]
+        source: ResourceProviderError,
+    },
+
+    /// Security compliance validation error.
+    #[error(transparent)]
+    SecurityCompliance(#[from] SecurityComplianceError),
+
+    /// (de)serialization error.
+    #[error("data serialization error")]
+    Serde {
+        #[from]
+        source: serde_json::Error,
+    },
+
+    /// Structures builder error.
+    #[error(transparent)]
+    StructBuilder {
+        /// The source of the error.
+        #[from]
+        source: BuilderError,
+    },
+
+    /// Per-user authentication rate limit exceeded (ADR-0022).
+    ///
+    /// The message deliberately carries no identifying information (no user
+    /// ID, no bucket key) so the 429 response stays uniform across limiters
+    /// (ADR-0022, Invariant 3).
+    #[error("too many requests")]
+    TooManyRequests {
+        /// Seconds the client must wait before retrying (>= 1).
+        retry_after_secs: u64,
+    },
+
+    /// Unsupported driver.
+    #[error("unsupported driver `{0}` for the identity provider")]
+    UnsupportedDriver(String),
+
+    #[error("user id must be given")]
+    UserIdMissing,
+
+    /// User ID or Name with Domain must be specified.
+    #[error("either user id or user name with user domain id or name must be given")]
+    UserIdOrNameWithDomain,
+
+    /// The user has not been found.
+    #[error("user {0} not found")]
+    UserNotFound(String),
+
+    /// Request validation error.
+    #[error("request validation error: {}", source)]
+    Validation {
+        /// The source of the error.
+        #[from]
+        source: validator::ValidationErrors,
+    },
+}
+
+impl IdentityProviderError {
+    pub fn password_hash<E>(source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::PasswordHash {
+            source: Box::new(source),
+        }
+    }
+
+    pub fn join<E>(source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::Join {
+            source: Box::new(source),
+        }
+    }
+}

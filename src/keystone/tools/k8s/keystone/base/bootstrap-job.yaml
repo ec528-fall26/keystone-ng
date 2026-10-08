@@ -1,0 +1,90 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: "keystone-bootstrap"
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      initContainers:
+        - name: db-waiter
+          image: busybox:1.36.1
+          imagePullPolicy: IfNotPresent
+          command: ['sh', '-c', 'echo "Waiting for PostgreSQL to be available..."; while ! nc -z -w 1 $HOST 5432; do echo "Still waiting for postgres-service..."; sleep 2; done; echo "PostgreSQL is available! Starting application."']
+          env:
+            - name: "HOST"
+              valueFrom:
+                secretKeyRef:
+                  key: "host"
+                  name: "keystone-db-app"
+        - env:
+            - name: OS_DATABASE__CONNECTION
+              valueFrom:
+                secretKeyRef:
+                  key: fqdn-uri
+                  name: keystone-db-app
+          image: py-keystone
+          imagePullPolicy: IfNotPresent
+          name: keystone-db-py
+          command: [keystone-manage, db_sync]
+          volumeMounts:
+            - mountPath: /var/log/keystone
+              name: keystone-logs
+            - mountPath: /etc/keystone/keystone.conf
+              name: keystone-config
+              subPath: keystone.conf
+        - env:
+            - name: OS_DATABASE__CONNECTION
+              valueFrom:
+                secretKeyRef:
+                  key: fqdn-uri
+                  name: keystone-db-app
+          image: keystone-rs
+          imagePullPolicy: IfNotPresent
+          name: keystone-db-rs
+          command: [keystone-manage, db, up]
+          volumeMounts:
+            - mountPath: /var/log/keystone
+              name: keystone-logs
+            - mountPath: /etc/keystone/keystone.conf
+              name: keystone-config
+              subPath: keystone.conf
+
+      containers:
+        - env:
+            - name: OS_DATABASE__CONNECTION
+              valueFrom:
+                secretKeyRef:
+                  key: fqdn-uri
+                  name: keystone-db-app
+          image: py-keystone
+          imagePullPolicy: IfNotPresent
+          name: keystone-bootstrap
+          command: [keystone-manage, "bootstrap", "--bootstrap-username", "admin", "--bootstrap-password", "password", "--bootstrap-public-url", "http://keystone-py.local", "--bootstrap-internal-url", "http://keystone-py.default.svc.cluster.local:5000", "--bootstrap-region-id", "RegionOne"]
+          volumeMounts:
+            - mountPath: /var/log/keystone
+              name: keystone-logs
+            - mountPath: /etc/keystone/keystone.conf
+              name: keystone-config
+              subPath: keystone.conf
+            - mountPath: /etc/keystone/fernet-keys
+              name: fernet
+
+      volumes:
+        - name: keystone-logs
+          emptyDir: {}
+        - name: keystone-config
+          configMap:
+            name: "keystone"
+        - name: "fernet"
+          secret:
+            defaultMode: 420
+            optional: false
+            secretName: "fernet-keys"
+            items:
+              - key: "k0"
+                path: "0"
+              - key: "k1"
+                path: "1"
+
+      restartPolicy: "Never"

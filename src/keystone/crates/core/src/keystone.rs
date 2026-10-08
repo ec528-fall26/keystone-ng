@@ -1,0 +1,286 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # Keystone state
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
+use sea_orm::DatabaseConnection;
+use tokio::sync::RwLock;
+use tracing::info;
+
+use cadf::AuditDispatcher;
+use openstack_keystone_auth_plugin_core::{AuthPluginRuntime, EmptyAuthPluginRuntime};
+use openstack_keystone_config::ConfigManager;
+use openstack_keystone_local_emergency_store::{LeaderlessTracker, LocalEmergencyStore};
+use openstack_keystone_storage_api::StorageApi;
+
+use crate::auth_plugin::{CoreHostFunctions, PluginInvocationLimiter};
+use crate::db_state::DbState;
+use crate::error::KeystoneError;
+use crate::events::EventDispatcher;
+use crate::policy::PolicyEnforcer;
+use crate::provider::Provider;
+use crate::rate_limit::RateLimitState;
+
+/// Outcome of a SPIFFE mTLS material freshness check, reported by the
+/// closure installed via [`Service::set_spiffe_health_check`].
+///
+/// Deliberately free of any `spiffe`-crate types: `core` is a
+/// transport-agnostic domain layer and must not depend on that crate (an
+/// infra/transport concern that belongs in `crates/keystone`). The real
+/// closure - built in `crates/keystone/src/bin/keystone.rs` - inspects a
+/// live `spiffe::X509Source` and maps its state down to this enum.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SpiffeHealthStatus {
+    /// The SPIFFE source is open and reports healthy, current material.
+    Ok,
+    /// The SPIFFE source is open but its current SVID/material is stale or
+    /// expired.
+    Warn(String),
+    /// The SPIFFE source itself is unreachable/closed.
+    Error(String),
+}
+
+// Placing ServiceState behind Arc is necessary because several fields below
+// (e.g. `local_emergency_store`, `auth_plugin_registry`) are only
+// interior-mutable, not `Clone`.
+//#[derive(Clone)]
+pub struct Service {
+    /// Config file.
+    pub config_manager: Arc<ConfigManager>,
+
+    /// Hot-swappable database connection handle (see [`DbState`]). The
+    /// active connection is rebuilt in place - without a process restart -
+    /// when `[database] connection` changes across a configuration reload,
+    /// including a Vault-backed value re-resolving to rotated credentials.
+    pub db: DbState,
+
+    /// Policy enforcer.
+    pub policy_enforcer: Arc<dyn PolicyEnforcer>,
+
+    /// Service/resource Provider.
+    pub provider: Provider,
+
+    /// Event dispatcher for inter-provider notifications.
+    pub event_dispatcher: Arc<EventDispatcher>,
+
+    /// Audit dispatcher for fail-closed audit records.
+    pub audit_dispatcher: Arc<AuditDispatcher>,
+
+    /// Distributed storage instance (when configured).
+    pub storage: Option<Arc<dyn StorageApi>>,
+
+    /// Node-local, quorum-bypass emergency write path (ADR 0028).
+    ///
+    /// `None` unless a distributed storage backend was configured and
+    /// `[local_emergency]` is available on this node. Populated
+    /// post-construction (like `core_host_functions` below) since the real
+    /// Fjall-backed store needs the same database handle
+    /// `StateMachineStore` uses, which isn't available until distributed
+    /// storage itself finishes initializing in
+    /// `crates/keystone/src/bin/keystone.rs`.
+    pub local_emergency_store: RwLock<Option<Arc<dyn LocalEmergencyStore>>>,
+
+    /// Tracks how long this node's Raft leader has been unknown, feeding
+    /// the `[local_emergency]` quorum-bypass guardrail (ADR 0028 §1).
+    /// Always present (harmless/unused if `local_emergency_store` is
+    /// `None`) since it carries no state until observations are recorded.
+    pub local_emergency_leaderless_tracker: LeaderlessTracker,
+
+    /// Sliding-window rate limiter for the API Key (SCIM ingress)
+    /// authentication path, keyed on `lookup_hash` (or source IP when the
+    /// presented token fails the format check) (ADR 0021 §6.A).
+    pub api_key_rate_limiter: Arc<DefaultKeyedRateLimiter<String>>,
+
+    /// Sliding-window rate limiter for `POST /v4/oauth2/{domain_id}/token`,
+    /// keyed on the raw, unverified `client_id` string presented in the
+    /// request (ADR 0026 §7.A "Pre-Hash Enforcement") - checked before any
+    /// storage lookup or Argon2id verification. A separate pool from
+    /// `api_key_rate_limiter` above, own tunable blast radius.
+    pub oauth2_token_rate_limiter: Arc<DefaultKeyedRateLimiter<String>>,
+
+    /// Loaded dynamic auth plugins (ADR 0025). Empty (an
+    /// [`EmptyAuthPluginRuntime`]) until `crates/keystone`'s
+    /// `load_auth_plugins` runs post-construction - `CoreHostFunctions`
+    /// needs a `ServiceState`, which doesn't exist until `Service::new`
+    /// returns, so this can't be populated inline here (mirrors how
+    /// `subscribe_event_hooks` wires provider hooks onto an already-`Arc`-
+    /// wrapped `Service` at process startup, in
+    /// `crates/keystone/src/bin/keystone.rs`). A trait object
+    /// (`dyn AuthPluginRuntime`) rather than the concrete, extism-backed
+    /// `WasmPluginRegistry` so this crate never depends on `extism` - only
+    /// `crates/keystone` (which constructs the real registry) does.
+    pub auth_plugin_registry: RwLock<Arc<dyn AuthPluginRuntime>>,
+
+    /// The [`CoreHostFunctions`] instance the dynamic plugin registry above
+    /// was loaded with - kept alongside the registry so dispatch code can
+    /// call [`CoreHostFunctions::verify_handle`] using the *same*
+    /// process-lifetime HMAC key the registry's plugins were loaded with.
+    /// `None` until `load_auth_plugins` runs, same as the registry.
+    pub core_host_functions: RwLock<Option<Arc<CoreHostFunctions>>>,
+
+    /// Rate-limiting state (ADR-0022).
+    ///
+    /// Holds one `governor` keyed limiter per active bucket. `None` fields
+    /// mean the corresponding bucket is disabled in `keystone.conf` and
+    /// requests bypass that check entirely.
+    pub rate_limiters: RateLimitState,
+
+    /// Per-plugin invocation rate/concurrency limiters (ADR 0025 §7), keyed
+    /// by plugin name - populated alongside `auth_plugin_registry` by
+    /// `crates/keystone`'s `load_auth_plugins`, one entry per successfully
+    /// loaded plugin.
+    pub auth_plugin_limiters: RwLock<HashMap<String, Arc<PluginInvocationLimiter>>>,
+
+    /// Type-erased hook used to observe SPIFFE mTLS material freshness for
+    /// the readiness probe (see `crates/keystone/src/api/health.rs`'s
+    /// `SpiffeStatus`).
+    ///
+    /// `core` is a transport-agnostic domain layer and must not depend on
+    /// the `spiffe` crate (that's an infra/transport concern), so this holds
+    /// a plain closure returning [`SpiffeHealthStatus`] - a spiffe-crate-free
+    /// enum - rather than an `Arc<spiffe::X509Source>` directly. `None`
+    /// unless the deployment has SPIFFE mTLS configured on at least one
+    /// interface. Populated post-construction (like `local_emergency_store`
+    /// above) via [`Self::set_spiffe_health_check`] - the real closure,
+    /// which captures a live `spiffe::X509Source`, is built in
+    /// `crates/keystone/src/bin/keystone.rs` once the config is known,
+    /// independent of the per-listener `X509Source` instances each mTLS
+    /// listener builds for itself in
+    /// `crates/keystone/src/server/listener/spiffe_common.rs`. This one
+    /// exists solely to give the health check a live handle it can query
+    /// without touching those listener-owned sources.
+    pub spiffe_health_check: RwLock<Option<Arc<dyn Fn() -> SpiffeHealthStatus + Send + Sync>>>,
+
+    /// Shutdown flag.
+    pub shutdown: bool,
+}
+
+pub type ServiceState = Arc<Service>;
+
+impl Service {
+    /// Creates a new Keystone service instance.
+    ///
+    /// # Parameters
+    /// - `cfg`: The configuration manager for the service.
+    /// - `db`: The database connection.
+    /// - `provider`: The provider for services/resources.
+    /// - `policy_enforcer`: The policy enforcer instance.
+    /// - `audit_dispatcher`: The audit dispatcher for fail-closed audit
+    ///   records.
+    /// - `storage`: Optional distributed storage instance.
+    ///
+    /// # Returns
+    /// - `Ok(Self)` if the service was initialized successfully.
+    /// - `Err(KeystoneError)` if there was an error during initialization.
+    pub async fn new(
+        cfg: Arc<ConfigManager>,
+        db: DatabaseConnection,
+        provider: Provider,
+        policy_enforcer: Arc<dyn PolicyEnforcer>,
+        audit_dispatcher: Arc<AuditDispatcher>,
+        storage: Option<Arc<dyn StorageApi>>,
+    ) -> Result<Self, KeystoneError> {
+        let api_key_cfg = cfg.config.read().await.api_key.clone();
+        let quota = Quota::per_minute(
+            api_key_cfg
+                .rate_limit_replenish_per_minute
+                .try_into()
+                .unwrap_or(std::num::NonZeroU32::MAX),
+        )
+        .allow_burst(
+            api_key_cfg
+                .rate_limit_burst_size
+                .try_into()
+                .unwrap_or(std::num::NonZeroU32::MAX),
+        );
+        let api_key_rate_limiter = Arc::new(RateLimiter::keyed(quota));
+
+        let oauth2_cfg = cfg.config.read().await.oauth2.clone();
+        let oauth2_token_quota = Quota::per_minute(
+            oauth2_cfg
+                .token_rate_limit_replenish_per_minute
+                .try_into()
+                .unwrap_or(std::num::NonZeroU32::MAX),
+        )
+        .allow_burst(
+            oauth2_cfg
+                .token_rate_limit_burst_size
+                .try_into()
+                .unwrap_or(std::num::NonZeroU32::MAX),
+        );
+        let oauth2_token_rate_limiter = Arc::new(RateLimiter::keyed(oauth2_token_quota));
+
+        // Build rate-limiting state from config. Fails fast (Invariant 2) if
+        // any enabled bucket has zero burst or replenish rate.
+        let rate_limiters = {
+            let config = cfg.config.read().await;
+            RateLimitState::from_config(&config)?
+        };
+
+        Ok(Self {
+            config_manager: cfg,
+            provider,
+            event_dispatcher: EventDispatcher::production(),
+            audit_dispatcher,
+            db: DbState::new(db),
+            policy_enforcer,
+            storage,
+            local_emergency_store: RwLock::new(None),
+            local_emergency_leaderless_tracker: LeaderlessTracker::new(),
+            api_key_rate_limiter,
+            oauth2_token_rate_limiter,
+            auth_plugin_registry: RwLock::new(Arc::new(EmptyAuthPluginRuntime)),
+            core_host_functions: RwLock::new(None),
+            rate_limiters,
+            auth_plugin_limiters: RwLock::new(HashMap::new()),
+            spiffe_health_check: RwLock::new(None),
+            shutdown: false,
+        })
+    }
+
+    /// Install the node-local emergency store, once distributed storage has
+    /// finished initializing (ADR 0028). A no-op path (`local_emergency_store`
+    /// stays `None`) if this is never called, e.g. on a node with no
+    /// distributed storage configured.
+    pub async fn set_local_emergency_store(&self, store: Arc<dyn LocalEmergencyStore>) {
+        *self.local_emergency_store.write().await = Some(store);
+    }
+
+    /// Install the SPIFFE health-check hook used by the readiness probe's
+    /// `SpiffeStatus` check. A no-op path (`spiffe_health_check` stays
+    /// `None`) if this is never called, e.g. on a node with no SPIFFE mTLS
+    /// interface configured. The closure is expected to be cheap and
+    /// non-blocking - it's called on every `/health`/`/ready` probe.
+    pub async fn set_spiffe_health_check(
+        &self,
+        check: Arc<dyn Fn() -> SpiffeHealthStatus + Send + Sync>,
+    ) {
+        *self.spiffe_health_check.write().await = Some(check);
+    }
+
+    /// Terminates the Keystone service.
+    ///
+    /// # Returns
+    /// - `Ok(())` upon successful termination.
+    /// - `Err(KeystoneError)` if an error occurred during termination.
+    pub async fn terminate(&self) -> Result<(), KeystoneError> {
+        info!("Terminating Keystone");
+        // Stop the config watcher and, for a Vault-backed configuration,
+        // revoke the Vault token before the process exits.
+        self.config_manager.shutdown().await;
+        Ok(())
+    }
+}

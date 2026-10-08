@@ -1,0 +1,103 @@
+name: OPA policy
+
+on:
+  pull_request:
+    paths:
+      - 'policy/**'
+      - '.github/workflows/policy-container.yml'
+  push:
+    branches: [ "main"]
+  workflow_dispatch: # Allow manual triggering
+
+env:
+  OPA_VERSION: 1.6.0
+  ORAS_VERSION: 1.2.0
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup OPA
+        uses: open-policy-agent/setup-opa@b2b258e089860efaadaaf71bf6e3aecb4a3eeff1 # v2.4.0
+        with:
+          version: ${{ env.OPA_VERSION }}
+
+      - name: Test OPA policies
+        run: opa test policy
+
+      - name: Build policy bundle
+        run: opa build policy --bundle
+
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      id-token: write
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup OPA
+        uses: open-policy-agent/setup-opa@b2b258e089860efaadaaf71bf6e3aecb4a3eeff1 # v2.4.0
+        with:
+          version: ${{ env.OPA_VERSION }}
+
+      - name: Setup ORAS CLI
+        uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3 # v2.0.0
+        with:
+          version: ${{ env.ORAS_VERSION }}
+
+      - name: Setup cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Build policy container
+        run: opa build policy --bundle
+
+      - name: Create empty container config
+        run: echo "{}" > config.json
+
+      - name: Log in to GitHub Container Registry for ORAS
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io --username ${{ github.actor }} --password-stdin
+
+      - name: Push policy
+        run: oras push ghcr.io/${{ github.repository }}/opa-bundle:${{ github.ref_name }},latest --config config.json:application/vnd.oci.image.config.v1+json bundle.tar.gz:application/vnd.oci.image.layer.v1.tar+gzip
+
+      # Gate H (security review V4, issue #984): the running policy is as
+      # security-critical as the binary and should carry the same
+      # provenance bar. Sign by digest (not the mutable `latest`/branch
+      # tags) with cosign keyless signing, reusing the `id-token: write`
+      # permission already granted to this job for OIDC.
+      - name: Resolve pushed bundle digest
+        id: digest
+        run: |
+          digest=$(oras resolve "ghcr.io/${{ github.repository }}/opa-bundle:${{ github.ref_name }}")
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Sign policy bundle (cosign keyless)
+        run: |
+          cosign sign --yes "ghcr.io/${{ github.repository }}/opa-bundle@${{ steps.digest.outputs.digest }}"
+
+      # Prove the signature verifies before the workflow reports success,
+      # so a broken signing setup fails CI instead of silently shipping an
+      # unverifiable bundle. A deployment's OPA loader should run the same
+      # `cosign verify` (pinned to this digest) before serving the bundle.
+      - name: Verify policy bundle signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "ghcr.io/${{ github.repository }}/opa-bundle@${{ steps.digest.outputs.digest }}"

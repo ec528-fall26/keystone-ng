@@ -1,0 +1,625 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Identity providers: list IDP.
+use axum::{
+    Json,
+    extract::{OriginalUri, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use serde_json::json;
+use std::collections::HashSet;
+use validator::Validate;
+
+use openstack_keystone_api_types::PaginationQuery;
+use openstack_keystone_api_types::federation::*;
+use openstack_keystone_core_types::ListPagination;
+use openstack_keystone_core_types::federation::IdentityProviderListParameters as ProviderIdentityProviderListParameters;
+
+use crate::api::{KeystoneApiError, auth::Auth, common::paginate_bidirectional};
+use crate::keystone::ServiceState;
+use openstack_keystone_core::auth::ExecutionContext;
+
+/// List identity providers.
+///
+/// List identity providers. Without any filters only global identity providers
+/// are returned. With the `domain_id` identity providers owned by the specified
+/// identity provider are returned.
+///
+/// It is expected that only global or owned identity providers can be returned,
+/// while an admin user is able to list all providers.
+#[utoipa::path(
+    get,
+    path = "/",
+    operation_id = "/federation/identity_provider:list",
+    params(IdentityProviderListParameters, PaginationQuery),
+    responses(
+        (status = OK, description = "List of identity providers", body = IdentityProviderList),
+        (status = 500, description = "Internal error", example = json!(KeystoneApiError::InternalError(String::from("id = 1"))))
+    ),
+    security(("x-auth" = [])),
+    tag="identity_providers"
+)]
+#[tracing::instrument(
+    name = "api::identity_provider_list",
+    level = "debug",
+    skip(state, user_auth),
+    err(Debug)
+)]
+pub(super) async fn list(
+    Auth(user_auth): Auth,
+    OriginalUri(original_url): OriginalUri,
+    Query(query): Query<IdentityProviderListParameters>,
+    Query(pagination): Query<PaginationQuery>,
+    State(state): State<ServiceState>,
+) -> Result<impl IntoResponse, KeystoneApiError> {
+    query.validate()?;
+    let res = state
+        .policy_enforcer
+        .enforce(
+            "identity/federation/identity_provider/list",
+            &user_auth,
+            json!({"identity_provider": query}),
+            None,
+        )
+        .await?;
+
+    let domain_ids = if query.domain_id.as_ref().is_none() {
+        if !res.can_see_other_domain_resources.is_some_and(|x| x) {
+            //let principal_domain_id =
+            // user_auth.principal().domain_id.clone();
+            let domain_ids: HashSet<Option<String>> = HashSet::from([
+                None,
+                // TODO: perhaps we should first look at the domain_scope and than user domain.
+                user_auth.principal().domain_id(),
+            ]);
+            Some(domain_ids)
+        } else {
+            // User can see other domain's resources and query is empty - leave
+            // it empty
+            None
+        }
+    } else {
+        if user_auth.principal().domain_id() != query.domain_id {
+            return Err(KeystoneApiError::UnauthorizedNoContext);
+        }
+
+        Some(HashSet::from([query.domain_id.clone()]))
+    };
+    // Resolve the effective limit *before* querying, so the backend fetches a
+    // bounded page. Passing the raw `pagination.limit` here let a request with
+    // no `?limit` read the whole table and only truncate afterwards, whenever
+    // a global `[DEFAULT] list_limit` was configured.
+    //
+    // The federation provider has no `list_limit` section of its own, so the
+    // global `[DEFAULT] list_limit`/`max_db_limit` fallbacks apply.
+    let config = state.config_manager.config.read().await;
+    let provider_limit = openstack_keystone_config::ListLimitConfig::default();
+    let limit = config.resolve_list_limit(&provider_limit, pagination.limit);
+
+    let mut provider_list_params = ProviderIdentityProviderListParameters::from(query.clone());
+    provider_list_params.domain_ids = domain_ids;
+    provider_list_params.pagination = ListPagination {
+        limit,
+        marker: pagination.marker.clone(),
+        page_reverse: pagination.page_reverse,
+    };
+
+    let identity_providers: Vec<IdentityProvider> = state
+        .provider
+        .get_federation_provider()
+        .list_identity_providers(
+            &ExecutionContext::from_auth(&state, &user_auth),
+            &provider_list_params,
+        )
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+
+    let (identity_providers, links) = paginate_bidirectional(
+        &config,
+        &provider_limit,
+        identity_providers,
+        &pagination,
+        &original_url,
+    )?;
+    Ok((
+        StatusCode::OK,
+        Json(IdentityProviderList {
+            identity_providers,
+            links,
+        }),
+    )
+        .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use http_body_util::BodyExt; // for `collect`
+    use tower::ServiceExt; // for `call`, `oneshot`, and `ready`
+    use tower_http::trace::TraceLayer;
+    use tracing_test::traced_test;
+
+    use openstack_keystone_core_types::federation as provider_types;
+
+    use super::{super::openapi_router, *};
+    use crate::api::tests::{get_mocked_state, get_mocked_state_with_config, test_fixture_scoped};
+    use crate::federation::MockFederationProvider;
+    use crate::provider::Provider;
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_list() {
+        let mut federation_mock = MockFederationProvider::default();
+        federation_mock
+            .expect_list_identity_providers()
+            .withf(|_, _: &provider_types::IdentityProviderListParameters| true)
+            .returning(|_, _| {
+                Ok(vec![provider_types::IdentityProvider {
+                    id: "id".into(),
+                    name: "name".into(),
+                    domain_id: Some("did".into()),
+                    enabled: true,
+                    default_mapping_name: Some("dummy".into()),
+                    ..Default::default()
+                }])
+            });
+        let vsc = test_fixture_scoped();
+        let state = get_mocked_state(
+            Provider::mocked_builder().mock_federation(federation_mock),
+            true,
+            None,
+        )
+        .await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let res: IdentityProviderList = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            vec![IdentityProvider {
+                id: "id".into(),
+                name: "name".into(),
+                domain_id: Some("did".into()),
+                enabled: true,
+                oidc_discovery_url: None,
+                oidc_client_id: None,
+                oidc_response_mode: None,
+                oidc_response_types: None,
+                jwks_url: None,
+                jwt_validation_pubkeys: None,
+                bound_issuer: None,
+                default_mapping_name: Some("dummy".into()),
+                oidc_scopes: None,
+                allowed_redirect_uris: None,
+                provider_config: None
+            }],
+            res.identity_providers
+        );
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// test listing if forbidden to show IDP of foreign domain when user does
+    /// not have permission to see resources of other domains.
+    async fn test_list_policy_allow_but_other_domain() {
+        let mut federation_mock = MockFederationProvider::default();
+        federation_mock
+            .expect_list_identity_providers()
+            .withf(|_, qp: &provider_types::IdentityProviderListParameters| {
+                provider_types::IdentityProviderListParameters {
+                    name: Some("name".into()),
+                    domain_ids: Some(HashSet::from([Some("did".into())])),
+                    pagination: ListPagination {
+                        limit: Some(20),
+                        marker: None,
+                        page_reverse: false,
+                    },
+                } == *qp
+            })
+            .returning(|_, _| {
+                Ok(vec![provider_types::IdentityProvider {
+                    id: "id".into(),
+                    name: "name".into(),
+                    domain_id: Some("did".into()),
+                    ..Default::default()
+                }])
+            });
+
+        let vsc = test_fixture_scoped();
+
+        let state = get_mocked_state(
+            Provider::mocked_builder().mock_federation(federation_mock),
+            true,
+            Some(false),
+        )
+        .await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/?name=name&limit=20&domain_id=did")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_list_shared_and_own() {
+        let mut federation_mock = MockFederationProvider::default();
+        federation_mock
+            .expect_list_identity_providers()
+            .withf(|_, qp: &provider_types::IdentityProviderListParameters| {
+                provider_types::IdentityProviderListParameters {
+                    name: Some("name".into()),
+                    domain_ids: Some(HashSet::from([None, Some("domain_id".into())])),
+                    pagination: ListPagination {
+                        limit: None,
+                        marker: None,
+                        page_reverse: false,
+                    },
+                } == *qp
+            })
+            .returning(|_, _| {
+                Ok(vec![provider_types::IdentityProvider {
+                    id: "id".into(),
+                    name: "name".into(),
+                    domain_id: Some("did".into()),
+                    ..Default::default()
+                }])
+            });
+
+        let vsc = test_fixture_scoped();
+
+        let state = get_mocked_state(
+            Provider::mocked_builder().mock_federation(federation_mock),
+            true,
+            Some(false),
+        )
+        .await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/?name=name")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let _res: IdentityProviderList = serde_json::from_slice(&body).unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_list_all() {
+        let mut federation_mock = MockFederationProvider::default();
+        federation_mock
+            .expect_list_identity_providers()
+            .withf(|_, qp: &provider_types::IdentityProviderListParameters| {
+                provider_types::IdentityProviderListParameters {
+                    name: Some("name".into()),
+                    domain_ids: Some(HashSet::from([None, Some("domain_id".into())])),
+                    pagination: ListPagination {
+                        limit: None,
+                        marker: None,
+                        page_reverse: false,
+                    },
+                } == *qp
+            })
+            .returning(|_, _| {
+                Ok(vec![provider_types::IdentityProvider {
+                    id: "id".into(),
+                    name: "name".into(),
+                    domain_id: Some("did".into()),
+                    ..Default::default()
+                }])
+            });
+
+        let vsc = test_fixture_scoped();
+
+        let state = get_mocked_state(
+            Provider::mocked_builder().mock_federation(federation_mock),
+            true,
+            Some(false),
+        )
+        .await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/?name=name")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let _res: IdentityProviderList = serde_json::from_slice(&body).unwrap();
+    }
+
+    /// Backend over-fetched (returned `limit + 1 == 2` rows): a `next` link
+    /// must be produced, and the extra row trimmed from the response body.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_list_pagination_link() {
+        let mut federation_mock = MockFederationProvider::default();
+        federation_mock
+            .expect_list_identity_providers()
+            .withf(|_, qp: &provider_types::IdentityProviderListParameters| {
+                provider_types::IdentityProviderListParameters {
+                    domain_ids: Some(HashSet::from([None, Some("domain_id".into())])),
+                    pagination: ListPagination {
+                        limit: Some(1),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                } == *qp
+            })
+            .returning(|_, _| {
+                Ok(vec![
+                    provider_types::IdentityProvider {
+                        id: "id1".into(),
+                        name: "name".into(),
+                        domain_id: Some("did".into()),
+                        ..Default::default()
+                    },
+                    provider_types::IdentityProvider {
+                        id: "id2".into(),
+                        name: "name".into(),
+                        domain_id: Some("did".into()),
+                        ..Default::default()
+                    },
+                ])
+            });
+
+        let vsc = test_fixture_scoped();
+
+        let state = get_mocked_state(
+            Provider::mocked_builder().mock_federation(federation_mock),
+            true,
+            Some(false),
+        )
+        .await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/?limit=1")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let res: IdentityProviderList = serde_json::from_slice(&body).unwrap();
+        assert!(res.links.is_some());
+        assert_eq!(res.identity_providers.len(), 1);
+        assert_eq!(res.identity_providers[0].id, "id1");
+    }
+
+    /// Backend returned exactly `limit` rows (no over-fetched extra row): no
+    /// `next` link should be produced. This is the false-positive this
+    /// design fixes vs the old `returned_count >= limit` heuristic.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_list_pagination_no_false_positive_next() {
+        let mut federation_mock = MockFederationProvider::default();
+        federation_mock
+            .expect_list_identity_providers()
+            .withf(|_, qp: &provider_types::IdentityProviderListParameters| {
+                provider_types::IdentityProviderListParameters {
+                    domain_ids: Some(HashSet::from([None, Some("domain_id".into())])),
+                    pagination: ListPagination {
+                        limit: Some(1),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                } == *qp
+            })
+            .returning(|_, _| {
+                Ok(vec![provider_types::IdentityProvider {
+                    id: "id1".into(),
+                    name: "name".into(),
+                    domain_id: Some("did".into()),
+                    ..Default::default()
+                }])
+            });
+
+        let vsc = test_fixture_scoped();
+
+        let state = get_mocked_state(
+            Provider::mocked_builder().mock_federation(federation_mock),
+            true,
+            Some(false),
+        )
+        .await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/?limit=1")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let res: IdentityProviderList = serde_json::from_slice(&body).unwrap();
+        assert_eq!(res.links, None);
+        assert_eq!(res.identity_providers.len(), 1);
+    }
+
+    /// The backend must receive the *resolved* limit, not the raw request.
+    /// With a global `[DEFAULT] list_limit` and no `?limit`, passing
+    /// `pagination.limit` straight through made the driver read the whole
+    /// table and only truncate afterwards.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_list_backend_gets_global_default_limit() {
+        let mut federation_mock = MockFederationProvider::default();
+        federation_mock
+            .expect_list_identity_providers()
+            .withf(|_, qp: &provider_types::IdentityProviderListParameters| {
+                qp.pagination.limit == Some(7)
+            })
+            .returning(|_, _| Ok(Vec::new()));
+
+        let mut config = openstack_keystone_config::Config::default();
+        config.default.list_limit = Some(7);
+
+        let vsc = test_fixture_scoped();
+        let state = get_mocked_state_with_config(
+            Provider::mocked_builder().mock_federation(federation_mock),
+            true,
+            Some(true),
+            config,
+        )
+        .await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A client `limit` above the global `max_db_limit` is clamped before the
+    /// query, so the driver never over-reads.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_list_backend_limit_clamped_to_max_db_limit() {
+        let mut federation_mock = MockFederationProvider::default();
+        federation_mock
+            .expect_list_identity_providers()
+            .withf(|_, qp: &provider_types::IdentityProviderListParameters| {
+                qp.pagination.limit == Some(3)
+            })
+            .returning(|_, _| Ok(Vec::new()));
+
+        let mut config = openstack_keystone_config::Config::default();
+        config.default.max_db_limit = Some(3);
+
+        let vsc = test_fixture_scoped();
+        let state = get_mocked_state_with_config(
+            Provider::mocked_builder().mock_federation(federation_mock),
+            true,
+            Some(true),
+            config,
+        )
+        .await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/?limit=100")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}

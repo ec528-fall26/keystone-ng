@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+#set -e
+
+echo "USE_RAFT=1" >> "$NEXTEST_ENV"
+# Fixed 256-bit test key for DEV/CI; never use in production.
+echo "KEYSTONE_DEV_KEK=4242424242424242424242424242424242424242424242424242424242424242" >> "$NEXTEST_ENV"
+echo "KEYSTONE_ALLOW_ENV_KEK=1" >> "$NEXTEST_ENV"

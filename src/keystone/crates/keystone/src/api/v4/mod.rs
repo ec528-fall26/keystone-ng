@@ -1,0 +1,121 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! # v4 API.
+
+use axum::{
+    Json,
+    extract::{OriginalUri, Request, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+};
+use utoipa::OpenApi;
+use utoipa_axum::{router::OpenApiRouter, routes};
+
+use crate::api::common::public_base_url;
+use crate::api::error::KeystoneApiError;
+use crate::federation::api as federation;
+use crate::k8s_auth::api as k8s_auth;
+use crate::keystone::ServiceState;
+
+pub mod api_key;
+pub mod auth;
+pub mod auth_plugin;
+pub mod group;
+pub mod mapping;
+pub mod oauth2;
+pub mod role;
+pub mod role_assignment;
+pub mod scim_realm;
+pub mod spiffe;
+pub mod token;
+pub mod user;
+pub mod vendordata;
+
+use crate::api::types::*;
+
+/// OpenApi specification for v4.
+#[derive(OpenApi)]
+#[openapi(
+    nest(
+      (path = "api-keys", api = api_key::ApiDoc),
+      (path = "auth_plugins", api = auth_plugin::ApiDoc),
+      (path = "federation", api = federation::ApiDoc),
+      (path = "k8s_auth", api = k8s_auth::ApiDoc),
+      (path = "mappings", api = mapping::ApiDoc),
+      (path = "oauth2", api = oauth2::ApiDoc),
+      (path = "scim_realms", api = scim_realm::ApiDoc),
+      (path = "spiffe", api = spiffe::ApiDoc),
+      (path = "tokens", api = token::ApiDoc),
+      (path = "users", api = user::ApiDoc),
+      (path = "vendordata", api = vendordata::ApiDoc),
+    ),
+)]
+pub struct ApiDoc;
+
+pub(super) fn openapi_router() -> OpenApiRouter<ServiceState> {
+    OpenApiRouter::new()
+        .nest("/api-keys", api_key::openapi_router())
+        .nest("/auth", auth::openapi_router())
+        .nest("/auth_plugins", auth_plugin::openapi_router())
+        .nest("/groups", group::openapi_router())
+        .nest("/mappings", mapping::openapi_router())
+        .nest("/oauth2", oauth2::openapi_router())
+        .nest("/federation", federation::openapi_router())
+        .nest("/k8s_auth", k8s_auth::openapi_router())
+        .nest("/roles", role::openapi_router())
+        .nest("/scim_realms", scim_realm::openapi_router())
+        .nest("/spiffe", spiffe::openapi_router())
+        .nest("/tokens", token::openapi_router())
+        .nest("/users", user::openapi_router())
+        .nest("/vendordata", vendordata::openapi_router())
+        // The role assignment sub-routes register absolute paths
+        // (`/role_assignments`, `/projects/…`, `/system/…`), so they are
+        // merged rather than nested — the same wiring as `api::v3`. Nesting
+        // them under `/role_assignments` would prefix those absolute paths
+        // and yield `/v4/role_assignments/role_assignments`.
+        .merge(role_assignment::openapi_router())
+        .routes(routes!(version))
+}
+
+/// Version discovery endpoint
+#[utoipa::path(
+    get,
+    path = "/",
+    description = "Version discovery",
+    responses(
+        (status = OK, description = "Versions", body = SingleVersion),
+    ),
+    tag = "version"
+)]
+async fn version(
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    State(state): State<ServiceState>,
+    _req: Request,
+) -> Result<impl IntoResponse, KeystoneApiError> {
+    let host = public_base_url(&state, &headers).await;
+    let link = Link {
+        rel: "self".into(),
+        href: format!("{}{}", host, uri.path()),
+    };
+    let version = VersionBuilder::default()
+        .id("v4.0")
+        .status(VersionStatus::Stable)
+        .links(vec![link])
+        .media_types(vec![MediaType::default()])
+        .build()?;
+    let res = SingleVersion { version };
+    Ok((StatusCode::OK, Json(res)).into_response())
+}

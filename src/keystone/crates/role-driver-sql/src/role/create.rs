@@ -1,0 +1,177 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use sea_orm::DatabaseConnection;
+use sea_orm::entity::*;
+
+use openstack_keystone_core::error::DbContextExt;
+use openstack_keystone_core::role::RoleProviderError;
+use openstack_keystone_core_types::role::{Role, RoleCreate};
+
+use crate::entity::role as db_role;
+
+/// Create a new role.
+///
+/// # Parameters
+/// - `db`: The database connection.
+/// - `role`: The role creation parameters.
+///
+/// # Returns
+/// A `Result` containing the created `Role`, or an `Error`.
+pub async fn create(db: &DatabaseConnection, role: RoleCreate) -> Result<Role, RoleProviderError> {
+    let options = role.options.clone().unwrap_or_default();
+    let mut created: Role = TryInto::<db_role::ActiveModel>::try_into(role)?
+        .insert(db)
+        .await
+        .context("creating role")?
+        .try_into()?;
+    crate::role_option::upsert(db, created.id.clone(), &options).await?;
+    created.options = options;
+    Ok(created)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use serde_json::json;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_create() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![db_role::Model {
+                id: "role-123".into(),
+                domain_id: "default".into(),
+                name: "Test Role".into(),
+                description: Some("A role for testing".into()),
+                extra: Some(r#"{"key":"value"}"#.into()),
+            }]])
+            .into_connection();
+
+        let role_create = RoleCreate {
+            id: Some("role-123".to_string()),
+            name: "Test Role".to_string(),
+            domain_id: Some("default".to_string()),
+            description: Some("A role for testing".to_string()),
+            extra: HashMap::from([("key".into(), json!("value"))]),
+            options: None,
+        };
+
+        let created = create(&db, role_create).await.unwrap();
+
+        assert_eq!(created.id, "role-123");
+        assert_eq!(created.name, "Test Role");
+        assert_eq!(created.domain_id.as_deref(), Some("default"));
+        assert_eq!(created.description.as_deref(), Some("A role for testing"));
+        assert_eq!(*created.extra.get("key").unwrap(), json!("value"));
+    }
+
+    #[tokio::test]
+    async fn test_create_without_domain() {
+        // When domain_id is None, NULL_DOMAIN_ID should be used
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![db_role::Model {
+                id: "role-1".into(),
+                domain_id: super::super::NULL_DOMAIN_ID.into(),
+                name: "Global Role".into(),
+                description: None,
+                extra: None,
+            }]])
+            .into_connection();
+
+        let role_create = RoleCreate {
+            id: Some("role-1".to_string()),
+            name: "Global Role".to_string(),
+            domain_id: None, // ← No domain
+            description: None,
+            extra: HashMap::new(),
+            options: None,
+        };
+
+        let created = create(&db, role_create).await.unwrap();
+
+        assert_eq!(created.name, "Global Role");
+        // domain_id should be None in the returned Role (because TryFrom
+        // filters NULL_DOMAIN_ID)
+        assert_eq!(created.domain_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_create_with_extra() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![db_role::Model {
+                id: "role-with-extra".into(),
+                domain_id: "default".into(),
+                name: "Role With Extra".into(),
+                description: None,
+                extra: Some(r#"{"custom":"data","count":42}"#.into()),
+            }]])
+            .into_connection();
+
+        let role_create = RoleCreate {
+            id: Some("role-with-extra".to_string()),
+            name: "Role With Extra".to_string(),
+            domain_id: Some("default".to_string()),
+            description: None,
+            extra: HashMap::from([
+                ("custom".into(), json!("data")),
+                ("count".into(), json!(42)),
+            ]),
+            options: None,
+        };
+
+        let created = create(&db, role_create).await.unwrap();
+
+        assert_eq!(created.name, "Role With Extra");
+        assert_eq!(*created.extra.get("custom").unwrap(), json!("data"));
+        assert_eq!(*created.extra.get("count").unwrap(), json!(42));
+    }
+
+    #[tokio::test]
+    async fn test_create_with_immutable_option() {
+        use openstack_keystone_core_types::role::RoleOptions;
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![db_role::Model {
+                id: "role-1".into(),
+                domain_id: "default".into(),
+                name: "admin".into(),
+                description: None,
+                extra: None,
+            }]])
+            .append_query_results([vec![crate::entity::role_option::Model {
+                role_id: "role-1".into(),
+                option_id: "IMMU".into(),
+                option_value: Some("true".into()),
+            }]])
+            .into_connection();
+
+        let role_create = RoleCreate {
+            id: Some("role-1".to_string()),
+            name: "admin".to_string(),
+            domain_id: Some("default".to_string()),
+            description: None,
+            extra: HashMap::new(),
+            options: Some(RoleOptions {
+                immutable: Some(true),
+            }),
+        };
+
+        let created = create(&db, role_create).await.unwrap();
+        assert_eq!(created.options.immutable, Some(true));
+    }
+}

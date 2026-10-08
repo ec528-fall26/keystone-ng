@@ -1,0 +1,436 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # Common API helpers
+use openstack_keystone_core_types::auth::ScopeInfo;
+use serde::Serialize;
+use url::Url;
+
+use openstack_keystone_api_types::Link;
+use openstack_keystone_api_types::error::KeystoneApiError;
+use openstack_keystone_api_types::scope::{ProjectBuilder, ScopeProject};
+use openstack_keystone_config::Config;
+use openstack_keystone_core_types::resource::{Domain, Project};
+use openstack_keystone_core_types::scope::Scope as ProviderScope;
+
+use crate::auth::ExecutionContext;
+use crate::keystone::ServiceState;
+
+/// Get the scope [ProjectBuilder] for the given Project.
+///
+/// # Arguments
+/// * `state` - The service state
+/// * `project` - The project to get info for
+/// * `user_domain` - The user's domain
+///
+/// # Returns
+/// * `Result<ProjectBuilder, KeystoneApiError>` - The project builder
+#[allow(dead_code)]
+pub(super) async fn get_project_info_scope_builder(
+    state: &ServiceState,
+    project: &Project,
+    user_domain: &Domain,
+) -> Result<ProjectBuilder, KeystoneApiError> {
+    let mut project_response = ProjectBuilder::default();
+    project_response.id(project.id.clone());
+    project_response.name(project.name.clone());
+    if project.domain_id == user_domain.id {
+        project_response.domain(user_domain.clone());
+    } else {
+        let project_domain = get_domain(state, Some(&project.domain_id), None::<&str>).await?;
+        project_response.domain(project_domain.clone());
+    }
+    Ok(project_response)
+}
+
+/// Get the domain by ID or Name.
+///
+/// # Arguments
+/// * `state` - The service state
+/// * `id` - The domain ID
+/// * `name` - The domain name
+///
+/// # Returns
+/// * `Result<Domain, KeystoneApiError>` - The domain object
+pub async fn get_domain<I: AsRef<str>, N: AsRef<str>>(
+    state: &ServiceState,
+    id: Option<I>,
+    name: Option<N>,
+) -> Result<Domain, KeystoneApiError> {
+    if let Some(did) = &id {
+        let exec = ExecutionContext::internal(state);
+        state
+            .provider
+            .get_resource_provider()
+            .get_domain(&exec, did.as_ref())
+            .await?
+            .ok_or_else(|| KeystoneApiError::NotFound {
+                resource: "domain".into(),
+                identifier: did.as_ref().to_string(),
+            })
+    } else if let Some(name) = &name {
+        let exec = ExecutionContext::internal(state);
+        state
+            .provider
+            .get_resource_provider()
+            .find_domain_by_name(&exec, name.as_ref())
+            .await?
+            .ok_or_else(|| KeystoneApiError::NotFound {
+                resource: "domain".into(),
+                identifier: name.as_ref().to_string(),
+            })
+    } else {
+        Err(KeystoneApiError::DomainIdOrName)
+    }
+}
+
+/// Find the project referred in the scope.
+///
+/// # Arguments
+/// * `state` - The service state.
+/// * `scope` - The scope to find the project.
+///
+/// # Returns
+/// * `Result<Option<Project>, KeystoneApiError>` - The resolved project or None
+///   if not found
+pub async fn find_project_from_scope(
+    state: &ServiceState,
+    scope: &ScopeProject,
+) -> Result<Option<Project>, KeystoneApiError> {
+    let project = if let Some(pid) = &scope.id {
+        let exec = ExecutionContext::internal(state);
+        state
+            .provider
+            .get_resource_provider()
+            .get_project(&exec, pid)
+            .await?
+    } else if let Some(name) = &scope.name {
+        if let Some(domain) = &scope.domain {
+            let exec = ExecutionContext::internal(state);
+            let domain_id = match &domain.id {
+                Some(id) => id.clone(),
+                None => {
+                    state
+                        .provider
+                        .get_resource_provider()
+                        .find_domain_by_name(
+                            &exec,
+                            &domain
+                                .name
+                                .clone()
+                                .ok_or(KeystoneApiError::DomainIdOrName)?,
+                        )
+                        .await?
+                        .ok_or(KeystoneApiError::NotFound {
+                            resource: "domain".to_string(),
+                            identifier: domain
+                                .name
+                                .clone()
+                                .ok_or(KeystoneApiError::DomainIdOrName)?,
+                        })?
+                        .id
+                }
+            };
+            state
+                .provider
+                .get_resource_provider()
+                .get_project_by_name(&exec, name, &domain_id)
+                .await?
+        } else {
+            return Err(KeystoneApiError::ProjectDomain);
+        }
+    } else {
+        return Err(KeystoneApiError::ProjectIdOrName);
+    };
+    Ok(project)
+}
+
+/// Convert [ProviderScope] to [ScopeInfo].
+///
+/// # Arguments
+/// * `state`: The service state
+/// * `scope`: The scope to extract the scope information from
+///
+/// # Returns
+/// * `Ok(ScopeInfo)`: The scope information
+/// * `Err(KeystoneApiError)`: An error if the scope is not valid
+#[tracing::instrument(name = "auth.get_authz_info", level = "debug", skip(state), err)]
+pub async fn get_authz_info(
+    state: &ServiceState,
+    scope: Option<&ProviderScope>,
+) -> Result<ScopeInfo, KeystoneApiError> {
+    let authz_scope = match scope {
+        Some(ProviderScope::Project(scope)) => {
+            if let Some(project) = find_project_from_scope(state, &scope.into()).await? {
+                let domain_id = project.domain_id.clone();
+                ScopeInfo::Project {
+                    project,
+                    project_domain: get_domain(state, Some(&domain_id), None::<&str>).await?,
+                }
+            } else {
+                return Err(KeystoneApiError::UnauthorizedNoContext);
+            }
+        }
+        Some(ProviderScope::Domain(scope)) => {
+            if let Ok(domain) = get_domain(state, scope.id.as_ref(), scope.name.as_ref()).await {
+                ScopeInfo::Domain(domain)
+            } else {
+                return Err(KeystoneApiError::UnauthorizedNoContext);
+            }
+        }
+        Some(ProviderScope::System(_scope)) => ScopeInfo::System("system".into()),
+        // TODO: Trust scope should be handled here
+        Some(ProviderScope::Unscoped) => ScopeInfo::Unscoped,
+        None => ScopeInfo::Unscoped,
+    };
+    authz_scope.validate()?;
+
+    Ok(authz_scope)
+}
+
+/// Prepare the links for the paginated resource collection.
+///
+/// # Arguments
+/// * `config` - The service configuration
+/// * `data` - The slice of resources to paginate
+/// * `query` - The pagination query parameters
+/// * `collection_url` - The URL of the collection
+///
+/// # Returns
+/// * `Result<Option<Vec<Link>>, KeystoneApiError>` - The pagination links if
+///   applicable
+pub fn build_pagination_links<T, Q>(
+    config: &Config,
+    data: &[T],
+    query: &Q,
+    collection_url: &str,
+) -> Result<Option<Vec<Link>>, KeystoneApiError>
+where
+    T: ResourceIdentifier,
+    Q: QueryParameterPagination + Clone + Serialize,
+{
+    Ok(match &query.get_limit() {
+        Some(limit) => {
+            if (data.len() as u64) >= *limit
+                && let Some(last_id) = data.last().map(|x| x.get_id())
+            {
+                let mut url = if let Some(pe) = &config.default.public_endpoint {
+                    pe.clone()
+                } else {
+                    Url::parse("http://localhost")?
+                };
+                url.set_path(collection_url);
+                let mut new_query = query.clone();
+
+                new_query.set_marker(last_id);
+                url.set_query(Some(&serde_urlencoded::to_string(&new_query)?));
+
+                let next_page_url = format!(
+                    "{}{}",
+                    url.path(),
+                    url.query().map(|q| format!("?{}", q)).unwrap_or_default()
+                );
+                Some(vec![Link {
+                    rel: String::from("next"),
+                    href: next_page_url,
+                }])
+            } else {
+                None
+            }
+        }
+        None => None,
+    })
+}
+
+/// Resource query parameters pagination extension trait.
+pub trait QueryParameterPagination {
+    /// Get the page limit.
+    ///
+    /// # Returns
+    /// * `Option<u64>` - The page limit if set.
+    fn get_limit(&self) -> Option<u64>;
+    /// Set the pagination marker.
+    ///
+    /// # Arguments
+    /// * `marker` - The marker to set.
+    ///
+    /// # Returns
+    /// * `&mut Self` - A mutable reference to the trait implementor.
+    fn set_marker(&mut self, marker: String) -> &mut Self;
+}
+
+/// Trait for the resource to expose the unique identifier that can be used for
+/// building the marker pagination.
+pub trait ResourceIdentifier {
+    /// Get the unique resource identifier.
+    ///
+    /// # Returns
+    /// * `String` - The unique identifier of the resource.
+    fn get_id(&self) -> String;
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use openstack_keystone_config::Config;
+    use openstack_keystone_core_types::resource::Domain;
+
+    use super::*;
+    use crate::api::tests::get_mocked_state;
+    use crate::provider::Provider;
+    use crate::resource::MockResourceProvider;
+
+    #[tokio::test]
+    async fn test_get_domain() {
+        let mut resource_mock = MockResourceProvider::default();
+        resource_mock
+            .expect_get_domain()
+            .withf(|_, id: &'_ str| id == "domain_id")
+            .returning(|_, _| {
+                Ok(Some(Domain {
+                    id: "domain_id".into(),
+                    name: "domain_name".into(),
+                    ..Default::default()
+                }))
+            });
+        resource_mock
+            .expect_find_domain_by_name()
+            .withf(|_, id: &'_ str| id == "domain_name")
+            .returning(|_, _| {
+                Ok(Some(Domain {
+                    id: "domain_id".into(),
+                    name: "domain_name".into(),
+                    ..Default::default()
+                }))
+            });
+
+        let state = get_mocked_state(
+            Provider::mocked_builder().mock_resource(resource_mock),
+            true,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            "domain_id",
+            get_domain(&state, Some("domain_id"), None::<&str>)
+                .await
+                .unwrap()
+                .id
+        );
+        assert_eq!(
+            "domain_id",
+            get_domain(&state, None::<&str>, Some("domain_name"))
+                .await
+                .unwrap()
+                .id
+        );
+        assert_eq!(
+            "domain_id",
+            get_domain(&state, Some("domain_id"), Some("other_domain_name"))
+                .await
+                .unwrap()
+                .id
+        );
+        match get_domain(&state, None::<&str>, None::<&str>).await {
+            Err(KeystoneApiError::DomainIdOrName) => {}
+            _ => {
+                panic!("wrong result");
+            }
+        }
+    }
+
+    /// Fake resource for pagination testing.
+    struct FakeResource {
+        pub id: String,
+    }
+
+    /// Fake query params for pagination testing.
+    #[derive(Clone, Default, Serialize)]
+    struct FakeQueryParams {
+        pub marker: Option<String>,
+        pub limit: Option<u64>,
+    }
+
+    impl ResourceIdentifier for FakeResource {
+        fn get_id(&self) -> String {
+            self.id.clone()
+        }
+    }
+
+    impl QueryParameterPagination for FakeQueryParams {
+        fn get_limit(&self) -> Option<u64> {
+            self.limit
+        }
+
+        fn set_marker(&mut self, marker: String) -> &mut Self {
+            self.marker = Some(marker);
+            self
+        }
+    }
+
+    /// Parameterized pagination test
+    #[rstest]
+    #[case(5, FakeQueryParams::default(), None)]
+    #[case(5, FakeQueryParams{marker: Some("x".into()), limit: None}, None)]
+    #[case(5, FakeQueryParams{marker: Some("x".into()), limit: Some(6)}, None)]
+    #[case(5, FakeQueryParams{marker: Some("x".into()), limit: Some(5)}, Some(vec![
+        Link {
+            rel: "next".into(),
+            href: "/foo/bar?marker=4&limit=5".into()
+        }])
+    )]
+    #[case(5, FakeQueryParams{marker: Some("x".into()), limit: Some(3)}, Some(vec![
+        Link {
+            rel: "next".into(),
+            href: "/foo/bar?marker=4&limit=3".into()
+        }])
+    )]
+    #[case(5, FakeQueryParams{marker: Some("x".into()), limit: Some(1)}, Some(vec![
+        Link {
+            rel: "next".into(),
+            href: "/foo/bar?marker=4&limit=1".into()
+        }])
+    )]
+    #[case(5, FakeQueryParams{marker: Some("x".into()), limit: Some(0)}, Some(vec![
+        Link {
+            rel: "next".into(),
+            href: "/foo/bar?marker=4&limit=0".into()
+        }])
+    )]
+    #[case(0, FakeQueryParams{marker: Some("x".into()), limit: Some(6)}, None)]
+    #[case(0, FakeQueryParams{marker: None, limit: Some(6)}, None)]
+    #[case(5, FakeQueryParams{marker: None, limit: Some(5)}, Some(vec![
+        Link {
+            rel: "next".into(),
+            href: "/foo/bar?marker=4&limit=5".into()
+        }])
+    )]
+    fn test_pagination(
+        #[case] cnt: usize,
+        #[case] query: FakeQueryParams,
+        #[case] expected: Option<Vec<Link>>,
+    ) {
+        assert_eq!(
+            build_pagination_links(
+                &Config::default(),
+                Vec::from_iter((0..cnt).map(|x| FakeResource { id: x.to_string() })).as_slice(),
+                &query,
+                "foo/bar",
+            )
+            .unwrap(),
+            expected
+        );
+    }
+}

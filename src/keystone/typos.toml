@@ -1,0 +1,65 @@
+[files]
+extend-exclude = ["loadtest", "doc/**/mermaid.*js", "doc/html/**/*"]
+ignore-hidden = true
+ignore-files = true
+ignore-dot = true
+ignore-vcs = true
+ignore-global = true
+ignore-parent = true
+
+[default]
+binary = false
+check-filename = true
+check-file = true
+unicode = true
+ignore-hex = true
+identifier-leading-digits = false
+locale = "en"
+extend-ignore-identifiers-re = []
+extend-ignore-words-re = []
+extend-ignore-re = []
+
+[default.extend-identifiers]
+
+[default.extend-words]
+ro = "ro"
+ratatui = "ratatui"
+wrk = "wrk"
+
+[type.rust]
+extend-glob = []
+extend-ignore-identifiers-re = ["INSERT", "DELETE", "SIEM", "JOIN"]
+extend-ignore-words-re = ["udid", "typ"]
+extend-ignore-re = [
+  "gAA.*\\b",
+  "TEST_JWK_N.*[A-Za-z0-9+/=_-]{20,}",
+]
+
+[type.rust.extend-identifiers]
+flate2 = "flate2"
+wher = "wher"
+rule_ba = "rule_ba"
+
+[type.rust.extend-words]
+ro = "ro"
+ser = "ser"
+mis = "mis"
+COSE = "COSE"
+BA = "BA"
+UE = "UE"
+
+[type.lock]
+extend-glob = []
+check-file = false
+extend-ignore-identifiers-re = []
+extend-ignore-words-re = []
+extend-ignore-re = []
+
+[type.lock.extend-identifiers]
+
+[type.lock.extend-words]
+
+[type.js]
+
+[type.md]
+extend-ignore-identifiers-re = ["HashiCorp", "SIEM", "mis"]

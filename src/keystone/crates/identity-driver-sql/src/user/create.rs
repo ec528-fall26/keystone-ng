@@ -1,0 +1,469 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use chrono::{DateTime, Utc};
+use sea_orm::DatabaseConnection;
+use sea_orm::entity::*;
+use sea_orm::{ConnectionTrait, TransactionTrait};
+use uuid::Uuid;
+
+use openstack_keystone_config::Config;
+use openstack_keystone_core::error::DbContextExt;
+use openstack_keystone_core::identity::{IdentityProviderError, get_user_last_active_at};
+use openstack_keystone_core_types::identity::*;
+
+use crate::entity::{federated_user as db_federated_user, user as db_user};
+use crate::federated_user::MergeFederatedUserData;
+use crate::local_user::MergeLocalUserData;
+use crate::nonlocal_user::MergeNonlocalUserData;
+use crate::password::MergePasswordData;
+use crate::user::MergeUserData;
+
+use crate::federated_user;
+use crate::local_user;
+use crate::nonlocal_user;
+use crate::password;
+use crate::user_option;
+
+impl db_user::ActiveModel {
+    /// Create an active model for the user.
+    ///
+    /// # Parameters
+    /// - `user`: The user creation request.
+    /// - `config`: The system configuration.
+    /// - `created_at`: The creation date.
+    ///
+    /// # Returns
+    /// A `Result` containing the active model, or an `Error`.
+    fn from_user_create(
+        user: &UserCreate,
+        config: &Config,
+        created_at: Option<DateTime<Utc>>,
+    ) -> Result<Self, IdentityProviderError> {
+        let created_at = created_at.unwrap_or_else(Utc::now).naive_utc();
+
+        Ok(Self {
+            id: Set(user
+                .id
+                .clone()
+                .unwrap_or(Uuid::new_v4().simple().to_string())),
+            enabled: Set(Some(user.enabled.unwrap_or(true))),
+            extra: Set(Some(serde_json::to_string(&user.extra)?)),
+            default_project_id: user
+                .default_project_id
+                .clone()
+                .map(Set)
+                .unwrap_or(NotSet)
+                .into(),
+            // Set last_active to now if compliance disabling is on
+            last_active_at: get_user_last_active_at(config, user.enabled, created_at)
+                .map(Set)
+                .unwrap_or(NotSet)
+                .into(),
+            created_at: Set(Some(created_at)),
+            domain_id: Set(user.domain_id.clone().ok_or_else(|| {
+                IdentityProviderError::Driver(
+                    "domain_id must be resolved before persisting a user".into(),
+                )
+            })?),
+        })
+    }
+}
+
+/// Create the main user record.
+///
+/// # Parameters
+/// - `conf`: The system configuration.
+/// - `db`: The database connection.
+/// - `user`: The user creation request.
+/// - `created_at`: The creation date.
+///
+/// # Returns
+/// A `Result` containing the created `db_user::Model` if successful, or an
+/// `Error`.
+pub async fn create_main<C>(
+    conf: &Config,
+    db: &C,
+    user: &UserCreate,
+    created_at: Option<DateTime<Utc>>,
+) -> Result<db_user::Model, IdentityProviderError>
+where
+    C: ConnectionTrait,
+{
+    Ok(
+        db_user::ActiveModel::from_user_create(user, conf, created_at)?
+            // user
+            // .to_user_active_model(conf, created_at)?
+            .insert(db)
+            .await
+            .context("inserting user entry")?,
+    )
+}
+
+/// Create a new user.
+///
+/// # Parameters
+/// - `conf`: The system configuration.
+/// - `db`: The database connection.
+/// - `user`: The user creation request.
+///
+/// # Returns
+/// A `Result` containing the `UserResponse` if successful, or an `Error`.
+pub async fn create(
+    conf: &Config,
+    db: &DatabaseConnection,
+    user: UserCreate,
+) -> Result<UserResponse, IdentityProviderError> {
+    // Do a lot of stuff in a transaction
+
+    let txn = db
+        .begin()
+        .await
+        .context("starting transaction for persisting user")?;
+
+    let now = Utc::now();
+    let main_user = create_main(conf, &txn, &user, Some(now)).await?;
+    if let Some(opts) = &user.options {
+        // Persist user options when passed
+        user_option::create(&txn, main_user.id.clone(), opts).await?;
+    }
+
+    let mut response_builder = UserResponseBuilder::default();
+    response_builder.merge_user_data(
+        &main_user,
+        user.options.as_ref().unwrap_or(&UserOptions::default()),
+        None,
+    );
+
+    if let Some(federation_data) = &user.federated {
+        let mut federated_entities: Vec<db_federated_user::Model> = Vec::new();
+        for federated_user in federation_data {
+            if federated_user.protocols.is_empty() {
+                federated_entities.push(
+                    federated_user::create(
+                        &txn,
+                        db_federated_user::ActiveModel {
+                            id: NotSet,
+                            user_id: Set(main_user.id.clone()),
+                            idp_id: Set(federated_user.idp_id.clone()),
+                            protocol_id: Set("oidc".into()),
+                            unique_id: Set(federated_user.unique_id.clone()),
+                            display_name: Set(Some(user.name.clone())),
+                        },
+                    )
+                    .await?,
+                );
+            } else {
+                for proto in &federated_user.protocols {
+                    //for proto in &federated_user.protocol_ids {
+                    federated_entities.push(
+                        federated_user::create(
+                            &txn,
+                            db_federated_user::ActiveModel {
+                                id: NotSet,
+                                user_id: Set(main_user.id.clone()),
+                                idp_id: Set(federated_user.idp_id.clone()),
+                                protocol_id: Set(proto.protocol_id.clone()),
+                                unique_id: Set(federated_user.unique_id.clone()),
+                                display_name: Set(Some(user.name.clone())),
+                            },
+                        )
+                        .await?,
+                    );
+                }
+            }
+        }
+        response_builder.merge_federated_user_data(federated_entities);
+    } else if user.user_type == UserType::NonLocal {
+        if user.password.is_some() {
+            return Err(IdentityProviderError::Conflict(
+                "password cannot be set on a nonlocal (externally managed) user".to_string(),
+            ));
+        }
+        let nonlocal_user = nonlocal_user::create(&txn, &main_user, user.name.clone()).await?;
+        response_builder.merge_nonlocal_user_data(&nonlocal_user);
+    } else {
+        let local_user = local_user::create(conf, &txn, &main_user, &user).await?;
+        response_builder.merge_local_user_data(&local_user);
+
+        if let Some(password) = &user.password {
+            password::set_new_password(&txn, conf, local_user.id, password.clone(), Vec::new())
+                .await?;
+            response_builder.merge_passwords_data(password::list(&txn, local_user.id).await?);
+        }
+    }
+
+    txn.commit()
+        .await
+        .context("committing the user creation transaction")?;
+
+    Ok(response_builder.build()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::{DatabaseBackend, MockDatabase, Transaction};
+
+    use openstack_keystone_config::Config;
+    use openstack_keystone_core_types::identity::{
+        UserCreateBuilder, {FederationBuilder, FederationProtocol},
+    };
+
+    use super::*;
+
+    use crate::{
+        federated_user::tests::get_federated_user_mock, local_user::tests::get_local_user_mock,
+        nonlocal_user::tests::get_nonlocal_user_mock, password::tests::get_password_mock,
+        user::tests::get_user_mock,
+    };
+
+    #[test]
+    fn test_active_record_from_user_create() {
+        let now = Utc::now();
+        let req = UserCreateBuilder::default()
+            .default_project_id("dpid")
+            .domain_id("did")
+            .id("1")
+            .name("foo")
+            .enabled(true)
+            .build()
+            .unwrap();
+        let cfg = Config::default();
+        let sot = db_user::ActiveModel::from_user_create(&req, &cfg, Some(now)).unwrap(); //at)req.to_user_active_model(&cfg, Some(now)).unwrap();
+        assert_eq!(sot.default_project_id, Set(Some("dpid".into())));
+        assert_eq!(sot.domain_id, Set("did".into()));
+        assert_eq!(sot.enabled, Set(Some(true)));
+        assert_eq!(sot.extra, Set(Some("{}".into())));
+        assert_eq!(sot.id, Set("1".into()));
+        assert_eq!(sot.last_active_at, NotSet);
+    }
+
+    #[test]
+    fn test_active_record_from_user_create_track_user_activity() {
+        let now = Utc::now();
+        let req = UserCreateBuilder::default()
+            .domain_id("did")
+            .id("1")
+            .name("foo")
+            .enabled(true)
+            .build()
+            .unwrap();
+        let mut cfg = Config::default();
+        cfg.security_compliance.disable_user_account_days_inactive = Some(1);
+        let sot = db_user::ActiveModel::from_user_create(&req, &cfg, Some(now)).unwrap(); //at)req.to_user_active_model(&cfg, Some(now)).unwrap();
+        assert_eq!(sot.last_active_at, Set(Some(now.naive_utc().date())));
+    }
+
+    #[tokio::test]
+    async fn test_create_main() {
+        let sot_db_res = db_user::Model {
+            id: "1".into(),
+            domain_id: "did".into(),
+            enabled: Some(true),
+            ..Default::default()
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![sot_db_res.clone()]])
+            .into_connection();
+
+        let now = Utc::now();
+        let req = UserCreateBuilder::default()
+            .default_project_id("dpid")
+            .domain_id("did")
+            .id("1")
+            .name("foo")
+            .enabled(true)
+            .build()
+            .unwrap();
+        assert_eq!(
+            create_main(&Config::default(), &db, &req, Some(now))
+                .await
+                .unwrap(),
+            sot_db_res
+        );
+        assert_eq!(
+            db.into_transaction_log(),
+            [Transaction::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"INSERT INTO "user" ("created_at", "default_project_id", "domain_id", "enabled", "extra", "id") VALUES ($1, $2, $3, $4, $5, $6) RETURNING "created_at", "default_project_id", "domain_id", "enabled", "extra", "id", "last_active_at""#,
+                [
+                    now.naive_utc().into(),
+                    "dpid".into(),
+                    "did".into(),
+                    true.into(),
+                    "{}".into(),
+                    "1".into(),
+                ]
+            ),]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_main_disable_inactivity_tracking() {
+        let sot_db_res = db_user::Model {
+            id: "1".into(),
+            domain_id: "did".into(),
+            enabled: Some(true),
+            ..Default::default()
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![sot_db_res.clone()]])
+            .into_connection();
+
+        let now = Utc::now();
+        let req = UserCreateBuilder::default()
+            .default_project_id("dpid")
+            .domain_id("did")
+            .id("1")
+            .name("foo")
+            .enabled(true)
+            .build()
+            .unwrap();
+        let mut cfg = Config::default();
+        cfg.security_compliance.disable_user_account_days_inactive = Some(1);
+        assert_eq!(
+            create_main(&cfg, &db, &req, Some(now)).await.unwrap(),
+            sot_db_res
+        );
+        assert_eq!(
+            db.into_transaction_log(),
+            [Transaction::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"INSERT INTO "user" ("created_at", "default_project_id", "domain_id", "enabled", "extra", "id", "last_active_at") VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING "created_at", "default_project_id", "domain_id", "enabled", "extra", "id", "last_active_at""#,
+                [
+                    now.naive_utc().into(),
+                    "dpid".into(),
+                    "did".into(),
+                    true.into(),
+                    "{}".into(),
+                    "1".into(),
+                    now.naive_utc().date().into(),
+                ]
+            ),]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_federated() {
+        let user_opts = UserOptions {
+            ignore_password_expiry: Some(true),
+            ..Default::default()
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![get_user_mock("1")]])
+            .append_query_results([vec![crate::entity::user_option::Model {
+                user_id: "1".into(),
+                option_id: "1001".into(),
+                option_value: Some("true".into()),
+            }]])
+            .append_query_results([vec![get_federated_user_mock("1")]])
+            .into_connection();
+        let mut federation_data = FederationBuilder::default();
+        federation_data
+            .idp_id("idp_id")
+            .unique_id("unique_id")
+            .protocols(vec![FederationProtocol {
+                protocol_id: "oidc".into(),
+                unique_id: "unique_id".into(),
+            }]);
+        let req = UserCreateBuilder::default()
+            .default_project_id("dpid")
+            .domain_id("did")
+            .id("1")
+            .name("foo")
+            .enabled(true)
+            .federated(vec![federation_data.build().unwrap()])
+            .options(user_opts.clone())
+            .build()
+            .unwrap();
+        let sot = create(&Config::default(), &db, req).await.unwrap();
+        assert_eq!(sot.name, "foo");
+        assert_eq!(sot.options, user_opts);
+    }
+
+    #[tokio::test]
+    async fn test_create_local() {
+        let user_opts = UserOptions {
+            ignore_password_expiry: Some(true),
+            ..Default::default()
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Transaction queries:
+            // 1. Insert main user record
+            .append_query_results([vec![get_user_mock("1")]])
+            // 2. Insert user option (ignore_password_expiry)
+            .append_query_results([vec![crate::entity::user_option::Model {
+                user_id: "1".into(),
+                option_id: "1001".into(),
+                option_value: Some("true".into()),
+            }]])
+            // 3. Insert local_user record
+            .append_query_results([vec![get_local_user_mock("1")]])
+            // 4. password::set_new_password with Vec::new() -> no expire, no delete just insert new
+            //    password record
+            .append_query_results([vec![get_password_mock(1)]])
+            // 5. password::list after set_new_password
+            .append_query_results([vec![get_password_mock(1)]])
+            .into_connection();
+        let req = UserCreateBuilder::default()
+            .default_project_id("dpid")
+            .domain_id("did")
+            .id("1")
+            .name("foo")
+            .enabled(true)
+            .password("foobar")
+            .options(user_opts.clone())
+            .build()
+            .unwrap();
+        let sot = create(&Config::default(), &db, req).await.unwrap();
+        assert_eq!(sot.name, "foo_domain");
+        assert_eq!(sot.options, user_opts);
+    }
+
+    #[tokio::test]
+    async fn test_create_nonlocal() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![get_user_mock("1")]])
+            .append_query_results([vec![get_nonlocal_user_mock("1")]])
+            .into_connection();
+        let req = UserCreateBuilder::default()
+            .domain_id("did")
+            .id("1")
+            .name("foo")
+            .enabled(true)
+            .user_type(UserType::NonLocal)
+            .build()
+            .unwrap();
+        let sot = create(&Config::default(), &db, req).await.unwrap();
+        assert_eq!(sot.name, "foo");
+    }
+
+    #[tokio::test]
+    async fn test_create_nonlocal_rejects_password() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![get_user_mock("1")]])
+            .into_connection();
+        let req = UserCreateBuilder::default()
+            .domain_id("did")
+            .id("1")
+            .name("foo")
+            .enabled(true)
+            .user_type(UserType::NonLocal)
+            .password("hunter2")
+            .build()
+            .unwrap();
+        let result = create(&Config::default(), &db, req).await;
+        assert!(matches!(result, Err(IdentityProviderError::Conflict(_))));
+    }
+}

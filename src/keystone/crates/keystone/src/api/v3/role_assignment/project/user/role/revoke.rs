@@ -1,0 +1,487 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Project user role: delete.
+
+use axum::{
+    extract::{Path, Request, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use serde_json::{Value, json};
+use tracing::info;
+
+use crate::api::auth::Auth;
+use crate::api::error::KeystoneApiError;
+use crate::keystone::ServiceState;
+use openstack_keystone_core::auth::ExecutionContext;
+use openstack_keystone_core_types::assignment::{AssignmentBuilder, AssignmentType};
+
+/// Revoke role from user on project
+///
+/// Remove a role assignment for a user on a specific project.
+#[utoipa::path(
+    delete,
+    path = "/projects/{project_id}/users/{user_id}/roles/{role_id}",
+    operation_id = "/project/user/role:delete",
+    params(
+        ("role_id" = String, Path, description = "The role ID."),
+        ("project_id" = String, Path, description = "The project ID."),
+        ("user_id" = String, Path, description = "The user ID."),
+    ),
+    responses(
+        (status = 204, description = "Role revoked successfully"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Grant not found", example = json!(KeystoneApiError::NotFound(String::from("id = 1"))))
+    ),
+    security(
+        ("X-Auth-Token" = [])),
+    tag="role_assignments"
+)]
+#[tracing::instrument(
+    name = "api::v3::project_user_role_revoke",
+    level = "debug",
+    skip(state, user_auth),
+    err(Debug)
+)]
+
+pub(super) async fn revoke(
+    Auth(user_auth): Auth,
+    Path((project_id, user_id, role_id)): Path<(String, String, String)>,
+    State(state): State<ServiceState>,
+    request: Request,
+) -> Result<impl IntoResponse, KeystoneApiError> {
+    let inherited = request.uri().path().contains("inherited_to_projects");
+    let exec = &ExecutionContext::from_auth(&state, &user_auth);
+    // Use join instead of try_join to have more constant latency preventing
+    // timing attacks.
+    let (user, role, project) = tokio::join!(
+        state
+            .provider
+            .get_identity_provider()
+            .get_user(exec, &user_id),
+        state.provider.get_role_provider().get_role(exec, &role_id),
+        state
+            .provider
+            .get_resource_provider()
+            .get_project(exec, &project_id)
+    );
+    let user = user?.ok_or_else(|| {
+        info!("User {} was not found", user_id);
+        KeystoneApiError::NotFound {
+            resource: "grant".into(),
+            identifier: "".into(),
+        }
+    })?;
+    let project = project?.ok_or_else(|| {
+        info!("Project {} was not found", project_id);
+        KeystoneApiError::NotFound {
+            resource: "grant".into(),
+            identifier: "".into(),
+        }
+    })?;
+    let role = role?.ok_or_else(|| {
+        info!("Role {} was not found", role_id);
+        KeystoneApiError::NotFound {
+            resource: "grant".into(),
+            identifier: "".into(),
+        }
+    })?;
+
+    state
+        .policy_enforcer
+        .enforce(
+            "identity/project/user/role/revoke",
+            &user_auth,
+            Value::Null,
+            Some(json!({"user": user, "role": role, "project": project})),
+        )
+        .await?;
+
+    let grant = AssignmentBuilder::default()
+        .actor_id(user_id)
+        .role_id(role_id)
+        .target_id(project_id)
+        .r#type(AssignmentType::UserProject)
+        .inherited(inherited)
+        .build()?;
+
+    state
+        .provider
+        .get_assignment_provider()
+        .revoke_grant(exec, grant)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    use tower_http::trace::TraceLayer;
+    use tracing_test::traced_test;
+
+    use openstack_keystone_core_types::identity::*;
+    use openstack_keystone_core_types::resource::*;
+    use openstack_keystone_core_types::role::*;
+
+    use crate::api::tests::{get_mocked_state, test_fixture_scoped};
+    use crate::api::v3::role_assignment::openapi_router;
+    use crate::assignment::MockAssignmentProvider;
+    use crate::identity::MockIdentityProvider;
+    use crate::provider::Provider;
+    use crate::resource::MockResourceProvider;
+    use crate::role::MockRoleProvider;
+
+    #[tokio::test]
+    async fn test_revoke_success() {
+        let mut identity_mock = MockIdentityProvider::default();
+        identity_mock
+            .expect_get_user()
+            .withf(|_, id: &'_ str| id == "user_id")
+            .returning(|_, _| {
+                Ok(Some(
+                    UserResponseBuilder::default()
+                        .id("user_id")
+                        .domain_id("did")
+                        .enabled(true)
+                        .name("uname")
+                        .build()
+                        .unwrap(),
+                ))
+            });
+
+        let mut assignment_mock = MockAssignmentProvider::default();
+        assignment_mock
+            .expect_revoke_grant()
+            //.withf(|_, grant| {})
+            .returning(|_, _| Ok(()));
+
+        let mut role_mock = MockRoleProvider::default();
+        role_mock
+            .expect_get_role()
+            .withf(|_, rid: &'_ str| rid == "role_id")
+            .returning(|_, _| {
+                Ok(Some(
+                    RoleBuilder::default()
+                        .id("role_id")
+                        .name("new_role")
+                        .build()
+                        .unwrap(),
+                ))
+            });
+
+        let mut resource_mock = MockResourceProvider::default();
+        resource_mock
+            .expect_get_project()
+            .withf(|_, pid: &'_ str| pid == "project_id")
+            .returning(|_, id: &'_ str| {
+                Ok(Some(Project {
+                    id: id.to_string(),
+                    domain_id: "project_domain_id".into(),
+                    ..Default::default()
+                }))
+            });
+
+        let provider_builder = Provider::mocked_builder()
+            .mock_assignment(assignment_mock)
+            .mock_identity(identity_mock)
+            .mock_resource(resource_mock)
+            .mock_role(role_mock);
+        let vsc = test_fixture_scoped();
+        let state = get_mocked_state(provider_builder, true, None).await;
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/projects/project_id/users/user_id/roles/role_id")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_revoke_forbidden() {
+        let mut identity_mock = MockIdentityProvider::default();
+        identity_mock
+            .expect_get_user()
+            .withf(|_, id: &'_ str| id == "user_id")
+            .returning(|_, _| {
+                Ok(Some(
+                    UserResponseBuilder::default()
+                        .id("user_id")
+                        .domain_id("did")
+                        .enabled(true)
+                        .name("uname")
+                        .build()
+                        .unwrap(),
+                ))
+            });
+
+        let mut role_mock = MockRoleProvider::default();
+        role_mock
+            .expect_get_role()
+            .withf(|_, rid: &'_ str| rid == "role_id")
+            .returning(|_, _| {
+                Ok(Some(
+                    RoleBuilder::default()
+                        .id("role_id")
+                        .name("new_role")
+                        .build()
+                        .unwrap(),
+                ))
+            });
+
+        let mut resource_mock = MockResourceProvider::default();
+        resource_mock
+            .expect_get_project()
+            .withf(|_, pid: &'_ str| pid == "project_id")
+            .returning(|_, id: &'_ str| {
+                Ok(Some(Project {
+                    id: id.to_string(),
+                    domain_id: "project_domain_id".into(),
+                    ..Default::default()
+                }))
+            });
+
+        let provider_builder = Provider::mocked_builder()
+            .mock_identity(identity_mock)
+            .mock_resource(resource_mock)
+            .mock_role(role_mock);
+        let vsc = test_fixture_scoped();
+        let state = get_mocked_state(provider_builder, false, None).await; // Policy NOT allowed
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/projects/project_id/users/user_id/roles/role_id")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_revoke_user_not_found() {
+        let mut identity_mock = MockIdentityProvider::default();
+        identity_mock
+            .expect_get_user()
+            .withf(|_, id: &'_ str| id == "user_id")
+            .returning(|_, _| Ok(None)); // User not found
+
+        let mut role_mock = MockRoleProvider::default();
+        role_mock
+            .expect_get_role()
+            .withf(|_, rid: &'_ str| rid == "role_id")
+            .returning(|_, _| {
+                Ok(Some(
+                    RoleBuilder::default()
+                        .id("role_id")
+                        .name("new_role")
+                        .build()
+                        .unwrap(),
+                ))
+            });
+
+        let mut resource_mock = MockResourceProvider::default();
+        resource_mock
+            .expect_get_project()
+            .withf(|_, pid: &'_ str| pid == "project_id")
+            .returning(|_, id: &'_ str| {
+                Ok(Some(Project {
+                    id: id.to_string(),
+                    domain_id: "project_domain_id".into(),
+                    ..Default::default()
+                }))
+            });
+
+        let provider_builder = Provider::mocked_builder()
+            .mock_identity(identity_mock)
+            .mock_resource(resource_mock)
+            .mock_role(role_mock);
+        let vsc = test_fixture_scoped();
+        let state = get_mocked_state(provider_builder, true, None).await;
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/projects/project_id/users/user_id/roles/role_id")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_revoke_project_not_found() {
+        let mut identity_mock = MockIdentityProvider::default();
+        identity_mock
+            .expect_get_user()
+            .withf(|_, id: &'_ str| id == "user_id")
+            .returning(|_, _| {
+                Ok(Some(
+                    UserResponseBuilder::default()
+                        .id("user_id")
+                        .domain_id("did")
+                        .enabled(true)
+                        .name("uname")
+                        .build()
+                        .unwrap(),
+                ))
+            });
+
+        let mut role_mock = MockRoleProvider::default();
+        role_mock
+            .expect_get_role()
+            .withf(|_, rid: &'_ str| rid == "role_id")
+            .returning(|_, _| {
+                Ok(Some(
+                    RoleBuilder::default()
+                        .id("role_id")
+                        .name("test_role")
+                        .build()
+                        .unwrap(),
+                ))
+            });
+
+        let mut resource_mock = MockResourceProvider::default();
+        resource_mock
+            .expect_get_project()
+            .withf(|_, pid: &'_ str| pid == "project_id")
+            .returning(|_, _| Ok(None)); // Project not found
+
+        let provider_builder = Provider::mocked_builder()
+            .mock_identity(identity_mock)
+            .mock_resource(resource_mock)
+            .mock_role(role_mock);
+        let vsc = test_fixture_scoped();
+        let state = get_mocked_state(provider_builder, true, None).await;
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/projects/project_id/users/user_id/roles/role_id")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_revoke_role_not_found() {
+        let mut identity_mock = MockIdentityProvider::default();
+        identity_mock
+            .expect_get_user()
+            .withf(|_, id: &'_ str| id == "user_id")
+            .returning(|_, _| {
+                Ok(Some(
+                    UserResponseBuilder::default()
+                        .id("user_id")
+                        .domain_id("did")
+                        .enabled(true)
+                        .name("uname")
+                        .build()
+                        .unwrap(),
+                ))
+            });
+
+        let mut role_mock = MockRoleProvider::default();
+        role_mock
+            .expect_get_role()
+            .withf(|_, rid: &'_ str| rid == "role_id")
+            .returning(|_, _| Ok(None)); // Role not found
+
+        let mut resource_mock = MockResourceProvider::default();
+        resource_mock
+            .expect_get_project()
+            .withf(|_, pid: &'_ str| pid == "project_id")
+            .returning(|_, id: &'_ str| {
+                Ok(Some(Project {
+                    id: id.to_string(),
+                    domain_id: "project_domain_id".into(),
+                    ..Default::default()
+                }))
+            });
+
+        let provider_builder = Provider::mocked_builder()
+            .mock_identity(identity_mock)
+            .mock_resource(resource_mock)
+            .mock_role(role_mock);
+        let vsc = test_fixture_scoped();
+        let state = get_mocked_state(provider_builder, true, None).await;
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/projects/project_id/users/user_id/roles/role_id")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}

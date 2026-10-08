@@ -1,0 +1,391 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//use std::time;
+
+use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+use eyre::{Result, eyre};
+use reqwest::Client;
+use reserve_port::ReservedSocketAddr;
+use serde_json::json;
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
+use tower::ServiceBuilder;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tracing::Level;
+use url::Url;
+use uuid::Uuid;
+use webauthn_authenticator_rs::WebauthnAuthenticator;
+use webauthn_authenticator_rs::softtoken::SoftToken;
+
+use openstack_keystone_api_types::webauthn::*;
+use openstack_keystone_core::assignment::MockAssignmentProvider;
+use openstack_keystone_core::auth::ExecutionContext;
+use openstack_keystone_core::identity::MockIdentityProvider;
+use openstack_keystone_core::provider::{Provider, ProviderBuilder};
+use openstack_keystone_core::resource::MockResourceProvider;
+use openstack_keystone_core::token::MockTokenProvider;
+use openstack_keystone_core_types::assignment::*;
+use openstack_keystone_core_types::auth::*;
+use openstack_keystone_core_types::identity::UserResponseBuilder;
+use openstack_keystone_core_types::resource::{Domain, Project, ProjectBuilder};
+use openstack_keystone_core_types::role::RoleRefBuilder;
+use openstack_keystone_core_types::token::ProjectScopePayload;
+use openstack_keystone_webauthn::api::init_extension;
+
+mod common;
+use common::get_state;
+
+#[allow(clippy::unwrap_used)]
+fn get_provider_mocks(user_id: &Uuid) -> ProviderBuilder {
+    let provider_builder = Provider::mocked_builder();
+    let mut token_mock = MockTokenProvider::default();
+    let uid = user_id.to_string().clone();
+    let user = UserResponseBuilder::default()
+        .id(uid.clone())
+        .domain_id("user_domain_id")
+        .enabled(true)
+        .name("name")
+        .build()
+        .unwrap();
+    let user_domain = Domain {
+        id: user.domain_id.clone(),
+        enabled: true,
+        name: "user_domain".into(),
+        ..Default::default()
+    };
+    let project = Project {
+        id: "project_id".into(),
+        domain_id: "project_domain_id".into(),
+        enabled: true,
+        ..Default::default()
+    };
+    let project_domain = Domain {
+        id: "project_domain_id".into(),
+        enabled: true,
+        name: "project_domain".into(),
+        ..Default::default()
+    };
+
+    let auth = AuthenticationResultBuilder::default()
+        .context(AuthenticationContext::Token(
+            openstack_keystone_core_types::token::FernetToken::ProjectScope(
+                ProjectScopePayload::default(),
+            ),
+        ))
+        .principal(PrincipalInfo {
+            identity: IdentityInfo::User(
+                UserIdentityInfoBuilder::default()
+                    .user_id(user.id.clone())
+                    .user(user.clone())
+                    .user_domain(user_domain.clone())
+                    .build()
+                    .unwrap(),
+            ),
+        })
+        .authorization(
+            AuthzInfoBuilder::default()
+                .scope(ScopeInfo::Project {
+                    project: ProjectBuilder::default()
+                        .id("pid")
+                        .domain_id("project_domain_id")
+                        .enabled(true)
+                        .name("project_name")
+                        .build()
+                        .unwrap(),
+                    project_domain: project_domain.clone(),
+                })
+                .roles(vec![
+                    RoleRefBuilder::default()
+                        .id("admin")
+                        .name("admin")
+                        .build()
+                        .unwrap(),
+                ])
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let _auth_clone = auth.clone();
+    let uid = user_id.to_string().clone();
+
+    let mut sc = SecurityContext::try_from(auth).unwrap();
+    sc.set_token(
+        openstack_keystone_core_types::token::FernetToken::ProjectScope(ProjectScopePayload {
+            user_id: uid.clone(),
+            methods: vec!["password".to_string()],
+            project_id: "project_id".into(),
+            ..Default::default()
+        }),
+    );
+    let vsc_for_mock = openstack_keystone_core::auth::ValidatedSecurityContext::test_new(sc);
+    let vsc_clone = vsc_for_mock.clone();
+    token_mock
+        .expect_authorize_by_token()
+        .returning(move |_, _, _, _| Ok(vsc_clone.clone()));
+    token_mock
+        .expect_issue_token_context()
+        .returning(move |_, _, _| Ok(vsc_for_mock.clone()));
+    //token_mock.expect_issue_token().returning(move |_, _| {
+    //    Ok(ProviderToken::ProjectScope(ProjectScopePayload {
+    //        user_id: uid.clone(),
+    //        methods: Vec::from(["x509".to_string()]),
+    //        project_id: "pid".into(),
+    //        ..Default::default()
+    //    }))
+    //});
+    token_mock
+        .expect_encode_token()
+        .returning(|_| Ok("token".to_string()));
+
+    let mut assignment_mock = MockAssignmentProvider::default();
+    assignment_mock
+        .expect_list_role_assignments()
+        .returning(|_, _| {
+            Ok(vec![Assignment {
+                role_id: "role".into(),
+                role_name: Some("rn".into()),
+                actor_id: "actor".into(),
+                target_id: "target".into(),
+                r#type: AssignmentType::UserProject,
+                inherited: false,
+                implied_via: None,
+            }])
+        });
+    let mut identity_mock = MockIdentityProvider::default();
+    let uid = user_id.to_string().clone();
+    identity_mock.expect_get_user().returning(move |_exec, _| {
+        Ok(Some(
+            UserResponseBuilder::default()
+                .id(uid.clone())
+                .domain_id(user.domain_id.clone())
+                .enabled(true)
+                .name(user.name.clone())
+                .build()
+                .unwrap(),
+        ))
+    });
+    let mut resource_mock = MockResourceProvider::default();
+
+    resource_mock
+        .expect_get_project()
+        .returning(move |_exec, _| Ok(Some(project.clone())));
+    resource_mock
+        .expect_get_domain()
+        .returning(move |_exec, _| Ok(Some(user_domain.clone())));
+
+    provider_builder
+        .mock_assignment(assignment_mock)
+        .mock_token(token_mock)
+        .mock_identity(identity_mock)
+        .mock_resource(resource_mock)
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn test_webauthn_roundtrip() -> Result<()> {
+    let user_id = Uuid::new_v4();
+
+    let (state, _dir) = get_state(Some(get_provider_mocks(&user_id))).await?;
+
+    let authenticator_backend = SoftToken::new(true)?.0;
+    let origin = Url::parse("https://keystone.local")?;
+    let mut authenticator = WebauthnAuthenticator::new(authenticator_backend);
+
+    let addr = ReservedSocketAddr::reserve_random_socket_addr()?.socket_addr();
+    let cancel_token = CancellationToken::new();
+
+    let listener = TcpListener::bind(&addr).await?;
+
+    let mut handles = tokio::task::JoinSet::new();
+
+    let middleware = ServiceBuilder::new().layer(
+        TraceLayer::new_for_http()
+            .make_span_with(DefaultMakeSpan::new().include_headers(true))
+            .on_request(DefaultOnRequest::new().level(Level::INFO))
+            .on_response(DefaultOnResponse::new().level(Level::INFO)),
+    );
+    let app = init_extension(state.core.clone(), cancel_token)
+        .await?
+        .layer(middleware);
+    handles.spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    let client = Client::new();
+    let ccr = client
+        .post(format!(
+            "http://{}/users/{}/passkeys/register_start",
+            addr, user_id
+        ))
+        .header("x-auth-token", "fake")
+        .json(&json!(UserPasskeyRegistrationStartRequest {
+            passkey: PasskeyCreate { description: None }
+        }))
+        .send()
+        .await?
+        .json::<UserPasskeyRegistrationStartResponse>()
+        .await?;
+
+    // register soft key
+    let reg_result = authenticator.do_registration(
+        origin.clone(),
+        webauthn_authenticator_rs::prelude::CreationChallengeResponse {
+            public_key: ccr.public_key.try_into()?,
+        },
+    )?;
+    let finish_req: UserPasskeyRegistrationFinishRequest = reg_result.into();
+    //finish_req.description = Some("another description".into());
+    // TODO: check description (not used what is sent in initial request)
+
+    // finish registration
+    let passkey = client
+        .post(format!(
+            "http://{}/users/{}/passkeys/register_finish",
+            addr, user_id
+        ))
+        .header("x-auth-token", "fake")
+        .json(&serde_json::to_value(&finish_req)?)
+        .send()
+        .await?
+        .json::<PasskeyResponse>()
+        .await?;
+
+    // Check the credential is actually saved in the storage
+    let exec = ExecutionContext::internal(&state.core);
+    state
+        .extension
+        .provider
+        .get_user_webauthn_credential(&exec, &user_id.to_string(), &passkey.passkey.credential_id)
+        .await?
+        .expect("must be found");
+
+    // now start auth
+    let auth_challenge = client
+        .post(format!("http://{}/auth/passkey/start", addr,))
+        .json(&serde_json::to_value(&PasskeyAuthenticationStartRequest {
+            passkey: PasskeyUserAuthenticationRequest {
+                user_id: user_id.to_string(),
+            },
+        })?)
+        .send()
+        .await?
+        .json::<PasskeyAuthenticationStartResponse>()
+        .await?;
+
+    // authenticate locally
+    let auth_challenge_response = authenticator.do_authentication(
+        origin,
+        webauthn_authenticator_rs::prelude::RequestChallengeResponse {
+            public_key: auth_challenge.public_key.try_into()?,
+            mediation: auth_challenge.mediation.map(Into::into),
+        },
+    )?;
+
+    // finish the auth
+    let rsp = client
+        .post(format!("http://{}/auth/passkey/finish", addr,))
+        .json(&serde_json::to_value(
+            &PasskeyAuthenticationFinishRequest {
+                id: auth_challenge_response.id,
+                extensions: auth_challenge_response.extensions.into(),
+                raw_id: URL_SAFE.encode(auth_challenge_response.raw_id),
+                response: auth_challenge_response.response.into(),
+                type_: auth_challenge_response.type_,
+                user_id: user_id.to_string(),
+            },
+        )?)
+        .send()
+        .await?;
+    let _token = rsp
+        .headers()
+        .get("X-Subject-Token")
+        .ok_or_else(|| eyre!("Token is missing in the {:?}", rsp))?
+        .to_str()?
+        .to_string();
+    Ok(())
+}
+
+/// Authentication start for a user without passkeys (e.g. a non-existing
+/// user) must be indistinguishable from a real one: a `200` response with
+/// decoy `allow_credentials` that are stable per user id, so the endpoint
+/// cannot be used for user enumeration.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn test_webauthn_auth_start_unknown_user_returns_decoys() -> Result<()> {
+    let (state, _dir) = get_state(None).await?;
+
+    let addr = ReservedSocketAddr::reserve_random_socket_addr()?.socket_addr();
+    let cancel_token = CancellationToken::new();
+    let listener = TcpListener::bind(&addr).await?;
+    let mut handles = tokio::task::JoinSet::new();
+    let app = init_extension(state.core.clone(), cancel_token).await?;
+    handles.spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    let client = Client::new();
+
+    let start = async |user_id: &str| -> Result<PasskeyAuthenticationStartResponse> {
+        let rsp = client
+            .post(format!("http://{}/auth/passkey/start", addr))
+            .json(&serde_json::to_value(&PasskeyAuthenticationStartRequest {
+                passkey: PasskeyUserAuthenticationRequest {
+                    user_id: user_id.into(),
+                },
+            })?)
+            .send()
+            .await?;
+        assert_eq!(rsp.status(), 201, "start must succeed for unknown users");
+        Ok(rsp.json::<PasskeyAuthenticationStartResponse>().await?)
+    };
+
+    let mut users_with_decoys = 0;
+    let mut all_decoy_ids: Vec<Vec<String>> = Vec::new();
+    for _ in 0..20 {
+        let user_id = Uuid::new_v4().to_string();
+        let first = start(&user_id).await?;
+        let second = start(&user_id).await?;
+
+        // Decoy credential IDs are deterministic per user id, while the
+        // challenge is freshly random - just like for real users.
+        let ids = |r: &PasskeyAuthenticationStartResponse| {
+            r.public_key
+                .allow_credentials
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&first), ids(&second));
+        assert_ne!(first.public_key.challenge, second.public_key.challenge);
+
+        if !first.public_key.allow_credentials.is_empty() {
+            users_with_decoys += 1;
+            all_decoy_ids.push(ids(&first));
+        }
+    }
+    // The decoy distribution may legitimately produce zero credentials for
+    // some user ids, but over 20 users it is virtually impossible that all
+    // of them get an empty list.
+    assert!(users_with_decoys > 0, "expected decoy credentials");
+    // Different users must get different decoys.
+    let unique = all_decoy_ids
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique.len(), all_decoy_ids.len());
+    Ok(())
+}

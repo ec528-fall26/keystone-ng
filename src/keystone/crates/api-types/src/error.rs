@@ -1,0 +1,207 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # Keystone API types Error
+use thiserror::Error;
+
+#[cfg(feature = "builder")]
+pub use openstack_keystone_core_types::error::BuilderError;
+
+/// Keystone API operation errors.
+#[derive(Debug, Error)]
+pub enum KeystoneApiError {
+    /// Selected authentication is forbidden.
+    #[error("changing current authentication scope is forbidden")]
+    AuthenticationRescopeForbidden,
+
+    #[error("Attempted to authenticate with an unsupported method.")]
+    AuthMethodNotSupported,
+
+    #[error("{0}.")]
+    BadRequest(String),
+
+    /// Base64 decoding error.
+    #[error(transparent)]
+    Base64Decode(#[from] base64::DecodeError),
+
+    #[error("conflict, resource already existing")]
+    Conflict(String),
+
+    #[error("domain id or name must be present")]
+    DomainIdOrName,
+
+    #[error("You are not authorized to perform the requested action.")]
+    Forbidden {
+        /// The source of the error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error("invalid header header")]
+    InvalidHeader,
+
+    #[error("invalid token")]
+    InvalidToken,
+
+    #[error("internal server error: {0}")]
+    InternalError(String),
+
+    #[error("could not find {resource}: {identifier}")]
+    NotFound {
+        resource: String,
+        identifier: String,
+    },
+
+    /// The requested operation requires optional infrastructure that is not
+    /// configured (e.g. raft-based providers when `[distributed_storage]` is
+    /// absent).  This is a permanent configuration gap, not a transient error.
+    #[error("{0}")]
+    NotImplemented(String),
+
+    /// Others.
+    #[error(transparent)]
+    Other(#[from] eyre::Report),
+
+    #[error("project id or name must be present")]
+    ProjectIdOrName,
+
+    #[error("project domain must be present")]
+    ProjectDomain,
+
+    /// Selected authentication is forbidden.
+    #[error("selected authentication is forbidden")]
+    SelectedAuthenticationForbidden,
+
+    /// The request could not be completed because a required upstream
+    /// dependency is unreachable or timed out (HTTP 503 Service
+    /// Unavailable). Used where failing closed is a deliberate security
+    /// property, not an internal bug -- e.g. `POST /v4/vendordata`'s Nova
+    /// ownership check (SPIRE integration plan, Phase 2, Fix 1): never
+    /// silently degrade to "unverified", only to "unavailable".
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
+
+    /// Rate limit exceeded (HTTP 429 Too Many Requests).
+    ///
+    /// `retry_after` is the number of seconds the client must wait before
+    /// retrying. Surfaced via the `Retry-After` response header (ADR-0022,
+    /// Invariant 3). No key-identifying information is included.
+    #[error("Rate limit exceeded. Retry in {retry_after} seconds.")]
+    TooManyRequests {
+        /// Minimum seconds to wait before retrying.
+        retry_after: u64,
+    },
+
+    /// (de)serialization error.
+    #[error(transparent)]
+    Serde {
+        #[from]
+        source: serde_json::Error,
+    },
+
+    #[error("missing x-subject-token header")]
+    SubjectTokenMissing,
+
+    /// Request is syntactically valid but semantically invalid (RFC 4918
+    /// §11.2 / RFC 7231 §6.5.1's `422` successor). Used for write-time
+    /// validation failures that are not simple malformed-request errors
+    /// (e.g. ADR 0024 §2.C's `Authorization::Project` prohibition).
+    #[error("{0}.")]
+    UnprocessableEntity(String),
+    #[error("The request you have made requires authentication.")]
+    UnauthorizedNoContext,
+
+    #[error("{}", .context.clone().unwrap_or("The request you have made requires authentication.".to_string()))]
+    Unauthorized {
+        context: Option<String>,
+        /// The source of the error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl KeystoneApiError {
+    pub fn forbidden<E>(error: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::Forbidden {
+            source: Box::new(error),
+        }
+    }
+
+    pub fn internal<E>(error: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::InternalError(error.to_string())
+        //{
+        //    source: Box::new(error),
+        //}
+    }
+
+    pub fn not_found<R, I>(resource: R, identifier: I) -> Self
+    where
+        R: Into<String>,
+        I: Into<String>,
+    {
+        Self::NotFound {
+            resource: resource.into(),
+            identifier: identifier.into(),
+        }
+    }
+
+    pub fn unauthorized<E, C>(error: E, context: Option<C>) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+        C: Into<String>,
+    {
+        Self::Unauthorized {
+            context: context.map(Into::into),
+            source: Box::new(error),
+        }
+    }
+}
+
+///// Builder error.
+/////
+///// A wrapper error that is used instead of the error generated by the
+///// `derive_builder`.
+//#[derive(Debug, Error)]
+//#[non_exhaustive]
+//pub enum BuilderError {
+//    /// Uninitialized field.
+//    #[error("{0}")]
+//    UninitializedField(String),
+//    /// Custom validation error.
+//    #[error("{0}")]
+//    Validation(String),
+//}
+//
+//impl From<String> for BuilderError {
+//    fn from(s: String) -> Self {
+//        Self::Validation(s)
+//    }
+//}
+//
+//impl From<derive_builder::UninitializedFieldError> for BuilderError {
+//    fn from(ufe: derive_builder::UninitializedFieldError) -> Self {
+//        Self::UninitializedField(ufe.to_string())
+//    }
+//}
+//
+//impl From<BuilderError> for KeystoneApiError {
+//    fn from(value: BuilderError) -> Self {
+//        Self::InternalError(value.to_string())
+//    }
+//}

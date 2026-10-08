@@ -1,0 +1,881 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # Plugin manager
+//!
+//! A driver, also known as a backend, is an important architectural component
+//! of Keystone. It is an abstraction around the data access needed by a
+//! particular subsystem. This pluggable implementation is not only how Keystone
+//! implements its own data access, but how you can implement your own!
+//!
+//! The [PluginManagerApi] is responsible for picking the proper backend driver
+//! for the provider.
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use openstack_keystone_config::ConfigView;
+
+use crate::api_key::ApiKeyProviderError;
+use crate::api_key::backend::ApiKeyBackend;
+use crate::application_credential::{
+    ApplicationCredentialProviderError, backend::ApplicationCredentialBackend,
+};
+use crate::assignment::backend::AssignmentBackend;
+use crate::assignment::error::AssignmentProviderError;
+use crate::auth_plugin_identity::AuthPluginIdentityProviderError;
+use crate::auth_plugin_identity::backend::DynamicPluginIdentityBackend;
+use crate::catalog::backend::CatalogBackend;
+use crate::catalog::error::CatalogProviderError;
+use crate::credential::CredentialProviderError;
+use crate::credential::backend::CredentialBackend;
+use crate::domain_config::backend::DomainConfigBackend;
+use crate::domain_config::error::DomainConfigProviderError;
+use crate::federation::backend::FederationBackend;
+use crate::federation::error::FederationProviderError;
+use crate::identity::backend::IdentityBackend;
+use crate::identity::error::IdentityProviderError;
+use crate::idmapping::IdMappingProviderError;
+use crate::idmapping::backend::IdMappingBackend;
+use crate::k8s_auth::K8sAuthProviderError;
+use crate::k8s_auth::backend::K8sAuthBackend;
+use crate::limit::backend::LimitBackend;
+use crate::limit::error::LimitProviderError;
+use crate::mapping::MappingBackend;
+use crate::mapping::error::MappingProviderError;
+use crate::oauth2_client::Oauth2ClientProviderError;
+use crate::oauth2_client::backend::Oauth2ClientBackend;
+use crate::oauth2_key::Oauth2KeyProviderError;
+use crate::oauth2_key::backend::Oauth2KeyBackend;
+use crate::oauth2_session::Oauth2SessionProviderError;
+use crate::oauth2_session::backend::Oauth2SessionBackend;
+use crate::policy_store::PolicyStoreProviderError;
+use crate::policy_store::backend::PolicyStoreBackend;
+use crate::resource::backend::ResourceBackend;
+use crate::resource::error::ResourceProviderError;
+use crate::revoke::RevokeProviderError;
+use crate::revoke::backend::RevokeBackend;
+use crate::role::RoleProviderError;
+use crate::role::backend::RoleBackend;
+use crate::scim_realm::backend::ScimRealmBackend;
+use crate::scim_realm::error::ScimRealmProviderError;
+use crate::scim_resource::backend::ScimResourceBackend;
+use crate::scim_resource::error::ScimResourceProviderError;
+use crate::token::TokenProviderError;
+use crate::token::backend::TokenBackend;
+use crate::token::backend::TokenRestrictionBackend;
+use crate::trust::TrustProviderError;
+use crate::trust::backend::TrustBackend;
+
+/// Future returned by a [`BackendRegistration::build`] constructor.
+pub type BuildFuture<B> = Pin<Box<dyn Future<Output = eyre::Result<Arc<B>>> + Send>>;
+
+/// A single driver's self-registration for backend kind `B` (e.g.
+/// `dyn IdentityBackend`), collected via `inventory` at link time.
+///
+/// Driver crates add themselves with `inventory::submit!` next to their
+/// backend implementation instead of `keystone::plugin_manager` calling
+/// out to them by name. See ADR-0018 for the linkage-anchor mechanism
+/// that keeps `submit!` sections from being stripped by the linker.
+pub struct BackendRegistration<B: ?Sized + 'static> {
+    /// Driver name this backend is registered under (e.g. `"sql"`,
+    /// `"raft"`, `"ldap"`).
+    pub name: &'static str,
+    /// Whether this driver should be built for the given configuration.
+    /// Always-on drivers (most `sql`/`raft` backends) use `|_| true`;
+    /// conditional drivers (e.g. `ldap`, `jws`) inspect `config`.
+    pub selected: fn(&ConfigView<'_>) -> bool,
+    /// Constructs the backend. May perform real I/O (e.g. opening an
+    /// LDAP connection, loading signing keys) and fail.
+    pub build: fn(&ConfigView<'_>) -> BuildFuture<B>,
+}
+
+/// Declares the `inventory` collection registry for one backend kind.
+///
+/// One invocation per `dyn XBackend` trait object type; must live in this
+/// crate since `inventory::collect!` defines the registry itself (driver
+/// crates only `inventory::submit!` into it).
+macro_rules! declare_backend_registry {
+    ($($ty:ty),+ $(,)?) => {
+        $(inventory::collect!(BackendRegistration<$ty>);)+
+    };
+}
+
+declare_backend_registry!(
+    dyn ApiKeyBackend,
+    dyn ApplicationCredentialBackend,
+    dyn AssignmentBackend,
+    dyn CatalogBackend,
+    dyn LimitBackend,
+    dyn CredentialBackend,
+    dyn DomainConfigBackend,
+    dyn DynamicPluginIdentityBackend,
+    dyn FederationBackend,
+    dyn IdentityBackend,
+    dyn IdMappingBackend,
+    dyn MappingBackend,
+    dyn Oauth2ClientBackend,
+    dyn Oauth2KeyBackend,
+    dyn Oauth2SessionBackend,
+    dyn K8sAuthBackend,
+    dyn PolicyStoreBackend,
+    dyn ResourceBackend,
+    dyn RevokeBackend,
+    dyn RoleBackend,
+    dyn ScimRealmBackend,
+    dyn ScimResourceBackend,
+    dyn TokenBackend,
+    dyn TokenRestrictionBackend,
+    dyn TrustBackend,
+);
+
+/// Builds and inserts every backend registered for kind `B` whose
+/// [`BackendRegistration::selected`] predicate accepts `config`.
+///
+/// # Errors
+/// - Propagates any error from a driver's `build` constructor.
+/// - Fails if two drivers of the same kind register under the same `name`
+///   (ambiguous selection at lookup time).
+pub async fn register_backends<B: ?Sized>(
+    config: &ConfigView<'_>,
+    target: &mut HashMap<String, Arc<B>>,
+) -> eyre::Result<()>
+where
+    BackendRegistration<B>: inventory::Collect,
+{
+    for reg in inventory::iter::<BackendRegistration<B>> {
+        if (reg.selected)(config) {
+            if target.contains_key(reg.name) {
+                eyre::bail!("duplicate backend registration for driver \"{}\"", reg.name);
+            }
+            let backend = (reg.build)(config).await?;
+            target.insert(reg.name.to_string(), backend);
+        }
+    }
+    Ok(())
+}
+
+/// A driver's self-registration for building a *named* assignment backend
+/// instance from an `[assignment.backends.<name>]` block (ADR 0034 §4).
+///
+/// Distinct from [`BackendRegistration`]: the global assignment driver is
+/// selected by `[assignment] driver` and configured from its own global
+/// section, whereas a named instance is built from one config block passed by
+/// name. A driver crate submits one of these next to its
+/// [`BackendRegistration`] with `inventory::submit!`.
+pub struct NamedAssignmentBackendRegistration {
+    /// The driver discriminator this builder handles, matching an
+    /// `[assignment.backends.<name>]` block's `driver =` (e.g. `"openfga"`).
+    pub driver: &'static str,
+    /// Builds one instance from the named block. Reads `config.assignment
+    /// .backend_block(block_name)` for its parameters; fails when the block is
+    /// absent or names a different driver.
+    pub build: fn(config: &ConfigView<'_>, block_name: &str) -> BuildFuture<dyn AssignmentBackend>,
+}
+
+inventory::collect!(NamedAssignmentBackendRegistration);
+
+/// Build the global assignment backend for `driver` without a
+/// [`PluginManager`] — the entry point a config reload uses to rebuild the
+/// global instance in place (ADR 0034 §9).
+///
+/// # Errors
+/// - [`AssignmentProviderError::UnsupportedDriver`] when no driver registered
+///   under `driver`.
+/// - [`AssignmentProviderError::Driver`] when more than one driver registered
+///   under `driver`, or wrapping any error from the driver's constructor.
+pub async fn build_global_assignment_backend(
+    config: &ConfigView<'_>,
+    driver: &str,
+) -> Result<Arc<dyn AssignmentBackend>, AssignmentProviderError> {
+    let reg = single_registration(
+        inventory::iter::<BackendRegistration<dyn AssignmentBackend>>
+            .into_iter()
+            .filter(|reg| reg.name == driver),
+        driver,
+    )?;
+    (reg.build)(config)
+        .await
+        .map_err(|err| AssignmentProviderError::Driver(err.to_string()))
+}
+
+/// Pick the sole registration from `matches`, mirroring the duplicate-name
+/// rejection [`register_backends`] does at plugin-manager build time.
+///
+/// # Errors
+/// - [`AssignmentProviderError::UnsupportedDriver`] when `matches` is empty.
+/// - [`AssignmentProviderError::Driver`] when it yields more than one.
+fn single_registration<T>(
+    mut matches: impl Iterator<Item = T>,
+    driver: &str,
+) -> Result<T, AssignmentProviderError> {
+    let reg = matches
+        .next()
+        .ok_or_else(|| AssignmentProviderError::UnsupportedDriver(driver.to_string()))?;
+    if matches.next().is_some() {
+        return Err(AssignmentProviderError::Driver(format!(
+            "multiple assignment drivers registered under `{driver}`"
+        )));
+    }
+    Ok(reg)
+}
+
+/// Build one named assignment backend instance from the
+/// `[assignment.backends.<block_name>]` block, dispatching on `driver`
+/// (ADR 0034 §4).
+///
+/// # Errors
+/// - [`AssignmentProviderError::UnsupportedDriver`] when no driver registered a
+///   [`NamedAssignmentBackendRegistration`] for `driver`.
+/// - [`AssignmentProviderError::NamedBackendMisconfigured`] when the block is
+///   absent or names a different driver.
+/// - [`AssignmentProviderError::Driver`] when more than one driver registered
+///   under `driver`, or wrapping any other construction failure.
+pub async fn build_named_assignment_backend(
+    config: &ConfigView<'_>,
+    driver: &str,
+    block_name: &str,
+) -> Result<Arc<dyn AssignmentBackend>, AssignmentProviderError> {
+    let reg = single_registration(
+        inventory::iter::<NamedAssignmentBackendRegistration>
+            .into_iter()
+            .filter(|reg| reg.driver == driver),
+        driver,
+    )?;
+    (reg.build)(config, block_name).await.map_err(|err| {
+        err.downcast::<AssignmentProviderError>()
+            .unwrap_or_else(|err| AssignmentProviderError::Driver(err.to_string()))
+    })
+}
+
+/// Plugin manager trait.
+pub trait PluginManagerApi {
+    /// Get registered API Key backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn ApiKeyBackend>)` if found, otherwise
+    ///   `Err(ApiKeyProviderError)`.
+    fn get_api_key_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn ApiKeyBackend>, ApiKeyProviderError>;
+
+    /// Get registered application credential backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn ApplicationCredentialBackend>)` if found, otherwise
+    ///   `Err(ApplicationCredentialProviderError)`.
+    fn get_application_credential_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn ApplicationCredentialBackend>, ApplicationCredentialProviderError>;
+
+    /// Get registered assignment backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn AssignmentBackend>)` if found, otherwise
+    ///   `Err(AssignmentProviderError)`.
+    fn get_assignment_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn AssignmentBackend>, AssignmentProviderError>;
+
+    /// Every registered assignment backend, keyed by driver name.
+    ///
+    /// The assignment provider resolves the global backend through this map
+    /// (ADR 0034 §4). A driver appears here only when its `selected`
+    /// predicate holds: with the `openfga` driver crate linked, `"openfga"`
+    /// is present only when `[assignment] driver` is `openfga`. Per-domain
+    /// backends are built separately from the named blocks and are not part
+    /// of this map.
+    ///
+    /// # Returns
+    /// - `&HashMap<String, Arc<dyn AssignmentBackend>>` - The registry.
+    fn assignment_backends(&self) -> &HashMap<String, Arc<dyn AssignmentBackend>>;
+
+    /// Get registered catalog backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn CatalogBackend>)` if found, otherwise
+    ///   `Err(CatalogProviderError)`.
+    fn get_catalog_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn CatalogBackend>, CatalogProviderError>;
+
+    /// Get registered limit backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn LimitBackend>)` if found, otherwise
+    ///   `Err(LimitProviderError)`.
+    fn get_limit_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn LimitBackend>, LimitProviderError>;
+
+    /// Get registered credential backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn CredentialBackend>)` if found, otherwise
+    ///   `Err(CredentialProviderError)`.
+    fn get_credential_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn CredentialBackend>, CredentialProviderError>;
+
+    /// Get registered domain config backend.
+    ///
+    /// The registry holds one entry per source — `"fs"` for the filesystem
+    /// driver, `"sql"` for the database one — and the resolution layer asks
+    /// for each by name (see
+    /// [`crate::domain_config::DomainConfigResolver`]).
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn DomainConfigBackend>)` if found, otherwise
+    ///   `Err(DomainConfigProviderError::UnsupportedDriver)`.
+    fn get_domain_config_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn DomainConfigBackend>, DomainConfigProviderError>;
+
+    /// Get registered dynamic plugin identity-binding index backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn DynamicPluginIdentityBackend>)` if found, otherwise
+    ///   `Err(AuthPluginIdentityProviderError)`.
+    fn get_auth_plugin_identity_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn DynamicPluginIdentityBackend>, AuthPluginIdentityProviderError>;
+
+    /// Get registered federation backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn FederationBackend>)` if found, otherwise
+    ///   `Err(FederationProviderError)`.
+    fn get_federation_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn FederationBackend>, FederationProviderError>;
+
+    /// Get registered identity backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn IdentityBackend>)` if found, otherwise
+    ///   `Err(IdentityProviderError)`.
+    fn get_identity_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn IdentityBackend>, IdentityProviderError>;
+
+    /// Every registered identity backend, keyed by driver name.
+    ///
+    /// The identity provider clones this map to dispatch operations to a
+    /// per-domain driver (issue #960); with `domain_specific_drivers_enabled`
+    /// it holds both `"sql"` and `"ldap"`.
+    ///
+    /// # Returns
+    /// - `&HashMap<String, Arc<dyn IdentityBackend>>` - The registry.
+    fn identity_backends(&self) -> &HashMap<String, Arc<dyn IdentityBackend>>;
+
+    /// Get registered idmapping backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn IdMappingBackend>)` if found, otherwise
+    ///   `Err(IdMappingProviderError)`.
+    fn get_idmapping_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn IdMappingBackend>, IdMappingProviderError>;
+
+    /// Get registered mapping backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn MappingBackend>)` if found, otherwise
+    ///   `Err(MappingProviderError)`.
+    fn get_mapping_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn MappingBackend>, MappingProviderError>;
+
+    /// Get registered OAuth2 client backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn Oauth2ClientBackend>)` if found, otherwise
+    ///   `Err(Oauth2ClientProviderError)`.
+    fn get_oauth2_client_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn Oauth2ClientBackend>, Oauth2ClientProviderError>;
+
+    /// Get registered OAuth2 signing key backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn Oauth2KeyBackend>)` if found, otherwise
+    ///   `Err(Oauth2KeyProviderError)`.
+    fn get_oauth2_key_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn Oauth2KeyBackend>, Oauth2KeyProviderError>;
+
+    /// Get registered OAuth2 browser session backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn Oauth2SessionBackend>)` if found, otherwise
+    ///   `Err(Oauth2SessionProviderError)`.
+    fn get_oauth2_session_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn Oauth2SessionBackend>, Oauth2SessionProviderError>;
+
+    /// Get registered k8s auth backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn K8sAuthBackend>)` if found, otherwise
+    ///   `Err(K8sAuthProviderError)`.
+    fn get_k8s_auth_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn K8sAuthBackend>, K8sAuthProviderError>;
+
+    /// Get registered resource backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn ResourceBackend>)` if found, otherwise
+    ///   `Err(ResourceProviderError)`.
+    fn get_resource_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn ResourceBackend>, ResourceProviderError>;
+
+    /// Get registered revoke backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn RevokeBackend>)` if found, otherwise
+    ///   `Err(RevokeProviderError)`.
+    fn get_revoke_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn RevokeBackend>, RevokeProviderError>;
+
+    /// Get role resource backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn RoleBackend>)` if found, otherwise
+    ///   `Err(RoleProviderError)`.
+    fn get_role_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn RoleBackend>, RoleProviderError>;
+
+    /// Get registered SCIM realm backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn ScimRealmBackend>)` if found, otherwise
+    ///   `Err(ScimRealmProviderError)`.
+    fn get_scim_realm_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn ScimRealmBackend>, ScimRealmProviderError>;
+
+    /// Get registered SCIM resource ownership index backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn ScimResourceBackend>)` if found, otherwise
+    ///   `Err(ScimResourceProviderError)`.
+    fn get_scim_resource_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn ScimResourceBackend>, ScimResourceProviderError>;
+
+    /// Get registered token backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn TokenBackend>)` if found, otherwise
+    ///   `Err(TokenProviderError)`.
+    fn get_token_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn TokenBackend>, TokenProviderError>;
+
+    /// Get registered token restriction backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn TokenRestrictionBackend>)` if found, otherwise
+    ///   `Err(TokenProviderError)`.
+    fn get_token_restriction_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn TokenRestrictionBackend>, TokenProviderError>;
+
+    /// Get registered trust backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn TrustBackend>)` if found, otherwise
+    ///   `Err(TrustProviderError)`.
+    fn get_trust_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn TrustBackend>, TrustProviderError>;
+
+    /// Get registered policy store backend (legacy `/v3/policies`).
+    ///
+    /// # Parameters
+    /// - `name`: The name of the backend to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(&Arc<dyn PolicyStoreBackend>)` if found, otherwise
+    ///   `Err(PolicyStoreProviderError)`.
+    fn get_policy_store_backend<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<&Arc<dyn PolicyStoreBackend>, PolicyStoreProviderError>;
+
+    /// Register API Key backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_api_key_backend<S: AsRef<str>>(&mut self, name: S, plugin: Arc<dyn ApiKeyBackend>);
+
+    /// Register application credential backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_application_credential_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn ApplicationCredentialBackend>,
+    );
+
+    /// Register credential backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_credential_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn CredentialBackend>,
+    );
+
+    /// Register dynamic plugin identity-binding index backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_auth_plugin_identity_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn DynamicPluginIdentityBackend>,
+    );
+
+    /// Register assignment backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_assignment_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn AssignmentBackend>,
+    );
+
+    /// Register catalog backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_catalog_backend<S: AsRef<str>>(&mut self, name: S, plugin: Arc<dyn CatalogBackend>);
+
+    /// Register limit backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_limit_backend<S: AsRef<str>>(&mut self, name: S, plugin: Arc<dyn LimitBackend>);
+
+    /// Register federation backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_federation_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn FederationBackend>,
+    );
+
+    /// Register identity backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_identity_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn IdentityBackend>,
+    );
+
+    /// Register idmapping backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_idmapping_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn IdMappingBackend>,
+    );
+
+    /// Register mapping backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_mapping_backend<S: AsRef<str>>(&mut self, name: S, plugin: Arc<dyn MappingBackend>);
+
+    /// Register OAuth2 client backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_oauth2_client_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn Oauth2ClientBackend>,
+    );
+
+    /// Register OAuth2 signing key backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_oauth2_key_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn Oauth2KeyBackend>,
+    );
+
+    /// Register OAuth2 browser session backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_oauth2_session_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn Oauth2SessionBackend>,
+    );
+
+    /// Register k8s_auth backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_k8s_auth_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn K8sAuthBackend>,
+    );
+
+    /// Register resource backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_resource_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn ResourceBackend>,
+    );
+
+    /// Register revoke backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_revoke_backend<S: AsRef<str>>(&mut self, name: S, plugin: Arc<dyn RevokeBackend>);
+
+    /// Register role backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_role_backend<S: AsRef<str>>(&mut self, name: S, plugin: Arc<dyn RoleBackend>);
+
+    /// Register SCIM realm backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_scim_realm_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn ScimRealmBackend>,
+    );
+
+    /// Register SCIM resource ownership index backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_scim_resource_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn ScimResourceBackend>,
+    );
+
+    /// Register token backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_token_backend<S: AsRef<str>>(&mut self, name: S, plugin: Arc<dyn TokenBackend>);
+
+    /// Register token restriction backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_token_restriction_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn TokenRestrictionBackend>,
+    );
+
+    /// Register trust backend.
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_trust_backend<S: AsRef<str>>(&mut self, name: S, plugin: Arc<dyn TrustBackend>);
+
+    /// Register policy store backend (legacy `/v3/policies`).
+    ///
+    /// # Parameters
+    /// - `name`: The name to register the backend under.
+    /// - `plugin`: The backend implementation.
+    fn register_policy_store_backend<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn PolicyStoreBackend>,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use openstack_keystone_config::{Config, LoadedConfig};
+
+    use super::*;
+
+    /// No assignment driver crate is linked into `core`'s own test binary, so
+    /// every name is unknown — the lookup must report it rather than panic.
+    #[tokio::test]
+    async fn build_global_assignment_backend_rejects_an_unknown_driver() {
+        match build_global_assignment_backend(&LoadedConfig::new(Config::default()).view(), "nope")
+            .await
+        {
+            Err(AssignmentProviderError::UnsupportedDriver(name)) => assert_eq!(name, "nope"),
+            other => panic!("expected UnsupportedDriver, got {:?}", other.err()),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_named_assignment_backend_rejects_an_unknown_driver() {
+        match build_named_assignment_backend(
+            &LoadedConfig::new(Config::default()).view(),
+            "nope",
+            "block",
+        )
+        .await
+        {
+            Err(AssignmentProviderError::UnsupportedDriver(name)) => assert_eq!(name, "nope"),
+            other => panic!("expected UnsupportedDriver, got {:?}", other.err()),
+        }
+    }
+}

@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+# devstack lib functions for the SPIRE service (SPIFFE workload identity).
+#
+# Stands up a single-node SPIRE server + agent, pre-registers the
+# well-known SPIFFE identities other phases of doc/plans/spire-integration.md
+# authenticate against (keystone-rs, nova-api, neutron, and a per-host
+# nova-compute entry), and exports the trust bundle so keystone-rs and
+# Python services can reference it. This plugin does not touch
+# keystone-rs's own config (devstack/lib/keystone-rs) - later phases wire
+# the two together.
+#
+# Standard devstack function naming: install_/configure_/init_/start_/
+# stop_/cleanup_<service>.
+#
+# Deliberately kept independent of tools/start-spire.sh (the test_api CI
+# harness's SPIRE bootstrap): that script is a one-shot, fixed-path
+# ($TRUST_DOMAIN=example.org, /tmp/spire-ci-test-harness) helper for
+# nextest, not a devstack-service-lifecycle-aware plugin. This file uses
+# its own data dir/port namespace under devstack's $DATA_DIR so the two
+# never collide, even though they never run in the same process tree
+# today (one is test_api-only, one is devstack.yml-only).
+
+SPIRE_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SPIRE_PLUGIN_ROOT=$(cd "$SPIRE_LIB_DIR/.." && pwd)
+
+SPIRE_VERSION=${SPIRE_VERSION:-1.15.3}
+SPIRE_TRUST_DOMAIN=${SPIRE_TRUST_DOMAIN:-cloud.trust.domain}
+SPIRE_DATA_DIR=${SPIRE_DATA_DIR:-$DATA_DIR/spire}
+SPIRE_SERVER_SOCKET=${SPIRE_SERVER_SOCKET:-$SPIRE_DATA_DIR/server.sock}
+SPIRE_AGENT_SOCKET=${SPIRE_AGENT_SOCKET:-$SPIRE_DATA_DIR/agent.sock}
+# 8082, not 8081: keystone-rs's internal SPIFFE mTLS listener
+# (KEYSTONE_RS_INTERNAL_PORT, default 8081, devstack/lib/keystone-rs)
+# owns 8081 in the combined devstack-full job, and spire-server would
+# fail to bind its control-plane port there. Only the spire agent
+# connects to this port (server_address/server_port in agent.conf).
+SPIRE_SERVER_BIND_PORT=${SPIRE_SERVER_BIND_PORT:-8082}
+SPIRE_SERVER_CONF=$SPIRE_DATA_DIR/server.conf
+SPIRE_AGENT_CONF=$SPIRE_DATA_DIR/agent.conf
+# Public CA cert, no secrecy requirement - keystone-rs (Phase 3) and
+# Python services will read this to validate SPIFFE peers.
+SPIRE_CA_BUNDLE_DEST=${SPIRE_CA_BUNDLE_DEST:-$KEYSTONE_CONF_DIR/spiffe/ca.crt}
+
+# spiffe-helper (github.com/spiffe/spiffe-helper) writes an SVID/key/bundle
+# to disk per workload, refreshing them from the SPIRE agent's Workload API
+# on rotation. Phase 1.5: one helper instance per OpenStack service
+# (nova/cinder/glance/neutron), writing certs nothing consumes yet - this
+# is preparation for the Phase 4/5 keystonemiddleware cutover, not an auth
+# change. Mirrors tools/k8s/keystone/base/conf/helper.conf's config shape,
+# using run_process instead of a k8s sidecar container.
+SPIFFE_HELPER_VERSION=${SPIFFE_HELPER_VERSION:-0.11.0}
+SPIFFE_HELPER_CERTS_DIR=${SPIFFE_HELPER_CERTS_DIR:-$SPIRE_DATA_DIR/certs}
+
+function install_spire {
+    local arch tarball url checksums_url tmp_dir
+
+    case "$(uname -m)" in
+        x86_64) arch=amd64 ;;
+        aarch64) arch=arm64 ;;
+        *) die $LINENO "Unsupported architecture for SPIRE: $(uname -m)" ;;
+    esac
+
+    tmp_dir=$(mktemp -d)
+    tarball="spire-${SPIRE_VERSION}-linux-${arch}-musl.tar.gz"
+    url="https://github.com/spiffe/spire/releases/download/v${SPIRE_VERSION}/${tarball}"
+    # SPIRE publishes one <asset>_sha256sum.txt per release asset, named
+    # after the asset without its .tar.gz suffix (there is no single
+    # combined checksums file).
+    checksums_url="https://github.com/spiffe/spire/releases/download/v${SPIRE_VERSION}/spire-${SPIRE_VERSION}-linux-${arch}-musl_sha256sum.txt"
+
+    curl --proto '=https' --tlsv1.2 -sSfL "$url" -o "$tmp_dir/$tarball"
+    curl --proto '=https' --tlsv1.2 -sSfL "$checksums_url" -o "$tmp_dir/checksums.txt"
+
+    # Unlike install_keystone_rs's OPA download, actually verify the
+    # published checksum - SPIRE issues X.509/JWT identities for the whole
+    # control plane, so a corrupted/tampered binary here is a much higher
+    # blast radius than a corrupted policy engine.
+    pushd "$tmp_dir" >/dev/null
+    if ! grep " ${tarball}\$" checksums.txt | sha256sum -c - >/dev/null 2>&1; then
+        popd >/dev/null
+        rm -rf "$tmp_dir"
+        die $LINENO "SPIRE release checksum verification failed for $tarball"
+    fi
+    popd >/dev/null
+
+    tar -xzf "$tmp_dir/$tarball" -C "$tmp_dir"
+    sudo install -m 0755 "$tmp_dir/spire-${SPIRE_VERSION}/bin/spire-server" /usr/local/bin/spire-server
+    sudo install -m 0755 "$tmp_dir/spire-${SPIRE_VERSION}/bin/spire-agent" /usr/local/bin/spire-agent
+
+    rm -rf "$tmp_dir"
+}
+
+# Unlike SPIRE's own releases (which publish a
+# <asset>_sha256sum.txt per asset), spiffe-helper's release workflow
+# (github.com/spiffe/spiffe-helper .github/workflows/release_build.yaml)
+# uploads only the tarballs themselves, with no companion checksum file to
+# verify against. So the checksums below are pinned inline instead,
+# computed directly from the published release assets at the time this was
+# written - same "verify, don't skip" rationale as install_spire (this
+# binary writes actual SVID/key material to disk, at least as sensitive as
+# SPIRE itself). Bumping SPIFFE_HELPER_VERSION requires updating these.
+function install_spiffe_helper {
+    local arch tarball url checksum tmp_dir
+
+    case "$(uname -m)" in
+        x86_64)
+            arch=x86_64
+            checksum=7fba909574320d6a656e2e7d7f0657890fefad08a2abecd86c7bafe62d6d9134
+            ;;
+        aarch64)
+            arch=arm64
+            checksum=0386fd6113c4a4fcdd13cbf1663cdc29441d65f25c12a3662c6c9b01505bf329
+            ;;
+        *) die $LINENO "Unsupported architecture for spiffe-helper: $(uname -m)" ;;
+    esac
+
+    tmp_dir=$(mktemp -d)
+    tarball="spiffe-helper_v${SPIFFE_HELPER_VERSION}_Linux-${arch}.tar.gz"
+    url="https://github.com/spiffe/spiffe-helper/releases/download/v${SPIFFE_HELPER_VERSION}/${tarball}"
+
+    curl --proto '=https' --tlsv1.2 -sSfL "$url" -o "$tmp_dir/$tarball"
+
+    if ! (echo "$checksum  $tmp_dir/$tarball" | sha256sum -c - >/dev/null 2>&1); then
+        rm -rf "$tmp_dir"
+        die $LINENO "spiffe-helper release checksum verification failed for $tarball"
+    fi
+
+    tar -xzf "$tmp_dir/$tarball" -C "$tmp_dir"
+    sudo install -m 0755 "$tmp_dir/spiffe-helper" /usr/local/bin/spiffe-helper
+
+    rm -rf "$tmp_dir"
+}
+
+function configure_spire {
+    sudo install -d -o "$STACK_USER" -m 0755 "$SPIRE_DATA_DIR"
+
+    sed \
+        -e "s|@SPIRE_TRUST_DOMAIN@|$SPIRE_TRUST_DOMAIN|g" \
+        -e "s|@SPIRE_DATA_DIR@|$SPIRE_DATA_DIR|g" \
+        -e "s|@SPIRE_SERVER_SOCKET@|$SPIRE_SERVER_SOCKET|g" \
+        -e "s|@SPIRE_SERVER_BIND_PORT@|$SPIRE_SERVER_BIND_PORT|g" \
+        "$SPIRE_PLUGIN_ROOT/etc/spire-server.conf.tpl" | \
+        sudo -u "$STACK_USER" tee "$SPIRE_SERVER_CONF" >/dev/null
+
+    sed \
+        -e "s|@SPIRE_TRUST_DOMAIN@|$SPIRE_TRUST_DOMAIN|g" \
+        -e "s|@SPIRE_DATA_DIR@|$SPIRE_DATA_DIR|g" \
+        -e "s|@SPIRE_AGENT_SOCKET@|$SPIRE_AGENT_SOCKET|g" \
+        -e "s|@SPIRE_SERVER_BIND_PORT@|$SPIRE_SERVER_BIND_PORT|g" \
+        "$SPIRE_PLUGIN_ROOT/etc/spire-agent.conf.tpl" | \
+        sudo -u "$STACK_USER" tee "$SPIRE_AGENT_CONF" >/dev/null
+}
+
+function init_spire {
+    # Nothing to migrate - the sqlite3 DataStore self-initializes on first
+    # server start. Kept for naming symmetry with init_keystone_rs.
+    :
+}
+
+# Small retry helper for a CLI healthcheck (exit code), mirroring
+# devstack/lib/keystone-rs's wait_for_connection but for a command instead
+# of an HTTP URL.
+function _spire_wait_for_socket {
+    local desc=$1
+    shift
+    local i
+    for i in {1..60}; do
+        if "$@" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    die $LINENO "$desc did not become healthy"
+}
+
+function start_spire {
+    run_process spire-server "/usr/local/bin/spire-server run -config $SPIRE_SERVER_CONF"
+    _spire_wait_for_socket "SPIRE server" spire-server healthcheck -socketPath "$SPIRE_SERVER_SOCKET"
+
+    local token
+    token=$(spire-server token generate \
+        -socketPath "$SPIRE_SERVER_SOCKET" \
+        -spiffeID "spiffe://$SPIRE_TRUST_DOMAIN/agent" | awk '{print $2}')
+
+    run_process spire-agent "/usr/local/bin/spire-agent run -config $SPIRE_AGENT_CONF -joinToken $token"
+    _spire_wait_for_socket "SPIRE agent" spire-agent healthcheck -socketPath "$SPIRE_AGENT_SOCKET"
+
+    _spire_register_static_entries
+    _spire_register_compute_host "$(hostname)"
+    _spire_export_ca_bundle
+
+    # No-ops unless the corresponding OpenStack service is enabled in
+    # local.conf (Phase 1.5's devstack-full CI job); in today's
+    # keystone-only job none of these are enabled, so this block does
+    # nothing there. Each guard is a full `if` (not `cmd && cmd`) so a
+    # disabled service leaves the last statement - and thus start_spire's
+    # return code - at 0; devstack runs with `set -e` and a non-zero
+    # return here would trip its ERR trap.
+    if is_service_enabled n-api; then
+        _spire_start_helper nova "$SPIFFE_HELPER_CERTS_DIR/nova" "spiffe://$SPIRE_TRUST_DOMAIN/service/nova-api"
+    fi
+    if is_service_enabled c-api; then
+        _spire_start_helper cinder "$SPIFFE_HELPER_CERTS_DIR/cinder" "spiffe://$SPIRE_TRUST_DOMAIN/service/cinder"
+    fi
+    if is_service_enabled g-api; then
+        _spire_start_helper glance "$SPIFFE_HELPER_CERTS_DIR/glance" "spiffe://$SPIRE_TRUST_DOMAIN/service/glance"
+    fi
+    if is_service_enabled q-svc; then
+        _spire_start_helper neutron "$SPIFFE_HELPER_CERTS_DIR/neutron" "spiffe://$SPIRE_TRUST_DOMAIN/service/neutron"
+    fi
+}
+
+# Create a SPIRE registration entry if one for this SPIFFE ID doesn't
+# already exist. devstack routinely re-runs stack.sh, and
+# `spire-server entry create` errors out on an exact duplicate, which
+# would otherwise break that workflow.
+#
+# The hint is the SPIFFE ID itself: spiffe-helper 0.11.0 selects which
+# SVID to write via `hint` (matched against the entry's hint), and without
+# a pin every helper in a single-user devstack - where all entries share
+# the same unix:uid selector - would fall back to the same arbitrary
+# "default" SVID (the first in the agent's list) instead of its own
+# service's identity.
+function _spire_entry_create_idempotent {
+    local spiffe_id=$1
+    local selector=$2
+    local hint=$3
+
+    if spire-server entry show -socketPath "$SPIRE_SERVER_SOCKET" -spiffeID "$spiffe_id" 2>/dev/null | grep -q "$spiffe_id"; then
+        return 0
+    fi
+
+    spire-server entry create \
+        -socketPath "$SPIRE_SERVER_SOCKET" \
+        -parentID "spiffe://$SPIRE_TRUST_DOMAIN/agent" \
+        -spiffeID "$spiffe_id" \
+        -selector "$selector" \
+        -hint "$hint"
+}
+
+function _spire_register_static_entries {
+    local uid cinder_uid glance_uid
+    uid=$(id -u "$STACK_USER")
+    # devstack single-node CI may not create dedicated cinder/glance system
+    # users (all API services can end up running as $STACK_USER) - same
+    # caveat _spire_register_compute_host documents for nova below. Falling
+    # back to $STACK_USER's uid keeps this idempotent-safe either way.
+    cinder_uid=$(id -u cinder 2>/dev/null || echo "$uid")
+    glance_uid=$(id -u glance 2>/dev/null || echo "$uid")
+
+    _spire_entry_create_idempotent "spiffe://$SPIRE_TRUST_DOMAIN/service/keystone" "unix:uid:$uid" "spiffe://$SPIRE_TRUST_DOMAIN/service/keystone"
+    _spire_entry_create_idempotent "spiffe://$SPIRE_TRUST_DOMAIN/service/nova-api" "unix:uid:$uid" "spiffe://$SPIRE_TRUST_DOMAIN/service/nova-api"
+    _spire_entry_create_idempotent "spiffe://$SPIRE_TRUST_DOMAIN/service/neutron" "unix:uid:$uid" "spiffe://$SPIRE_TRUST_DOMAIN/service/neutron"
+    _spire_entry_create_idempotent "spiffe://$SPIRE_TRUST_DOMAIN/service/cinder" "unix:uid:$cinder_uid" "spiffe://$SPIRE_TRUST_DOMAIN/service/cinder"
+    _spire_entry_create_idempotent "spiffe://$SPIRE_TRUST_DOMAIN/service/glance" "unix:uid:$glance_uid" "spiffe://$SPIRE_TRUST_DOMAIN/service/glance"
+    # Storage-node identity for keystone-rs's raft gRPC when
+    # [distributed_storage] selects SPIFFE mTLS: with no explicit
+    # allowed_peer_svids the raft interceptor only accepts peer SVID paths
+    # <spiffe_path_prefix>node or <spiffe_path_prefix>storage-operator, so
+    # the keystone process needs the storage-node SVID alongside its
+    # /service/... ones.
+    _spire_entry_create_idempotent "spiffe://$SPIRE_TRUST_DOMAIN/keystone/storage/node" "unix:uid:$uid" "spiffe://$SPIRE_TRUST_DOMAIN/keystone/storage/node"
+}
+
+# Per-host nova-compute registration (ownership binding for Phase 2's
+# compute-host <-> instance verification). Each compute host gets its own
+# SPIFFE ID keyed to its hostname, rather than one shared identity for all
+# of nova-compute - see doc/plans/spire-integration.md Phase 1 "Per-host
+# nova-compute registration" for the full rationale.
+#
+# CAVEAT: this is the devstack join-token path, not x509pop. A join token
+# only proves possession of the token, not which host is joining - in
+# devstack's typical shared-token single-node setup, this does NOT give
+# the same host-identity guarantee production x509pop attestation would.
+# Treat this as sufficient to exercise later phases' code paths in CI, not
+# as a security-equivalent stand-in for x509pop.
+#
+# In single-node devstack (including today's CI job, which enables no
+# nova-compute service) this collapses to one call against the local
+# hostname at plugin start, rather than being triggered by a real agent
+# join event. A genuine multi-node deployment would need this invoked per
+# compute host against the shared server - out of scope for this phase.
+function _spire_register_compute_host {
+    local host=$1
+    local uid
+    uid=$(id -u nova 2>/dev/null || id -u "$STACK_USER")
+
+    _spire_entry_create_idempotent \
+        "spiffe://$SPIRE_TRUST_DOMAIN/service/nova-compute/host/$host" \
+        "unix:uid:$uid" \
+        "spiffe://$SPIRE_TRUST_DOMAIN/service/nova-compute/host/$host"
+}
+
+function _spire_export_ca_bundle {
+    sudo install -d -m 0755 "$(dirname "$SPIRE_CA_BUNDLE_DEST")"
+    spire-server bundle show -socketPath "$SPIRE_SERVER_SOCKET" -format pem | \
+        sudo tee "$SPIRE_CA_BUNDLE_DEST" >/dev/null
+    sudo chmod 0644 "$SPIRE_CA_BUNDLE_DEST"
+}
+
+# Start one spiffe-helper instance for the given service, writing its SVID/
+# key/CA bundle to its own cert_dir under $SPIFFE_HELPER_CERTS_DIR. One
+# run_process unit per service (not a single shared helper) so a stuck
+# helper for one service doesn't block the others, and stop_spire/
+# cleanup_spire stay symmetric to extend.
+#
+# The spiffe_id argument pins the helper to that service's own SVID via
+# the config's `hint` (matched against the entry's hint, see
+# _spire_entry_create_idempotent). It must match the entry the service's
+# real processes will be attested against in Phase 4/5 - note nova's API
+# identity is service/nova-api, not service/nova.
+#
+# Nothing consumes these certs yet in Phase 1.5 - this only issues them,
+# in preparation for the Phase 4/5 keystonemiddleware cutover.
+function _spire_start_helper {
+    local service_name=$1
+    local cert_dir=$2
+    local spiffe_id=$3
+    local conf=$SPIRE_DATA_DIR/spiffe-helper-${service_name}.conf
+
+    sudo install -d -o "$STACK_USER" -m 0755 "$cert_dir"
+
+    sed \
+        -e "s|@SPIRE_AGENT_SOCKET@|$SPIRE_AGENT_SOCKET|g" \
+        -e "s|@SPIFFE_HELPER_CERT_DIR@|$cert_dir|g" \
+        -e "s|@SPIFFE_HELPER_HINT@|$spiffe_id|g" \
+        "$SPIRE_PLUGIN_ROOT/etc/spiffe-helper.conf.tpl" | \
+        sudo -u "$STACK_USER" tee "$conf" >/dev/null
+
+    run_process "spiffe-helper-${service_name}" \
+        "/usr/local/bin/spiffe-helper -config $conf"
+}
+
+function stop_spire {
+    local svc
+    for svc in nova cinder glance neutron; do
+        stop_process "spiffe-helper-${svc}"
+    done
+    stop_process spire-agent
+    stop_process spire-server
+}
+
+function cleanup_spire {
+    sudo rm -rf "$SPIRE_DATA_DIR"
+    sudo rm -f "$SPIRE_CA_BUNDLE_DEST"
+}

@@ -1,0 +1,173 @@
+# Development defaults (single replica, emptyDir storage). Production
+# reference: tools/k8s/keystone/overlays/production and the "Kubernetes
+# Reference Deployment" section of doc/src/admin/storage/distributed.md.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app.kubernetes.io/name: keystone-rs
+  name: keystone-rs
+spec:
+  replicas: 1
+  # Raft members must be able to start together: `/ready` requires a
+  # known leader, so with the default `OrderedReady` policy a full restart
+  # of a multi-node cluster would wait forever for pod-0 (which cannot
+  # elect a leader alone) before creating pod-1. Note this field is
+  # immutable on an existing StatefulSet.
+  podManagementPolicy: Parallel
+  serviceName: keystone-rs-internal
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keystone-rs
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keystone-rs
+    spec:
+      serviceAccountName: keystone
+      initContainers:
+        - name: db-waiter
+          image: busybox
+          imagePullPolicy: IfNotPresent
+          command: ['sh', '-c', 'echo "Waiting for PostgreSQL to be available..."; while ! nc -z -w 1 keystone-db-rw 5432; do echo "Still waiting for postgres-service..."; sleep 2; done; echo "PostgreSQL is available! Starting application."']
+
+      containers:
+        - env:
+            - name: "OS_DATABASE__CONNECTION"
+              valueFrom:
+                secretKeyRef:
+                  key: "fqdn-uri"
+                  name: "keystone-db-app"
+          command: ["keystone"]
+
+          image: keystone-rs
+          name: keystone
+          ports:
+            - containerPort: 8080
+              name: keystone-rs
+              protocol: TCP
+            - containerPort: 8215
+              name: spiffe
+              protocol: TCP
+            - containerPort: 8300
+              name: keystone-raft
+              protocol: TCP
+            - containerPort: 8099
+              name: metrics
+              protocol: TCP
+
+          livenessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /health
+              port: metrics
+              scheme: HTTP
+            periodSeconds: 10
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /ready
+              port: metrics
+              scheme: HTTP
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          # Startup gates only the liveness probe, so it uses `/health`:
+          # `/ready` waits for a Raft leader and catch-up, which is not a
+          # reason to restart the container.
+          startupProbe:
+            failureThreshold: 600
+            httpGet:
+              path: /health
+              port: metrics
+              scheme: HTTP
+            periodSeconds: 1
+            successThreshold: 1
+            timeoutSeconds: 1
+          volumeMounts:
+            - mountPath: /var/log/keystone
+              name: keystone-logs
+            - mountPath: /etc/keystone/fernet-keys
+              name: fernet
+            - mountPath: /etc/keystone/credential-keys
+              name: fernet
+            - mountPath: /certs
+              name: certs
+              readOnly: true
+            - mountPath: /etc/keystone
+              name: raft-config-shared
+            - mountPath: /storage
+              name: raft-storage
+            - mountPath: /etc/keystone/keystone.conf
+              name: config
+              subPath: keystone.conf
+              readOnly: true
+            - mountPath: /run/spire/sockets
+              name: spiffe-workload-api
+              readOnly: true
+            - mountPath: "/var/opa"
+              name: "opa-socket"
+            - mountPath: /run/keystone
+              name: admin-socket
+
+        - command: ["opa", "run", "--server", "/policy", "--addr", "unix:///var/opa/opa.sock", "--watch", "/etc/certs"]
+          image: keystone-rs
+          name: opa
+          ports:
+            - containerPort: 8181
+              name: http
+          volumeMounts:
+            - mountPath: /var/opa
+              name: opa-socket
+            - name: "certs"
+              mountPath: "/etc/certs"
+              readOnly: true
+
+        # --- SPIFFE-Helper Container ---
+        - name: spiffe-helper
+          image: ghcr.io/spiffe/spiffe-helper:0.11.0
+          args: ["-config", "/etc/spiffe-helper/helper.conf"]
+          securityContext:
+            runAsUser: 1000
+          volumeMounts:
+            - name: certs
+              mountPath: /etc/certs
+            - mountPath: /run/spire/sockets
+              name: spiffe-workload-api
+              readOnly: true
+            - name: helper-config
+              mountPath: /etc/spiffe-helper
+
+      volumes:
+        - name: keystone-logs
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: keystone
+        - name: fernet
+          secret:
+            defaultMode: 420
+            optional: false
+            secretName: fernet-keys
+            items:
+              - key: "k0"
+                path: "0"
+              - key: "k1"
+                path: "1"
+        - name: raft-storage
+          emptyDir: {}
+        - name: raft-config-shared
+          emptyDir: {}
+        - name: admin-socket
+          emptyDir: {}
+        - name: opa-socket
+          emptyDir: {}
+        - name: "spiffe-workload-api"
+          csi:
+            driver: "csi.spiffe.io"
+            readOnly: true
+        - name: "certs"
+          emptyDir: {}
+        - name: "helper-config"
+          configMap:
+            name: spiffe-helper-cfg

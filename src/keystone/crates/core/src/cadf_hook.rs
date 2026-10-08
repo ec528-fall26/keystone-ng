@@ -1,0 +1,577 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! CADF audit hook and shared initiator-builder helpers (ADR 0023 Phase 3.4).
+//!
+//! [`CadfAuditHook`] translates `(ValidatedSecurityContext, Event,
+//! AuditOutcome)` triples into signed [`CadfEvent`]s and dispatches them via
+//! the critical channel of an [`AuditDispatcher`].
+//!
+//! The initiator-builder helpers are also used by the perimeter audit path in
+//! `crates/keystone/src/audit.rs`.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use cadf::sanitize::sanitize_audit_id;
+use cadf::{
+    AuditDispatcher, CadfEventPayload, Initiator, Observer, Outcome, OutcomeReason, Target,
+};
+use openstack_keystone_core_types::auth::{PrincipalInfo, ScopeInfo};
+use openstack_keystone_core_types::events::{Event, EventPayload, Operation};
+use uuid::Uuid;
+
+use crate::auth::ValidatedSecurityContext;
+use crate::events::{AuditDispatchError, AuditHook, AuditOutcome};
+
+/// Map a domain [`Event`] to a CADF action string.
+///
+/// `Operation::Other` strings are sanitized to `[a-zA-Z0-9/_-]`, capped at
+/// 64 characters. An empty result after sanitization maps to `"unknown"`.
+pub fn map_event_to_action(event: &Event) -> String {
+    match &event.operation {
+        Operation::Create => "create".to_string(),
+        Operation::Update => "update".to_string(),
+        Operation::Delete => "delete".to_string(),
+        Operation::Disable => "disable".to_string(),
+        Operation::Enable => "enable".to_string(),
+        Operation::Authenticate => "authenticate".to_string(),
+        Operation::Revoke => "revoke".to_string(),
+        Operation::Other(action) => cadf::types::sanitize_action(action),
+    }
+}
+
+/// Target ID for a payload whose subject IDs are all absent (a bulk operation
+/// without a single subject).
+const UNKNOWN_TARGET_ID: &str = "unknown";
+
+/// Map an [`EventPayload`] to a CADF `(target_id, type_uri)` pair.
+///
+/// `target_id` is passed through [`sanitize_audit_id`] to enforce UUID format.
+fn build_target_from_event(event: &Event) -> Target {
+    let (raw_id, type_uri): (&str, &str) = match &event.payload {
+        EventPayload::User { id } => (id, "data/security/identity/user"),
+        EventPayload::Group { id } => (id, "data/security/identity/group"),
+        EventPayload::GroupMembership { user_id: id, .. } => {
+            (id, "data/security/identity/group-membership")
+        }
+        EventPayload::Project { id } => (id, "data/security/account/project"),
+        EventPayload::Domain { id } => (id, "data/security/account/domain"),
+        EventPayload::Role { id } => (id, "data/security/authz/role"),
+        EventPayload::RoleImply {
+            prior_role_id: id, ..
+        } => (id, "data/security/authz/role-implication"),
+        EventPayload::RoleAssignment { role_id: id, .. } => {
+            (id, "data/security/authz/role-assignment")
+        }
+        EventPayload::ApplicationCredential { id, .. } => {
+            (id, "data/security/identity/application-credential")
+        }
+        EventPayload::AccessRule { id, .. } => (id, "data/security/identity/access-rule"),
+        EventPayload::Credential { id, .. } => (id, "data/security/identity/credential"),
+        EventPayload::CredentialSet {
+            user_id,
+            project_id,
+        } => (
+            user_id
+                .as_deref()
+                .or(project_id.as_deref())
+                .unwrap_or(UNKNOWN_TARGET_ID),
+            "data/security/identity/credential",
+        ),
+        EventPayload::Endpoint { id } => (id, "data/compute/catalog/endpoint"),
+        EventPayload::EndpointGroup { id } => (id, "data/compute/catalog/endpoint-group"),
+        EventPayload::ProjectEndpoint {
+            endpoint_id: id, ..
+        } => (id, "data/compute/catalog/project-endpoint"),
+        EventPayload::ProjectEndpointGroup {
+            endpoint_group_id: id,
+            ..
+        } => (id, "data/compute/catalog/project-endpoint-group"),
+        EventPayload::Region { id } => (id, "data/compute/catalog/region"),
+        EventPayload::Limit { id } => (id, "data/compute/limit/limit"),
+        EventPayload::RegisteredLimit { id } => (id, "data/compute/limit/registered-limit"),
+        EventPayload::Service { id } => (id, "data/compute/catalog/service"),
+        EventPayload::Trust { id } => (id, "data/security/identity/trust"),
+        EventPayload::Policy { id } => (id, "data/security/identity/policy"),
+        EventPayload::TokenRestriction { id } => (id, "data/security/identity/token-restriction"),
+        EventPayload::IdentityProvider { id } => (id, "data/security/identity/identity-provider"),
+        EventPayload::AuthState { id } => (id, "data/security/identity/auth-state"),
+        EventPayload::MappingRuleSet { mapping_id: id } => {
+            (id, "data/security/identity/mapping-ruleset")
+        }
+        EventPayload::VirtualUser { user_id: id } => (id, "data/security/identity/virtual-user"),
+        EventPayload::K8sAuthInstance { id } => (id, "data/security/identity/k8s-auth-instance"),
+        EventPayload::ScimRealm { provider_id } => {
+            (provider_id, "data/security/identity/scim-realm")
+        }
+        EventPayload::ApiKey { client_id, .. } => (client_id, "data/security/identity/api-key"),
+        EventPayload::Oauth2Client { provider_id, .. } => {
+            (provider_id, "data/security/identity/oauth2-client")
+        }
+        EventPayload::Oauth2SigningKey { domain_id } => {
+            (domain_id, "data/security/identity/oauth2-signing-key")
+        }
+        EventPayload::RevocationEvent { audit_id, user_id } => (
+            audit_id
+                .as_deref()
+                .or(user_id.as_deref())
+                .unwrap_or(UNKNOWN_TARGET_ID),
+            "data/security/identity/token",
+        ),
+        EventPayload::DomainConfig { domain_id } => {
+            (domain_id, "data/security/account/domain-config")
+        }
+        EventPayload::IdMapping {
+            public_id,
+            domain_id,
+        } => (
+            public_id
+                .as_deref()
+                .or(domain_id.as_deref())
+                .unwrap_or(UNKNOWN_TARGET_ID),
+            "data/security/identity/id-mapping",
+        ),
+        EventPayload::PluginIdentity {
+            user_id,
+            plugin_name,
+        } => (
+            user_id
+                .as_deref()
+                .or(plugin_name.as_deref())
+                .unwrap_or(UNKNOWN_TARGET_ID),
+            "data/security/identity/plugin-identity",
+        ),
+        EventPayload::ScimIndex { keystone_id, .. } => {
+            (keystone_id, "data/security/identity/scim-index")
+        }
+    };
+    Target::new(sanitize_audit_id(raw_id), type_uri)
+}
+
+/// Build an [`Initiator`] from a fully resolved [`ValidatedSecurityContext`].
+pub fn build_initiator_from_vsc(vsc: &ValidatedSecurityContext) -> Initiator {
+    let principal = vsc.inner().principal();
+    let user_id = sanitize_audit_id(&principal.get_user_id());
+    let project_id = vsc.inner().authorization().and_then(|a| match &a.scope {
+        ScopeInfo::Project { project, .. } => Some(sanitize_audit_id(&project.id)),
+        ScopeInfo::TrustProject(tpi) => Some(sanitize_audit_id(&tpi.project.id)),
+        _ => None,
+    });
+    let domain_id = principal
+        .domain_id()
+        .as_deref()
+        .map(sanitize_audit_id)
+        .or_else(|| {
+            vsc.inner().authorization().and_then(|a| match &a.scope {
+                ScopeInfo::Domain(d) => Some(sanitize_audit_id(&d.id)),
+                _ => None,
+            })
+        });
+    Initiator::new(
+        user_id,
+        project_id.filter(|id| id != "unknown"),
+        domain_id.filter(|id| id != "unknown"),
+        None,
+    )
+    .with_address(vsc.inner().peer_addr().map(str::to_string))
+}
+
+/// Build an [`Initiator`] from a known user id and the user's domain, for
+/// flows (OAuth2 OP grants) that identify the user without a validated
+/// security context.
+pub fn build_initiator_from_user_id(user_id: &str, domain_id: &str) -> Initiator {
+    Initiator::new(
+        sanitize_audit_id(user_id),
+        None,
+        Some(sanitize_audit_id(domain_id)).filter(|id| id != "unknown"),
+        None,
+    )
+}
+
+/// Build an all-`"unknown"` [`Initiator`] for total auth failure.
+pub fn build_initiator_unknown() -> Initiator {
+    Initiator::new("unknown".to_string(), None, None, None)
+}
+
+/// Build an [`Initiator`] from the principal of an authentication that
+/// succeeded, for a request that then failed later (scope selection, rescope
+/// restrictions, policy).
+///
+/// ADR 0023 §Phase 2: a request that authenticated but failed authorization
+/// is an authorization failure by a known principal, not an unknown caller,
+/// and the audit trail must say who it was. Only the user and the user's
+/// domain are known at this point: the scope was never established.
+pub fn build_initiator_from_principal(principal: &PrincipalInfo) -> Initiator {
+    let domain_id = principal
+        .domain_id()
+        .as_deref()
+        .map(sanitize_audit_id)
+        .filter(|id| id != "unknown");
+    Initiator::new(
+        sanitize_audit_id(&principal.get_user_id()),
+        None,
+        domain_id,
+        None,
+    )
+}
+
+/// Stamp the request's client address (from the request-scoped audit
+/// context) on an initiator that has none yet. An address set explicitly by
+/// the handler wins.
+#[must_use]
+pub fn with_request_address(initiator: Initiator) -> Initiator {
+    if initiator.address().is_some() {
+        return initiator;
+    }
+    initiator.with_address(crate::audit_context::client_ip().map(|ip| ip.to_string()))
+}
+
+fn cadf_outcome(outcome: &AuditOutcome) -> Outcome {
+    match outcome {
+        AuditOutcome::Attempt => Outcome::Pending,
+        AuditOutcome::Success => Outcome::Success,
+        AuditOutcome::Failure { .. } => Outcome::Failure,
+    }
+}
+
+fn outcome_reason(outcome: &AuditOutcome) -> Option<OutcomeReason> {
+    match outcome {
+        // The reason is a static variant name, but `variant` re-checks that
+        // it is nothing else before it reaches the signed record.
+        AuditOutcome::Failure { reason } => Some(OutcomeReason::variant(reason)),
+        _ => None,
+    }
+}
+
+/// CADF implementation of [`AuditHook`] (ADR 0023 Phase 3.4).
+///
+/// Translates `(ValidatedSecurityContext, Event, AuditOutcome)` triples into
+/// signed [`CadfEvent`]s and dispatches them via
+/// [`AuditDispatcher::dispatch_critical`].
+pub struct CadfAuditHook {
+    dispatcher: Arc<AuditDispatcher>,
+}
+
+impl CadfAuditHook {
+    pub fn new(dispatcher: Arc<AuditDispatcher>) -> Self {
+        Self { dispatcher }
+    }
+}
+
+#[async_trait]
+impl AuditHook for CadfAuditHook {
+    async fn on_auditable_event(
+        &self,
+        ctx: &ValidatedSecurityContext,
+        event: &Event,
+        outcome: &AuditOutcome,
+    ) -> Result<(), AuditDispatchError> {
+        let node_id = self.dispatcher.node_id().to_string();
+        let event_id = format!("{}:{}", node_id, Uuid::new_v4());
+        let payload = CadfEventPayload::new(
+            event_id,
+            "1.1".to_string(),
+            ctx.correlation_id().to_string(),
+            event.timestamp.to_rfc3339(),
+            map_event_to_action(event),
+            cadf_outcome(outcome),
+            outcome_reason(outcome),
+            build_initiator_from_vsc(ctx),
+            build_target_from_event(event),
+            Observer::new(
+                node_id.clone(),
+                format!("service/security/keystone/{node_id}"),
+            ),
+        );
+        let signed = payload.sign(&self.dispatcher);
+        match self.dispatcher.dispatch_critical(signed).await {
+            Ok(()) => Ok(()),
+            // A lost terminal outcome (Success/Failure) is counted once, by
+            // `audited_op!`, which sees the hook error; counting here as well
+            // would export every dead-channel loss twice.
+            Err(_) => Err(AuditDispatchError::DispatcherDead),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openstack_keystone_core_types::auth::{
+        AuthenticationContext, IdentityInfo, PrincipalInfo, SecurityContextTestingBuilder,
+        UserIdentityInfo,
+    };
+    use openstack_keystone_core_types::events::EventPayload;
+    use openstack_keystone_core_types::identity::{UserOptions, UserResponse};
+    use std::collections::HashMap;
+
+    fn make_user_identity(user_id: impl Into<String>) -> PrincipalInfo {
+        let uid = user_id.into();
+        let u = UserResponse {
+            id: uid.clone(),
+            domain_id: "d1".to_string(),
+            enabled: true,
+            name: "u".to_string(),
+            extra: HashMap::new(),
+            default_project_id: None,
+            federated: None,
+            options: UserOptions::default(),
+            password_expires_at: None,
+        };
+        let ui = UserIdentityInfo {
+            user_id: uid.clone(),
+            user: Some(u),
+            user_domain: None,
+            user_groups: Vec::new(),
+        };
+        PrincipalInfo {
+            identity: IdentityInfo::User(ui),
+        }
+    }
+
+    #[test]
+    fn map_event_to_action_covers_all_variants() {
+        let cases: &[(&Event, &str)] = &[
+            (
+                &Event::new(Operation::Create, EventPayload::Role { id: "r".into() }),
+                "create",
+            ),
+            (
+                &Event::new(Operation::Update, EventPayload::Role { id: "r".into() }),
+                "update",
+            ),
+            (
+                &Event::new(Operation::Delete, EventPayload::Role { id: "r".into() }),
+                "delete",
+            ),
+            (
+                &Event::new(Operation::Disable, EventPayload::Role { id: "r".into() }),
+                "disable",
+            ),
+            (
+                &Event::new(Operation::Enable, EventPayload::Role { id: "r".into() }),
+                "enable",
+            ),
+            (
+                &Event::new(
+                    Operation::Authenticate,
+                    EventPayload::Role { id: "r".into() },
+                ),
+                "authenticate",
+            ),
+            (
+                &Event::new(Operation::Revoke, EventPayload::Role { id: "r".into() }),
+                "revoke",
+            ),
+            (
+                &Event::new(
+                    Operation::Other("custom/op".into()),
+                    EventPayload::Role { id: "r".into() },
+                ),
+                "custom/op",
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(map_event_to_action(event), *expected);
+        }
+    }
+
+    #[test]
+    fn map_event_to_action_sanitizes_other() {
+        let e = Event::new(
+            Operation::Other("<script>alert(1)</script>".into()),
+            EventPayload::Role { id: "r".into() },
+        );
+        let action = map_event_to_action(&e);
+        // '<', '>', '(', ')' are stripped; '/' survives as a valid character.
+        assert_eq!(action, "scriptalert1/script");
+    }
+
+    #[test]
+    fn map_event_to_action_other_empty_returns_unknown() {
+        let e = Event::new(
+            Operation::Other("!!!".into()),
+            EventPayload::Role { id: "r".into() },
+        );
+        assert_eq!(map_event_to_action(&e), "unknown");
+    }
+
+    #[test]
+    fn build_target_from_event_sanitizes_id() {
+        let e = Event::new(
+            Operation::Delete,
+            EventPayload::User {
+                id: "not-a-uuid".into(),
+            },
+        );
+        let target = build_target_from_event(&e);
+        assert_eq!(target.id(), "unknown");
+        assert_eq!(target.type_uri(), "data/security/identity/user");
+    }
+
+    #[test]
+    fn build_initiator_from_vsc_carries_peer_addr_as_address() {
+        let mut ctx = SecurityContextTestingBuilder::default()
+            .authentication_context(AuthenticationContext::Password)
+            .principal(make_user_identity("uid"))
+            .build();
+        ctx.set_peer_addr("203.0.113.42");
+        let vsc = ValidatedSecurityContext::test_new(ctx);
+
+        let initiator = build_initiator_from_vsc(&vsc);
+        assert_eq!(initiator.address(), Some("203.0.113.42"));
+    }
+
+    #[test]
+    fn build_initiator_from_vsc_without_peer_addr_has_no_address() {
+        let ctx = SecurityContextTestingBuilder::default()
+            .authentication_context(AuthenticationContext::Password)
+            .principal(make_user_identity("uid"))
+            .build();
+        let vsc = ValidatedSecurityContext::test_new(ctx);
+
+        let initiator = build_initiator_from_vsc(&vsc);
+        assert_eq!(initiator.address(), None);
+    }
+
+    #[test]
+    fn build_initiator_unknown_is_all_unknown() {
+        let i = build_initiator_unknown();
+        assert_eq!(i.id(), "unknown");
+        assert!(i.project_id().is_none());
+        assert!(i.domain_id().is_none());
+    }
+
+    fn test_vsc() -> ValidatedSecurityContext {
+        let ctx = SecurityContextTestingBuilder::default()
+            .authentication_context(AuthenticationContext::Password)
+            .principal(make_user_identity("0123456789abcdef0123456789abcdef"))
+            .build();
+        ValidatedSecurityContext::test_new(ctx)
+    }
+
+    fn user_event() -> Event {
+        Event::new(
+            Operation::Delete,
+            EventPayload::User {
+                id: "fedcba9876543210fedcba9876543210".into(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn hook_dispatches_a_signed_record_on_the_critical_channel() {
+        let key: std::sync::Arc<[u8]> = std::sync::Arc::from(Uuid::new_v4().as_bytes().as_slice());
+        let (dispatcher, mut rx) = AuditDispatcher::new(
+            "node-1",
+            Uuid::new_v4().to_string(),
+            std::sync::Arc::clone(&key),
+            1,
+        );
+        let hook = CadfAuditHook::new(dispatcher.clone());
+
+        hook.on_auditable_event(&test_vsc(), &user_event(), &AuditOutcome::Attempt)
+            .await
+            .unwrap();
+        hook.on_auditable_event(
+            &test_vsc(),
+            &user_event(),
+            &AuditOutcome::Failure {
+                reason: "Conflict".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let attempt = rx.critical.try_recv().unwrap();
+        assert_eq!(attempt.payload().outcome(), Outcome::Pending);
+        assert_eq!(attempt.payload().action(), "delete");
+        assert_eq!(
+            attempt.payload().initiator().id(),
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert!(dispatcher.verify_hmac(&attempt, &key));
+        let failure = rx.critical.try_recv().unwrap();
+        assert_eq!(failure.payload().outcome(), Outcome::Failure);
+        assert!(failure.seq() > attempt.seq());
+        assert!(
+            rx.perimeter.try_recv().is_err(),
+            "provider records are critical"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_channel_maps_to_dispatcher_dead_without_counting_a_drop() {
+        let (dispatcher, rx) = AuditDispatcher::new(
+            "node-1",
+            Uuid::new_v4().to_string(),
+            std::sync::Arc::from(b"k".as_slice()),
+            1,
+        );
+        drop(rx.critical);
+        let hook = CadfAuditHook::new(dispatcher.clone());
+
+        for outcome in [AuditOutcome::Attempt, AuditOutcome::Success] {
+            let err = hook
+                .on_auditable_event(&test_vsc(), &user_event(), &outcome)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AuditDispatchError::DispatcherDead));
+        }
+        // Counting a lost outcome is `audited_op!`'s job, not the hook's.
+        assert_eq!(dispatcher.postaudit_dropped_count(), 0);
+    }
+
+    #[test]
+    fn build_target_type_uris_per_payload() {
+        let id = "0123456789abcdef0123456789abcdef".to_string();
+        for (payload, type_uri) in [
+            (
+                EventPayload::User { id: id.clone() },
+                "data/security/identity/user",
+            ),
+            (
+                EventPayload::Group { id: id.clone() },
+                "data/security/identity/group",
+            ),
+            (
+                EventPayload::Project { id: id.clone() },
+                "data/security/account/project",
+            ),
+            (
+                EventPayload::Domain { id: id.clone() },
+                "data/security/account/domain",
+            ),
+            (
+                EventPayload::Role { id: id.clone() },
+                "data/security/authz/role",
+            ),
+        ] {
+            let target = build_target_from_event(&Event::new(Operation::Create, payload));
+            assert_eq!(target.type_uri(), type_uri);
+            assert_eq!(target.id(), id);
+        }
+    }
+
+    #[test]
+    fn build_initiator_from_principal_has_user_and_domain_only() {
+        let principal = make_user_identity("0123456789abcdef0123456789abcdef");
+        let initiator = build_initiator_from_principal(&principal);
+        assert_eq!(initiator.id(), "0123456789abcdef0123456789abcdef");
+        assert!(
+            initiator.project_id().is_none(),
+            "scope was never established"
+        );
+    }
+}

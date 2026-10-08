@@ -1,0 +1,60 @@
+[package]
+name = "openstack-keystone-cli-manage"
+description = "OpenStack Keystone administrative CLI"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+exclude.workspace = true
+
+[[bin]]
+name="keystone-manage"
+path="src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+clap = { workspace = true, features = ["derive"] }
+color-eyre.workspace = true
+comfy-table = "8.0"
+eyre.workspace = true
+futures.workspace = true
+inventory.workspace = true
+openstack-keystone-api-types.workspace = true
+cadf.workspace = true
+openstack-keystone = { version = "0.1", path = "../keystone" }
+openstack-keystone-config.workspace = true
+openstack-keystone-core.workspace = true
+openstack-keystone-credential-driver-sql.workspace = true
+openstack-keystone-distributed-storage.workspace = true
+openstack-keystone-federation-driver-sql.workspace = true
+openstack-keystone-k8s-auth-driver-sql.workspace = true
+openstack-keystone-token-driver-fernet.workspace = true
+openstack-keystone-token-restriction-driver-sql.workspace = true
+openstack-keystone-webauthn.workspace = true
+oslo-config.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-mysql", "sqlx-postgres", "sqlx-sqlite", "runtime-tokio", "runtime-tokio-native-tls"] }
+sea-orm-migration = { workspace = true, features = ["sqlx-mysql", "sqlx-postgres", "sqlx-sqlite", "runtime-tokio", "runtime-tokio-native-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls"] }
+rustls = { workspace = true, features = ["aws-lc-rs"] }
+secrecy = { workspace = true, features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+spiffe = { workspace = true, features = ["x509-source"] }
+spiffe-rustls = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros"] }
+tonic = { workspace = true, features = ["tls-aws-lc" ] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+httpmock = { version = "0.8", features = ["http2"] }
+openstack-keystone-credential-driver-sql = { version = "0.1", path = "../credential-driver-sql", features = ["test-support"] }
+serde.workspace = true
+temp-env.workspace = true
+tempfile.workspace = true

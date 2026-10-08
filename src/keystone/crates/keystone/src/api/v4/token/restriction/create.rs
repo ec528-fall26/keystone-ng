@@ -1,0 +1,182 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! Token restriction: create.
+
+use axum::{Json, debug_handler, extract::State, http::StatusCode, response::IntoResponse};
+use serde_json::json;
+use validator::Validate;
+
+use crate::api::auth::Auth;
+use crate::api::error::KeystoneApiError;
+use crate::api::v4::token::types::*;
+use crate::keystone::ServiceState;
+use openstack_keystone_core::auth::ExecutionContext;
+
+/// Create the token restriction.
+///
+/// Create the token restriction with the specified properties.
+///
+/// It is expected that only admin user is able to create token restriction in
+/// other domain.
+#[utoipa::path(
+    post,
+    path = "/",
+    operation_id = "/token_restriction:create",
+    responses(
+        (status = CREATED, description = "token restriction object", body = TokenRestrictionResponse),
+    ),
+    security(("x-auth" = [])),
+    tag="token_restriction"
+)]
+#[tracing::instrument(
+    name = "api::token_restriction::create",
+    level = "debug",
+    skip(state, user_auth),
+    err(Debug)
+)]
+#[debug_handler]
+pub(super) async fn create(
+    Auth(user_auth): Auth,
+    State(state): State<ServiceState>,
+    Json(req): Json<TokenRestrictionCreateRequest>,
+) -> Result<impl IntoResponse, KeystoneApiError> {
+    req.validate()?;
+    state
+        .policy_enforcer
+        .enforce(
+            "identity/token/token_restriction/create",
+            &user_auth,
+            json!({"restriction": req.restriction}),
+            None,
+        )
+        .await?;
+
+    let res = state
+        .provider
+        .get_token_provider()
+        .create_token_restriction(&ExecutionContext::from_auth(&state, &user_auth), req.into())
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(TokenRestrictionResponse {
+            restriction: TokenRestriction::from(res),
+        }),
+    )
+        .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode, header},
+    };
+    use http_body_util::BodyExt; // for `collect`
+    use tower::ServiceExt; // for `call`, `oneshot`, and `ready`
+    use tower_http::trace::TraceLayer;
+
+    use openstack_keystone_core_types::role::RoleRef as ProviderRoleRef;
+    use openstack_keystone_core_types::token as provider_types;
+
+    use super::{
+        super::{openapi_router, tests::get_token_provider_mock_with_mocks},
+        *,
+    };
+    use crate::api::tests::{get_mocked_state, test_fixture_scoped};
+    use crate::provider::Provider;
+
+    #[tokio::test]
+    async fn test_create() {
+        let vsc = test_fixture_scoped();
+        let mut token_mock = get_token_provider_mock_with_mocks();
+        token_mock
+            .expect_create_token_restriction()
+            .withf(|_, req: &provider_types::TokenRestrictionCreate| {
+                provider_types::TokenRestrictionCreate {
+                    id: String::new(),
+                    domain_id: "did".into(),
+                    user_id: Some("uid".into()),
+                    project_id: Some("pid".into()),
+                    allow_renew: true,
+                    allow_rescope: true,
+                    role_ids: vec!["r1".into()],
+                } == *req
+            })
+            .returning(|_, _| {
+                Ok(provider_types::TokenRestriction {
+                    user_id: Some("uid".into()),
+                    allow_renew: true,
+                    allow_rescope: true,
+                    id: "bar".into(),
+                    domain_id: "did".into(),
+                    project_id: Some("pid".into()),
+                    role_ids: vec!["r1".into(), "r2".into()],
+                    roles: Some(vec![ProviderRoleRef {
+                        id: "r1".into(),
+                        name: Some("r1n".into()),
+                        domain_id: None,
+                    }]),
+                })
+            });
+
+        let state = get_mocked_state(
+            Provider::mocked_builder().mock_token(token_mock),
+            true,
+            None,
+        )
+        .await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state.clone());
+
+        let req = TokenRestrictionCreateRequest {
+            restriction: TokenRestrictionCreate {
+                domain_id: "did".into(),
+                user_id: Some("uid".into()),
+                project_id: Some("pid".into()),
+                allow_renew: true,
+                allow_rescope: true,
+                roles: vec![
+                    ProviderRoleRef {
+                        id: "r1".into(),
+                        name: Some("r1n".into()),
+                        domain_id: None,
+                    }
+                    .into(),
+                ],
+            },
+        };
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .uri("/")
+                    .extension(vsc)
+                    .body(Body::from(serde_json::to_string(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let res: TokenRestrictionResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(res.restriction.domain_id, req.restriction.domain_id);
+    }
+}

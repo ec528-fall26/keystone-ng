@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/name: keystone-py
+  name: keystone-py
+spec:
+  ports:
+    - name: http-py
+      port: 5000
+      protocol: TCP
+      targetPort: 5000
+  selector:
+    app.kubernetes.io/name: keystone-py
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/name: keystone-rs
+  name: keystone-rs
+spec:
+  ports:
+    - name: http-rs
+      port: 8080
+      protocol: TCP
+      targetPort: 8080
+    - name: https-rs
+      port: 8215
+      protocol: TCP
+      targetPort: 8215
+  selector:
+    app.kubernetes.io/name: keystone-rs
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/name: keystone-rs-raft
+  name: keystone-rs-internal
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: raft
+      port: 8300
+      protocol: TCP
+      targetPort: 8300
+  selector:
+    app.kubernetes.io/name: keystone-rs

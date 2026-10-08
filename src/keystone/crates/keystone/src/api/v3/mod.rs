@@ -1,0 +1,113 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! v3 API.
+
+use axum::{
+    Json,
+    extract::{OriginalUri, Request, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+};
+use utoipa::OpenApi;
+use utoipa_axum::{router::OpenApiRouter, routes};
+
+use crate::api::common::public_base_url;
+use crate::api::error::KeystoneApiError;
+use crate::keystone::ServiceState;
+
+pub mod auth;
+pub mod credential;
+pub mod domain;
+pub mod domain_config;
+pub mod ec2tokens;
+pub mod endpoint;
+pub mod group;
+pub mod os_trust;
+pub mod policy;
+pub mod project;
+pub mod region;
+pub mod role;
+pub mod role_assignment;
+pub mod role_inferences;
+pub mod service;
+pub mod unified_limit;
+pub mod user;
+
+use crate::api::types::*;
+
+/// OpenApi specification for v3.
+#[derive(OpenApi)]
+#[openapi(
+    nest(
+      (path = "/roles", api = role::ApiDoc),
+      (path = "/limits", api = unified_limit::ApiDoc),
+    ),
+)]
+pub struct ApiDoc;
+
+pub(super) fn openapi_router() -> OpenApiRouter<ServiceState> {
+    OpenApiRouter::new()
+        .nest("/auth", auth::openapi_router())
+        .nest("/credentials", credential::openapi_router())
+        .nest(
+            "/domains",
+            domain::openapi_router().merge(domain_config::openapi_router()),
+        )
+        .nest("/ec2tokens", ec2tokens::openapi_router())
+        .nest("/endpoints", endpoint::openapi_router())
+        .nest("/groups", group::openapi_router())
+        .nest("/OS-TRUST", os_trust::openapi_router())
+        .nest("/policies", policy::openapi_router())
+        .nest("/projects", project::openapi_router())
+        .nest("/regions", region::openapi_router())
+        .nest("/roles", role::openapi_router())
+        .nest("/role_inferences", role_inferences::openapi_router())
+        .nest("/services", service::openapi_router())
+        .nest("/users", user::openapi_router())
+        .merge(role_assignment::openapi_router())
+        .merge(unified_limit::openapi_router())
+        .routes(routes!(version))
+}
+
+/// Version discovery endpoint
+#[utoipa::path(
+    get,
+    path = "/",
+    description = "Version discovery",
+    responses(
+        (status = OK, description = "Versions", body = SingleVersion),
+    ),
+    tag = "version"
+)]
+async fn version(
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    State(state): State<ServiceState>,
+    _req: Request,
+) -> Result<impl IntoResponse, KeystoneApiError> {
+    let host = public_base_url(&state, &headers).await;
+    let link = Link {
+        rel: "self".into(),
+        href: format!("{}{}", host, uri.path()),
+    };
+    let version = VersionBuilder::default()
+        .id("v3.14")
+        .status(VersionStatus::Stable)
+        .links(vec![link])
+        .media_types(vec![MediaType::default()])
+        .build()?;
+    let res = SingleVersion { version };
+    Ok((StatusCode::OK, Json(res)).into_response())
+}

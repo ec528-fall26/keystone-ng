@@ -1,0 +1,153 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! Role assignment database backend.
+
+use openstack_keystone_core::assignment::AssignmentProviderError;
+use openstack_keystone_core_types::assignment::*;
+
+use crate::entity::{
+    assignment as db_assignment, sea_orm_active_enums::Type as DbAssignmentType,
+    system_assignment as db_system_assignment,
+};
+
+mod check;
+mod create;
+mod delete;
+mod list;
+
+pub use check::check;
+pub use create::create;
+pub use delete::delete;
+pub use list::list_for_multiple_actors_and_targets;
+
+impl From<db_assignment::Model> for Assignment {
+    fn from(value: db_assignment::Model) -> Self {
+        Self {
+            role_id: value.role_id,
+            role_name: None,
+            actor_id: value.actor_id,
+            target_id: value.target_id,
+            inherited: value.inherited,
+            r#type: value.r#type.into(),
+            implied_via: None,
+        }
+    }
+}
+
+impl TryFrom<db_system_assignment::Model> for Assignment {
+    type Error = AssignmentProviderError;
+
+    fn try_from(value: db_system_assignment::Model) -> Result<Self, Self::Error> {
+        let mut builder = AssignmentBuilder::default();
+        builder.role_id(value.role_id);
+        builder.actor_id(value.actor_id);
+        builder.target_id(value.target_id);
+        builder.inherited(value.inherited);
+        builder.r#type(match value.r#type.as_ref() {
+            "GroupDomain" => AssignmentType::GroupDomain,
+            "GroupProject" => AssignmentType::GroupProject,
+            "GroupSystem" => AssignmentType::GroupSystem,
+            "UserDomain" => AssignmentType::UserDomain,
+            "UserProject" => AssignmentType::UserProject,
+            "UserSystem" => AssignmentType::UserSystem,
+            _ => {
+                return Err(AssignmentProviderError::InvalidAssignmentType(
+                    value.r#type.clone(),
+                ));
+            }
+        });
+
+        Ok(builder.build()?)
+    }
+}
+
+impl From<&db_assignment::Model> for Assignment {
+    fn from(value: &db_assignment::Model) -> Self {
+        Self::from(value.clone())
+    }
+}
+
+impl From<DbAssignmentType> for AssignmentType {
+    fn from(value: DbAssignmentType) -> Self {
+        match value {
+            DbAssignmentType::GroupDomain => Self::GroupDomain,
+            DbAssignmentType::GroupProject => Self::GroupProject,
+            DbAssignmentType::UserDomain => Self::UserDomain,
+            DbAssignmentType::UserProject => Self::UserProject,
+        }
+    }
+}
+
+impl TryFrom<&AssignmentType> for DbAssignmentType {
+    type Error = AssignmentProviderError;
+    fn try_from(value: &AssignmentType) -> Result<Self, Self::Error> {
+        match value {
+            AssignmentType::GroupDomain => Ok(Self::GroupDomain),
+            AssignmentType::GroupProject => Ok(Self::GroupProject),
+            AssignmentType::UserDomain => Ok(Self::UserDomain),
+            AssignmentType::UserProject => Ok(Self::UserProject),
+            AssignmentType::UserSystem => {
+                Err(Self::Error::InvalidAssignmentType("UserSystem".into()))
+            }
+            AssignmentType::GroupSystem => {
+                Err(Self::Error::InvalidAssignmentType("GroupSystem".into()))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use crate::entity::{assignment, sea_orm_active_enums, system_assignment};
+
+    /// Create a mock role assignment.
+    ///
+    /// # Parameters
+    ///
+    /// * `role_id` - The role ID.
+    ///
+    /// # Returns
+    ///
+    /// A mock `assignment::Model`.
+    pub fn get_role_assignment_mock<S: Into<String>>(role_id: S) -> assignment::Model {
+        assignment::Model {
+            role_id: role_id.into(),
+            actor_id: "actor".into(),
+            target_id: "target".into(),
+            r#type: sea_orm_active_enums::Type::UserProject,
+            inherited: false,
+        }
+    }
+
+    /// Create a mock system role assignment.
+    ///
+    /// # Parameters
+    ///
+    /// * `role_id` - The role ID.
+    ///
+    /// # Returns
+    ///
+    /// A mock `system_assignment::Model`.
+    pub fn get_role_system_assignment_mock<S: Into<String>>(
+        role_id: S,
+    ) -> system_assignment::Model {
+        system_assignment::Model {
+            role_id: role_id.into(),
+            actor_id: "actor".into(),
+            target_id: "system".into(),
+            r#type: "UserSystem".into(),
+            inherited: false,
+        }
+    }
+}

@@ -1,0 +1,64 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # V3 API types
+pub mod application_credential;
+pub mod auth;
+pub mod credential;
+pub mod domain;
+pub mod domain_config;
+pub mod ec2tokens;
+pub mod endpoint;
+pub mod group;
+pub mod limit;
+pub mod os_ec2_credential;
+pub mod policy;
+pub mod project;
+pub mod region;
+pub mod registered_limit;
+pub mod role;
+pub mod role_assignment;
+pub mod service;
+pub mod trust;
+pub mod user;
+
+#[cfg(feature = "conv")]
+mod credential_conv;
+#[cfg(feature = "conv")]
+mod domain_config_conv;
+#[cfg(feature = "conv")]
+mod domain_conv;
+#[cfg(feature = "conv")]
+mod endpoint_conv;
+#[cfg(feature = "conv")]
+mod group_conv;
+#[cfg(feature = "conv")]
+mod limit_conv;
+#[cfg(feature = "conv")]
+mod policy_conv;
+#[cfg(feature = "conv")]
+mod project_conv;
+#[cfg(feature = "conv")]
+mod region_conv;
+#[cfg(feature = "conv")]
+mod registered_limit_conv;
+#[cfg(feature = "conv")]
+mod role_assignment_conv;
+#[cfg(feature = "conv")]
+mod role_conv;
+#[cfg(feature = "conv")]
+mod service_conv;
+#[cfg(feature = "conv")]
+mod trust_conv;
+#[cfg(feature = "conv")]
+mod user_conv;

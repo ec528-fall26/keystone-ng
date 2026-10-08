@@ -1,0 +1,39 @@
+[package]
+name = "openstack-keystone-config"
+description = "OpenStack Keystone configuration"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+exclude.workspace = true
+
+[dependencies]
+cadf.workspace = true
+chrono = { workspace = true, features = ["now", "serde"] }
+config = { workspace = true, features = ["async", "ini", "toml"] }
+eyre.workspace = true
+http.workspace = true
+ipnet = { workspace = true }
+log.workspace = true
+oslo-config.workspace = true
+regex.workspace = true
+secrecy = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tracing.workspace = true
+url = { workspace = true, features = ["serde"] }
+url-macro.workspace = true
+validator = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true
+temp-env.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

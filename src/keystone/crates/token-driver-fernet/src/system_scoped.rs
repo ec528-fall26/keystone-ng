@@ -1,0 +1,110 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use std::io::Write;
+
+use openstack_keystone_core_types::token::SystemScopePayload;
+
+use crate::{FernetDriverError, FernetTokenProvider, MsgPackToken, utils};
+
+impl MsgPackToken for SystemScopePayload {
+    type Token = Self;
+
+    /// Construct MsgPack payload for the Token.
+    ///
+    /// # Parameters
+    /// - `wd`: The writer to write the payload to.
+    /// - `fernet_provider`: The Fernet token provider.
+    ///
+    /// # Returns
+    /// A `Result` indicating success or a `FernetDriverError`.
+    fn assemble<W: Write>(
+        &self,
+        wd: &mut W,
+        fernet_provider: &FernetTokenProvider,
+    ) -> Result<(), FernetDriverError> {
+        utils::write_uuid(wd, &self.user_id)?;
+        utils::write_auth_methods_code(
+            wd,
+            fernet_provider.encode_auth_methods(self.methods.clone())?,
+        )?;
+        utils::write_str(wd, &self.system_id)?;
+        utils::write_time(wd, self.expires_at)?;
+        utils::write_audit_ids(wd, self.audit_ids.clone())?;
+
+        Ok(())
+    }
+
+    /// Parse MsgPack payload into the Token.
+    ///
+    /// # Parameters
+    /// - `rd`: The reader to read the payload from.
+    /// - `fernet_provider`: The Fernet token provider.
+    ///
+    /// # Returns
+    /// A `Result` containing the `SystemScopePayload` if successful, or a
+    /// `FernetDriverError`.
+    fn disassemble(
+        rd: &mut &[u8],
+        fernet_provider: &FernetTokenProvider,
+    ) -> Result<Self::Token, FernetDriverError> {
+        // Order of reading is important
+        let user_id = utils::read_uuid(rd)?;
+        let methods: Vec<String> = fernet_provider
+            .decode_auth_methods(utils::read_auth_methods_code(rd)?)?
+            .into_iter()
+            .collect();
+        let system_id = utils::read_str(rd)?;
+        let expires_at = utils::read_time(rd)?;
+        let audit_ids: Vec<String> = utils::read_audit_ids(rd)?.into_iter().collect();
+        Ok(Self {
+            user_id,
+            methods,
+            expires_at,
+            audit_ids,
+            system_id,
+            ..Default::default()
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Local, SubsecRound};
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::tests::setup_config;
+
+    #[test]
+    fn test_roundtrip() {
+        let token = SystemScopePayload {
+            user_id: Uuid::new_v4().simple().to_string(),
+            methods: vec!["password".into()],
+            system_id: "system".to_string(),
+            audit_ids: vec!["Zm9vCg".into()],
+            expires_at: Local::now().trunc_subsecs(0).into(),
+            ..Default::default()
+        };
+
+        let provider = FernetTokenProvider::new(setup_config());
+
+        let mut buf = vec![];
+        token.assemble(&mut buf, &provider).unwrap();
+        let encoded_buf = buf.clone();
+        let decoded =
+            SystemScopePayload::disassemble(&mut encoded_buf.as_slice(), &provider).unwrap();
+        assert_eq!(token, decoded);
+    }
+}

@@ -1,0 +1,25 @@
+
+configMapGenerator:
+  - name: keystone
+    behavior: replace
+    files:
+      - conf/keystone.conf
+
+resources:
+  - ../../base
+
+images:
+  - name: keystone-rs
+    newName: keystone-rs
+  - name: busybox
+    newName: busybox
+
+replicas:
+  - name: keystone-rs
+    count: 2
+
+patches:
+  - target:
+      kind: StatefulSet
+      name: keystone-rs
+    path: statefulset-dev-patch.yaml

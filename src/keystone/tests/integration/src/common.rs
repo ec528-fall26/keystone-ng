@@ -1,0 +1,370 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+use std::fs::create_dir;
+use std::future::Future;
+use std::net::IpAddr;
+use std::ops::Deref;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time as std_time;
+
+use eyre::{Result, WrapErr};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, SanType,
+};
+use sea_orm::{
+    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbConn, schema::Schema,
+};
+use secrecy::SecretString;
+use tempfile::TempDir;
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+use cadf::AuditDispatcher;
+use openstack_keystone::plugin_manager::PluginManager;
+use openstack_keystone_config::{Config, LoadedConfig, TlsConfiguration, TlsConfigurationBuilder};
+use openstack_keystone_core::policy::MockPolicy;
+use openstack_keystone_core::provider::Provider;
+use openstack_keystone_core::{SqlDriverRegistration, keystone::Service};
+use openstack_keystone_distributed_storage::config::{
+    DistributedStorageConfiguration, KekProvider, RaftTlsConfiguration, config_manager_with,
+};
+
+/// Setup the database schema.
+///
+/// Create tables in the order of the foreign references with indexes and types.
+pub async fn setup_schema(db: &DbConn) -> Result<()> {
+    // TODO: with sea-orm 2.0 it can be improved
+    //db.get_schema_registry("crate::db::entity::*").sync(db).await?;
+    // Setup Schema helper
+    let schema = Schema::new(db.get_database_backend());
+
+    // Iterate over the registered sql plugins and let the create everything
+    // they need in the database.
+    for driver in inventory::iter::<SqlDriverRegistration>
+        .into_iter()
+        .map(|x| x.driver)
+    {
+        driver.setup(db, &schema).await?;
+    }
+
+    Ok(())
+}
+
+/// Prepare the isolated Database
+///
+/// Based on the `DATABASE_URL` environment variable prepare the database for
+/// the tests:
+///
+/// - `postgres` - create a unique schema
+/// - `mysql` - create a unique database on the instance
+/// - other - use whatever passed.
+///
+/// By default (when `DATABASE_URL` var is unset) use inmemory sqlite.
+pub async fn get_isolated_database() -> Result<DatabaseConnection> {
+    let db_conn = std::env::var("DATABASE_URL").unwrap_or("sqlite::memory:".to_string());
+    let log_queries = std::env::var("DATABASE_LOG_QUERIES").is_ok();
+    let opts: ConnectOptions = ConnectOptions::new(&db_conn)
+        .sqlx_logging(log_queries)
+        .to_owned();
+    let root_db = Database::connect(opts)
+        .await
+        .wrap_err_with(|| format!("Failed to connect to database at {}", db_conn.clone()))?;
+    let isolated_db_url = if db_conn.starts_with("postgres") {
+        // Generate a unique schema name
+        let schema_name = format!("test_schema_{}", Uuid::new_v4().simple());
+
+        // Create the schema using a raw SQL driver (sqlx)
+        root_db
+            .execute_unprepared(&format!("CREATE SCHEMA \"{}\"", schema_name))
+            .await
+            .expect("Failed to create schema");
+
+        // Create a new connection string that targets this schema specifically
+        // Postgres uses 'search_path' to resolve table names
+        if db_conn.contains('?') {
+            format!("{}&options=-c%20search_path%3D{}", db_conn, schema_name)
+        } else {
+            format!("{}?options=-c%20search_path%3D{}", db_conn, schema_name)
+        }
+    } else if db_conn.starts_with("mysql") {
+        // Generate a unique database name
+        let db_name = format!("test_db_{}", Uuid::new_v4().simple());
+
+        // Create the database
+        // MySQL uses backticks for identifiers
+        root_db
+            .execute_unprepared(&format!("CREATE DATABASE `{}`", db_name))
+            .await
+            .expect("Failed to create database");
+
+        // Build the connection string for the specific test database
+        // Assuming base_url is "mysql://user:pass@localhost:3306"
+        format!("{}/{}", db_conn.trim_end_matches('/'), db_name)
+    } else {
+        // Just use whichever URL has been passed
+        db_conn
+    };
+    let opts = ConnectOptions::new(&isolated_db_url)
+        .sqlx_logging(log_queries)
+        .to_owned();
+    let db = Database::connect(opts).await.wrap_err_with(|| {
+        format!(
+            "Failed to connect to dedicated database at {}",
+            isolated_db_url.clone()
+        )
+    })?;
+    setup_schema(&db).await?;
+
+    Ok(db)
+}
+
+#[allow(unsafe_code)]
+pub async fn get_state() -> Result<(Arc<Service>, TempDir)> {
+    get_state_with_config(|_| {}).await
+}
+
+/// Like [`get_state`], but lets the caller adjust the [`Config`] before the
+/// [`Provider`] (and every service that captures a `Clone` of a config
+/// section at construction time, e.g. `Oauth2SessionService`) is built.
+/// Mutating `state.config_manager` *after* construction is not equivalent
+/// for those services -- they read their captured copy, not the live
+/// config -- so tests that need e.g. a non-default
+/// `[oauth2] refresh_token_reuse_grace_minutes` must go through this
+/// entry point instead.
+#[allow(unsafe_code)]
+pub async fn get_state_with_config(
+    mutate: impl FnOnce(&mut Config),
+) -> Result<(Arc<Service>, TempDir)> {
+    let db = get_isolated_database().await?;
+
+    let tmp_dir = TempDir::new()?;
+    let tmp_fernet_repo = tmp_dir.path().join("fernet");
+    create_dir(&tmp_fernet_repo)?;
+
+    let mut cfg: Config = Config::default();
+    cfg.auth.methods = vec!["application_credential".into(), "password".into()];
+    cfg.fernet_tokens.key_repository = tmp_fernet_repo.to_path_buf();
+    let fernet_utils = openstack_keystone_token_driver_fernet::utils::FernetUtils {
+        key_repository: cfg.fernet_tokens.key_repository.clone(),
+        max_active_keys: cfg.fernet_tokens.max_active_keys,
+    };
+    cfg.federation.default_authorization_ttl = 20;
+    fernet_utils.initialize_key_repository().await?;
+    cfg.mapping.cluster_salt = Some(SecretString::new(
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+            .to_string()
+            .into(),
+    ));
+    mutate(&mut cfg);
+
+    let mut ds_config: Option<DistributedStorageConfiguration> = None;
+    if std::env::var("USE_RAFT").is_ok() {
+        let tmp_db_dir = tmp_dir.path().join("certs");
+        create_dir(&tmp_db_dir)?;
+        let tls_configuration = RaftTlsConfiguration::Tls(make_certificates()?);
+        ds_config = Some(DistributedStorageConfiguration {
+            node_cluster_addr: "http://127.0.0.1:12345".parse()?,
+            node_listener_addr: "127.0.0.1:12345".parse()?,
+            node_id: 1,
+            path: tmp_db_dir.to_path_buf(),
+            tls_configuration,
+            dev_mode: true,
+            kek_provider: KekProvider::Env,
+            ..Default::default()
+        });
+        cfg.k8s_auth.driver = "raft".to_string();
+    }
+
+    let plugin_manager = PluginManager::with_config(&LoadedConfig::new(cfg.clone()).view()).await?;
+    let k8s_http_client =
+        Arc::new(openstack_keystone::k8s_auth_client::MockK8sHttpClient::default());
+    let nova_http_client: Arc<dyn openstack_keystone_core::nova_client::NovaHttpClient> = Arc::new(
+        openstack_keystone::nova_client_impl::KeystoneNovaHttpClient::new(
+            None,
+            std_time::Duration::from_secs(2),
+        )?,
+    );
+    let provider = Provider::new(&cfg, &plugin_manager, k8s_http_client, nova_http_client)?;
+
+    let concrete_storage: Option<Arc<openstack_keystone_distributed_storage::app::Storage>> =
+        if ds_config.is_some() {
+            // init_storage requires KEYSTONE_ALLOW_ENV_KEK=1 alongside dev_mode
+            // before it will use an environment-provided KEK. CI sets both
+            // ambiently (tools/raft-env.sh / workflow env), but a bare `cargo
+            // test -p integration` or an IDE test runner skips that setup, so
+            // fall back to setting the same well-known test values here —
+            // only if unset, so CI's own values always win. Multiple test
+            // tasks may race to set these concurrently, but every writer uses
+            // the identical constant value, so the race is benign.
+            // SAFETY: values written are constant across all callers.
+            unsafe {
+                if std::env::var("KEYSTONE_DEV_KEK").is_err() {
+                    std::env::set_var(
+                        "KEYSTONE_DEV_KEK",
+                        "4242424242424242424242424242424242424242424242424242424242424242",
+                    );
+                }
+                if std::env::var("KEYSTONE_ALLOW_ENV_KEK").is_err() {
+                    std::env::set_var("KEYSTONE_ALLOW_ENV_KEK", "1");
+                }
+            }
+            let cfg_mgr = config_manager_with(cfg.clone(), ds_config.clone());
+            let storage = openstack_keystone_distributed_storage::app::init_storage(&cfg_mgr)
+                .await
+                .wrap_err("Failed to init storage")?;
+            Some(storage)
+        } else {
+            None
+        };
+    let storage_for_service: Option<Arc<dyn openstack_keystone_storage_api::StorageApi>> =
+        concrete_storage
+            .as_ref()
+            .map(|s| Arc::clone(s) as Arc<dyn openstack_keystone_storage_api::StorageApi>);
+
+    let state = Arc::new(
+        Service::new(
+            config_manager_with(cfg, ds_config),
+            db,
+            provider,
+            Arc::new(MockPolicy::default()),
+            AuditDispatcher::noop(),
+            storage_for_service,
+        )
+        .await?,
+    );
+
+    if let Some(store) = &state.storage {
+        store
+            .initialize(std::collections::HashMap::from([(
+                1u64,
+                openstack_keystone_storage_api::Node {
+                    node_id: 1,
+                    rpc_addr: "127.0.0.1:12345".into(),
+                },
+            )]))
+            .await?;
+    }
+    std::thread::sleep(std_time::Duration::from_millis(200));
+    Ok((state, tmp_dir))
+}
+
+/// Trait to allow State to delete various resource types T
+pub trait ResourceDeleter<T>: Send + Sync + 'static {
+    fn delete(&self, resource: T) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+pub struct AsyncResourceGuard<T, S>
+where
+    T: Clone + Send + Sync + 'static,
+    S: ResourceDeleter<T> + Clone + Send + Sync + 'static,
+{
+    pub resource: T,
+    pub state: S,
+}
+
+impl<T, S> AsyncResourceGuard<T, S>
+where
+    T: Clone + Send + Sync + 'static,
+    S: ResourceDeleter<T> + Clone + Send + Sync + 'static,
+{
+    pub fn new(resource: T, state: S) -> Self {
+        Self { resource, state }
+    }
+
+    /// Use this at the end of a test if you want to WAIT for cleanup
+    /// instead of letting it happen in the background.
+    #[allow(unused)]
+    pub async fn cleanup(self) {
+        let state = self.state.clone();
+        let res = self.resource.clone();
+        state.delete(res).await;
+        std::mem::forget(self);
+    }
+}
+
+impl<T, S> Drop for AsyncResourceGuard<T, S>
+where
+    T: Clone + Send + Sync + 'static,
+    S: ResourceDeleter<T> + Clone + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        let state = self.state.clone();
+        let res = self.resource.clone();
+
+        // Safety net for test panics
+        tokio::spawn(async move {
+            state.delete(res).await;
+        });
+    }
+}
+
+impl<T, S> Deref for AsyncResourceGuard<T, S>
+where
+    T: Clone + Send + Sync + 'static,
+    S: ResourceDeleter<T> + Clone + Send + Sync + 'static,
+{
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.resource
+    }
+}
+
+fn make_certificates() -> Result<TlsConfiguration> {
+    let now = OffsetDateTime::now_utc();
+    let thirty_days = time::Duration::days(30);
+
+    // 1. Generate CA private key and certificate
+    let mut ca_params = CertificateParams::default();
+    ca_params.not_before = now;
+    ca_params.not_after = now + thirty_days;
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::CrlSign,
+    ];
+
+    let mut ca_dn = DistinguishedName::new();
+    ca_dn.push(DnType::CommonName, "CA");
+    ca_params.distinguished_name = ca_dn;
+
+    let ca_key = KeyPair::generate()?;
+    let ca_cert = ca_params.self_signed(&ca_key)?;
+    let ca = Issuer::new(ca_params, ca_key);
+
+    // 2. Generate peer certificate (signed by CA)
+    let mut peer_cert_params = CertificateParams::default();
+    peer_cert_params.not_before = now;
+    peer_cert_params.not_after = now + thirty_days;
+
+    let client_ip: IpAddr = "127.0.0.1".parse()?;
+    peer_cert_params.subject_alt_names = vec![SanType::IpAddress(client_ip)];
+    peer_cert_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    peer_cert_params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    let peer_key = KeyPair::generate()?;
+    let peer_cert = peer_cert_params.signed_by(&peer_key, &ca)?;
+
+    Ok(TlsConfigurationBuilder::default()
+        .tls_client_ca_content(ca_cert.pem().as_bytes().to_vec())
+        .tls_cert_content(peer_cert.pem().as_bytes().to_vec())
+        .tls_key_content(peer_key.serialize_pem().as_bytes().to_vec())
+        .build()?)
+}

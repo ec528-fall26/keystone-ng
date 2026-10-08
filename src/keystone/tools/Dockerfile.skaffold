@@ -1,0 +1,123 @@
+FROM lukemathwalker/cargo-chef:latest-rust-1.99.0-slim-trixie AS base
+ENV CARGO_HOME=/usr/local/cargo
+ENV CARGO_TARGET_DIR=/app/target
+
+#RUN cargo install --locked cargo-chef
+WORKDIR /app
+
+FROM base AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM base AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssl libssl-dev libssl3 pkg-config protobuf-compiler libprotobuf-dev && \
+    rm -rf /var/lib/apt/lists/* && update-ca-certificates
+
+COPY --from=planner /app/recipe.json recipe.json
+
+# Single cargo-chef cook covering ALL packages - shared dependency cache.
+# `/app/target` is deliberately NOT a BuildKit cache mount anywhere in this
+# file: contents of a cache mount are not part of the image layer, so they
+# can't be exported to / restored from a remote layer cache, which is what
+# CI relies on (tools/ci-build-image.sh). Keeping the compiled dependencies
+# in the layer produced by this step makes them reusable until recipe.json
+# changes.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo chef cook \
+    -p openstack-keystone -p openstack-keystone-cli-manage -p test_api -p test_federation \
+    --features openstack-keystone/otel \
+    --recipe-path recipe.json --profile skaffold
+
+COPY crates crates
+COPY tests tests
+COPY Cargo.toml Cargo.toml
+COPY Cargo.lock Cargo.lock
+
+# Compile the wasm auth plugins
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    rustup target add wasm32-unknown-unknown &&\
+    cd crates/auth-plugin-runtime/tests/fixtures/reference-plugin &&\
+    cargo build --release --target wasm32-unknown-unknown &&\
+    cp /app/target/wasm32-unknown-unknown/release/reference_plugin.wasm /app/reference_plugin.wasm
+
+# Compile keystone + keystone-manage binaries. The `otel` feature only compiles
+# the OTLP exporters in; they stay off until `[otel] enabled` (ADR 0040).
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --profile skaffold \
+    -p openstack-keystone \
+    -p openstack-keystone-cli-manage \
+    --features openstack-keystone/otel && \
+    cp target/skaffold/keystone /app/keystone && \
+    cp target/skaffold/keystone-manage /app/keystone-manage
+
+# Compile all test_api functional test binaries (single RUN for shared incremental cache)
+# Stale hash-suffixed binaries from the cook step could sit in
+# target/skaffold/deps alongside the freshly rebuilt one. Purge old matches
+# for each test name before building so the post-build find below matches
+# exactly one file - otherwise cp receives multiple source args and fails
+# with "No such file or directory" trying to treat /app/test-api-v3 as a
+# directory.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    find target/skaffold/deps -maxdepth 1 -type f -executable \
+    \( -name "integration_api_v3-*" -o -name "integration_api_v4-*" \
+    -o -name "k8s_auth-*" -o -name "raft_spiffe-*" -o -name "internal_spiffe_rest-*" \
+    -o -name "keycloak-*" -o -name "dex-*" -o -name "github-*" \) -delete 2>/dev/null; \
+    cargo test --profile skaffold \
+    -p test_api \
+    -p test_federation \
+    --test integration_api_v3 \
+    --test integration_api_v4 \
+    --test k8s_auth \
+    --test raft_spiffe \
+    --test internal_spiffe_rest \
+    --test keycloak \
+    --test dex \
+    --test github \
+    --no-run && \
+    cp $(find target/skaffold/deps -name "integration_api_v3-*" -type f -executable) /app/test-api-v3 && \
+    cp $(find target/skaffold/deps -name "integration_api_v4-*" -type f -executable) /app/test-api-v4 && \
+    cp $(find target/skaffold/deps -name "k8s_auth-*" -type f -executable) /app/test-k8s-auth && \
+    cp $(find target/skaffold/deps -name "raft_spiffe-*" -type f -executable) /app/test-raft-spiffe && \
+    cp $(find target/skaffold/deps -name "internal_spiffe_rest-*" -type f -executable) /app/test-internal-spiffe-rest && \
+    cp $(find target/skaffold/deps -name "keycloak-*" -type f -executable) /app/test-keycloak && \
+    cp $(find target/skaffold/deps -name "dex-*" -type f -executable) /app/test-dex && \
+    cp $(find target/skaffold/deps -name "github-*" -type f -executable) /app/test-github
+
+# Single runtime: keystone + keystone-manage + OPA + policies + all test binaries
+FROM debian:trixie-slim
+
+LABEL maintainer="Artem Goncharov"
+
+ARG OPA_VERSION=1.16.2
+ARG OSC_VERSION=0.13.7
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl-dev libssl3 pkg-config xz-utils jq curl && \
+    rm -rf /var/lib/apt/lists/* && update-ca-certificates
+
+COPY --from=builder /app/keystone /usr/local/bin/
+COPY --from=builder /app/keystone-manage /usr/local/bin/
+COPY --from=builder /app/reference_plugin.wasm /usr/local/lib/reference_plugin.wasm
+
+ADD https://github.com/open-policy-agent/opa/releases/download/v${OPA_VERSION}/opa_linux_amd64_static /usr/local/bin/opa
+RUN chmod 755 /usr/local/bin/opa
+
+#ADD https://github.com/gtema/openstack/releases/download/v${OSC_VERSION}/openstack_cli-x86_64-unknown-linux-musl.tar.xz /tmp/osc.tar.xz
+#RUN tar -xf /tmp/osc.tar.xz -C /tmp && \
+#    cp /tmp/openstack_cli-x86_64-unknown-linux-musl/osc /usr/local/bin/ && \
+#    chmod 755 /usr/local/bin/osc && \
+#    rm -rf /tmp/osc.tar.xz /tmp/openstack_cli-x86_64-unknown-linux-musl
+
+COPY policy /policy
+
+COPY --from=builder /app/test-api-v3 /tests/
+COPY --from=builder /app/test-api-v4 /tests/
+COPY --from=builder /app/test-k8s-auth /tests/
+COPY --from=builder /app/test-raft-spiffe /tests/
+COPY --from=builder /app/test-internal-spiffe-rest /tests/
+COPY --from=builder /app/test-keycloak /tests/
+COPY --from=builder /app/test-dex /tests/
+COPY --from=builder /app/test-github /tests/
+
+CMD ["keystone"]

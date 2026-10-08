@@ -1,0 +1,3001 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # Mapping provider
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::Utc;
+use secrecy::ExposeSecret;
+use tracing::debug;
+use uuid::Uuid;
+
+use openstack_keystone_config::Config;
+use openstack_keystone_core_types::auth::{
+    AuthenticationContext, AuthenticationResult, AuthenticationResultBuilder, AuthzInfo,
+    AuthzInfoBuilder, IdentityInfo, OidcContextBuilder, PrincipalIdentityInfoBuilder,
+    PrincipalInfo, ScopeInfo, UserIdentityInfoBuilder,
+};
+use openstack_keystone_core_types::events::{Event, EventPayload, Operation};
+use openstack_keystone_core_types::identity::{
+    FederationBuilder, FederationProtocol, GroupCreate, GroupListParameters, UserCreateBuilder,
+    UserResponse,
+};
+use openstack_keystone_core_types::mapping::*;
+use openstack_keystone_core_types::resource::{Domain, Project};
+
+use crate::auth::ExecutionContext;
+use crate::events::AuditDispatchError;
+use crate::keystone::ServiceState;
+use crate::mapping::{
+    MappingApi, MappingProviderError, backend::MappingBackend, engine, hmac, validation, version,
+};
+use crate::plugin_manager::PluginManagerApi;
+
+/// Reject any `RoleRef` in a rule's
+/// `Authorization::{Project,Domain,System}.roles` whose `id` does not
+/// correspond to an existing `Role`.
+///
+/// `RoleRef.id` is mandatory (unlike `name`, which is optional), so this
+/// check resolves against the `Role` store by `id`. Without it, a typo'd or
+/// invented role reference (e.g. the `SystemAdmin`/`DomainManager`
+/// naming-drift bug) silently produces an authorization that can never
+/// satisfy any policy check, instead of being rejected at write time.
+async fn validate_roles_exist<'a>(
+    ctx: &ExecutionContext<'a>,
+    rules: &[MappingRule],
+) -> Result<(), MappingProviderError> {
+    let mut checked: HashSet<&str> = HashSet::new();
+    for rule in rules {
+        for auth in &rule.authorizations {
+            let roles = match auth {
+                Authorization::Project { roles, .. } => roles,
+                Authorization::Domain { roles, .. } => roles,
+                Authorization::System { roles, .. } => roles,
+            };
+            for role_ref in roles {
+                let key = role_ref.id.as_str();
+                if !checked.insert(key) {
+                    continue;
+                }
+                let existing = ctx
+                    .state()
+                    .provider
+                    .get_role_provider()
+                    .get_role(ctx, key)
+                    .await
+                    .map_err(MappingProviderError::driver)?;
+                if existing.is_none() {
+                    return Err(MappingProviderError::RoleNotFound(key.to_string()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Derive [`AuthzInfo`] from authorization list produced by a matched ruleset
+/// rule.
+///
+/// Uses the first authorization to determine scope. If the list is empty,
+/// returns `None` so the authentication result remains unscoped.
+fn derive_authz_info(authorizations: &[Authorization]) -> Option<AuthzInfo> {
+    let (scope, roles) = match authorizations.first() {
+        Some(Authorization::Project {
+            project_id,
+            project_domain_id,
+            roles,
+        }) => {
+            let project = Project {
+                id: project_id.clone(),
+                name: String::new(),
+                description: None,
+                enabled: true,
+                is_domain: false,
+                parent_id: None,
+                domain_id: project_domain_id.clone(),
+                extra: Default::default(),
+                options: Default::default(),
+            };
+            let domain = Domain {
+                id: project_domain_id.clone(),
+                name: String::new(),
+                description: None,
+                enabled: true,
+                extra: Default::default(),
+                options: Default::default(),
+            };
+            (
+                ScopeInfo::Project {
+                    project,
+                    project_domain: domain,
+                },
+                roles.clone(),
+            )
+        }
+        Some(Authorization::Domain { domain_id, roles }) => {
+            let domain = Domain {
+                id: domain_id.clone(),
+                name: String::new(),
+                description: None,
+                enabled: true,
+                extra: Default::default(),
+                options: Default::default(),
+            };
+            (ScopeInfo::Domain(domain), roles.clone())
+        }
+        Some(Authorization::System { system_id, roles }) => {
+            (ScopeInfo::System(system_id.clone()), roles.clone())
+        }
+        None => return None,
+    };
+
+    let mut authz = AuthzInfoBuilder::default().scope(scope).build().ok()?;
+    authz.set_roles(roles);
+    Some(authz)
+}
+
+/// Mapping Provider service.
+pub struct MappingService {
+    /// Backend driver.
+    pub(super) backend_driver: Arc<dyn MappingBackend>,
+}
+
+impl MappingService {
+    /// Create a new `MappingService`.
+    pub fn new<P: PluginManagerApi>(
+        config: &Config,
+        plugin_manager: &P,
+    ) -> Result<Self, MappingProviderError> {
+        let backend_driver = plugin_manager
+            .get_mapping_backend(config.mapping.driver.clone())?
+            .clone();
+        Ok(Self { backend_driver })
+    }
+
+    /// Create a `MappingService` from a backend driver.
+    ///
+    /// # Parameters
+    /// - `driver`: The backend driver.
+    #[cfg(any(test, feature = "mock"))]
+    pub fn from_driver<I: MappingBackend + 'static>(driver: I) -> Self {
+        Self {
+            backend_driver: Arc::new(driver),
+        }
+    }
+
+    /// Authenticate a principal through the unified mapping engine.
+    ///
+    /// Evaluates claims against the ruleset, performs a shadow registry upsert,
+    /// and emits `AuthenticationResult`.
+    pub(super) async fn authenticate_by_mapping_internal<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        req: &MappingAuthRequest,
+    ) -> Result<AuthenticationResult, MappingProviderError> {
+        let cfg = ctx.state().config_manager.config.read().await;
+        let salt = cfg
+            .mapping
+            .cluster_salt
+            .as_ref()
+            .map(|s| s.expose_secret().as_bytes().to_vec())
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| {
+                MappingProviderError::HmacDerivationFailed(
+                    "cluster_salt not configured".to_string(),
+                )
+            })?;
+
+        self.authenticate_by_mapping_with_salt(ctx, req, &salt)
+            .await
+    }
+
+    /// Authenticate a principal with an explicit salt.
+    pub(super) async fn authenticate_by_mapping_with_salt<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        req: &MappingAuthRequest,
+        salt: &[u8],
+    ) -> Result<AuthenticationResult, MappingProviderError> {
+        // 1. Resolve ruleset by (domain_id, source) composite index
+        let domain_id = req.domain_id.as_deref().unwrap_or("global");
+        let ruleset = self
+            .backend_driver
+            .get_ruleset_by_source(ctx.state(), domain_id, &req.source)
+            .await?
+            .ok_or(MappingProviderError::NoMatchingRule)?;
+
+        // 2. Enabled gate
+        if !ruleset.enabled {
+            return Err(MappingProviderError::DisabledRuleset);
+        }
+
+        // 3. Evaluate claims against ruleset — named rule hint is tried first,
+        // then standard first-match-wins iteration
+        let eval_started = std::time::Instant::now();
+        let eval_result = engine::evaluate_ruleset(
+            &ruleset,
+            &req.claims,
+            ruleset.domain_id.as_deref(),
+            req.rule_name.as_deref(),
+        );
+        let eval_outcome = match &eval_result {
+            Ok(Some(_)) => crate::mapping::metrics::OUTCOME_MATCHED,
+            Ok(None) => crate::mapping::metrics::OUTCOME_NO_MATCH,
+            Err(_) => crate::mapping::metrics::OUTCOME_ERROR,
+        };
+        crate::mapping::metrics::MAPPING_METRICS
+            .record_evaluation(eval_outcome, eval_started.elapsed().as_secs_f64());
+        let match_result = eval_result?.ok_or(MappingProviderError::NoMatchingRule)?;
+
+        // 4. Resolve identity mode: explicit rule value > source-based default
+        let identity_mode = match_result
+            .identity_mode
+            .clone()
+            .unwrap_or(IdentityMode::Ephemeral);
+
+        // 5. Branch on identity mode
+        match identity_mode {
+            IdentityMode::Local => {
+                self.authenticate_local(ctx.state(), &match_result, &ruleset, req)
+                    .await
+            }
+            IdentityMode::Ephemeral => {
+                self.authenticate_ephemeral(ctx.state(), &match_result, &ruleset, req, salt)
+                    .await
+            }
+        }
+    }
+
+    /// Authenticate with a virtual shadow registry record (ephemeral path).
+    async fn authenticate_ephemeral(
+        &self,
+        state: &ServiceState,
+        match_result: &MatchResult,
+        ruleset: &MappingRuleSet,
+        req: &MappingAuthRequest,
+        salt: &[u8],
+    ) -> Result<AuthenticationResult, MappingProviderError> {
+        let virtual_user_id =
+            hmac::derive_virtual_user_id(salt, &req.unique_workload_id, &req.source)?;
+
+        let virtual_user = self
+            .upsert_virtual_user_shadow(
+                &ExecutionContext::internal(state),
+                &virtual_user_id,
+                match_result,
+                ruleset,
+                &req.unique_workload_id,
+            )
+            .await?;
+
+        let user_name = match_result.user_name.clone();
+        let pinfo = if let Some(domain_id) = &virtual_user.domain_id {
+            PrincipalIdentityInfoBuilder::default()
+                .id(&virtual_user_id)
+                .resolved_user_name(&user_name)
+                .issuer(req.source.to_string_key())
+                .domain(openstack_keystone_core_types::resource::Domain {
+                    id: domain_id.clone(),
+                    description: None,
+                    enabled: true,
+                    name: String::new(),
+                    extra: HashMap::new(),
+                    options: Default::default(),
+                })
+                .build()
+                .map_err(Box::new)?
+        } else {
+            PrincipalIdentityInfoBuilder::default()
+                .id(&virtual_user_id)
+                .resolved_user_name(&user_name)
+                .issuer(req.source.to_string_key())
+                .build()
+                .map_err(Box::new)?
+        };
+
+        let principal = PrincipalInfo {
+            identity: IdentityInfo::Principal(pinfo),
+        };
+
+        let ctx = AuthenticationContext::Mapping(MappingContext {
+            mapping_id: ruleset.mapping_id.clone(),
+            matched_rule_name: match_result.rule_name.clone(),
+            virtual_user_id: virtual_user_id.clone(),
+            is_system: match_result.is_system,
+        });
+
+        let result = match derive_authz_info(&match_result.authorizations) {
+            Some(authz) => {
+                debug!(
+                    virtual_user_id = &virtual_user_id,
+                    auth_count = match_result.authorizations.len(),
+                    "derived authorization from match_result authorizations"
+                );
+                AuthenticationResultBuilder::default()
+                    .principal(principal)
+                    .context(ctx)
+                    .authorization(authz)
+                    .build()
+            }
+            None => {
+                debug!(
+                    virtual_user_id = &virtual_user_id,
+                    auth_count = match_result.authorizations.len(),
+                    "no authorization derived from match_result (wildcard rule or empty), setting unscoped"
+                );
+                #[allow(clippy::expect_used)]
+                let authz = AuthzInfoBuilder::default()
+                    .scope(ScopeInfo::Unscoped)
+                    .build()
+                    .expect("unscoped authz with no constraints must not fail");
+                AuthenticationResultBuilder::default()
+                    .principal(principal)
+                    .context(ctx)
+                    .authorization(authz)
+                    .build()
+            }
+        };
+        Ok(result.map_err(Box::new)?)
+    }
+
+    /// Authenticate with a real federated user row (local path).
+    async fn authenticate_local(
+        &self,
+        state: &ServiceState,
+        match_result: &MatchResult,
+        ruleset: &MappingRuleSet,
+        req: &MappingAuthRequest,
+    ) -> Result<AuthenticationResult, MappingProviderError> {
+        let IdentitySource::Federation { idp_id } = &req.source else {
+            return Err(MappingProviderError::LocalIdentityRequiresFederation(
+                req.source.to_string_key(),
+            ));
+        };
+
+        let domain_id = match_result
+            .user_domain_id
+            .clone()
+            .or_else(|| ruleset.domain_id.clone())
+            .ok_or(MappingProviderError::HmacDerivationFailed(
+                "domain_id required for local identity mode".to_string(),
+            ))?;
+
+        let user = self
+            .find_or_create_federated_user(
+                state,
+                idp_id,
+                &domain_id,
+                &match_result.user_name,
+                &req.unique_workload_id,
+            )
+            .await?;
+
+        // Always sync group memberships to reflect current claims, not just
+        // on first-time creation.
+        self.sync_user_groups(state, &user, match_result, idp_id)
+            .await?;
+
+        let user_groups = state
+            .provider
+            .get_identity_provider()
+            .list_groups_of_user(&ExecutionContext::internal(state), &user.id)
+            .await
+            .map_err(MappingProviderError::driver)?;
+
+        let auth_result = AuthenticationResultBuilder::default()
+            .principal(PrincipalInfo {
+                identity: IdentityInfo::User(
+                    UserIdentityInfoBuilder::default()
+                        .user_id(user.id.clone())
+                        .user(user.clone())
+                        .user_groups(user_groups)
+                        .build()
+                        .map_err(Box::new)?,
+                ),
+            })
+            .context(AuthenticationContext::Oidc {
+                oidc: OidcContextBuilder::default()
+                    .idp_id(idp_id.clone())
+                    .protocol_id("oidc")
+                    .build()
+                    .map_err(Box::new)?,
+                token: None,
+            })
+            .build()
+            .map_err(Box::new)?;
+
+        Ok(auth_result)
+    }
+
+    /// Find existing federated user or create a new one.
+    ///
+    /// Uses `unique_workload_id` (the raw subject from the IdP) as the
+    /// federated user's unique_id, matching the lookup key used by the IdP's
+    /// token validation flow.
+    async fn find_or_create_federated_user(
+        &self,
+        state: &ServiceState,
+        idp_id: &str,
+        domain_id: &str,
+        user_name: &str,
+        unique_workload_id: &str,
+    ) -> Result<UserResponse, MappingProviderError> {
+        let ctx = ExecutionContext::internal(state);
+        let idp = state
+            .provider
+            .get_federation_provider()
+            .get_identity_provider(&ctx, idp_id)
+            .await
+            .map_err(MappingProviderError::driver)?
+            .ok_or_else(|| {
+                MappingProviderError::NotFound(format!("identity provider {}", idp_id))
+            })?;
+
+        if !idp.enabled {
+            return Err(MappingProviderError::DisabledRuleset);
+        }
+
+        let identity_provider = state.provider.get_identity_provider();
+
+        // A user already provisioned via SCIM (or any other python-keystone-
+        // compatible shadow mechanism) with this same `(domain_id,
+        // unique_workload_id)` pair has the exact same deterministic id —
+        // reuse it directly instead of creating a duplicate `federated_user`
+        // row for the same real person (ADR 0024 dedup fix).
+        let candidate_id =
+            crate::identity::generate_public_id(domain_id, unique_workload_id, "user");
+        if let Some(existing) = identity_provider
+            .get_user(&ctx, &candidate_id)
+            .await
+            .map_err(MappingProviderError::driver)?
+        {
+            return Ok(existing);
+        }
+
+        if let Some(existing) = identity_provider
+            .find_federated_user(&ctx, idp_id, unique_workload_id)
+            .await
+            .map_err(MappingProviderError::driver)?
+        {
+            return Ok(existing);
+        }
+
+        let mut federated_builder = FederationBuilder::default();
+        federated_builder
+            .idp_id(idp_id.to_string())
+            .unique_id(unique_workload_id.to_string())
+            .protocols(vec![FederationProtocol {
+                protocol_id: "oidc".to_string(),
+                unique_id: unique_workload_id.to_string(),
+            }]);
+
+        let mut user_builder = UserCreateBuilder::default();
+        user_builder
+            // Same deterministic id a SCIM (or other python-keystone-
+            // compatible shadow) provisioning of this same `(domain_id,
+            // unique_workload_id)` pair would compute. Setting it explicitly
+            // here (rather than letting the backend assign a random id)
+            // closes the reverse-ordering half of the ADR 0024 dedup fix:
+            // federation-first-then-SCIM-second now converges on one row
+            // too, not just SCIM-first-then-federation-second.
+            .id(candidate_id.clone())
+            .domain_id(domain_id.to_string())
+            .enabled(true)
+            .name(user_name.to_string())
+            .federated(vec![
+                federated_builder
+                    .build()
+                    .map_err(MappingProviderError::driver)?,
+            ]);
+
+        let user = identity_provider
+            .create_user(
+                &ctx,
+                user_builder.build().map_err(MappingProviderError::driver)?,
+            )
+            .await
+            .map_err(MappingProviderError::driver)?;
+
+        Ok(user)
+    }
+
+    /// Sync user group memberships based on mapping rule's group bindings.
+    async fn sync_user_groups(
+        &self,
+        state: &ServiceState,
+        user: &UserResponse,
+        match_result: &MatchResult,
+        idp_id: &str,
+    ) -> Result<(), MappingProviderError> {
+        let ctx = ExecutionContext::internal(state);
+        let identity_provider = state.provider.get_identity_provider();
+
+        let domain_groups: HashMap<String, String> = identity_provider
+            .list_groups(
+                &ctx,
+                &GroupListParameters {
+                    domain_id: Some(user.domain_id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(MappingProviderError::driver)?
+            .into_iter()
+            .map(|g| (g.name.clone(), g.id.clone()))
+            .collect();
+
+        let mut group_ids = HashSet::new();
+
+        for binding in &match_result.resolved_group_bindings {
+            if let Some(group_name) = &binding.name {
+                let group_id = if let Some(id) = domain_groups.get(group_name) {
+                    id.clone()
+                } else {
+                    let domain_id = binding
+                        .domain_id
+                        .clone()
+                        .or_else(|| Some(user.domain_id.clone()))
+                        .unwrap_or_default();
+                    let created = identity_provider
+                        .create_group(
+                            &ctx,
+                            GroupCreate {
+                                domain_id,
+                                name: group_name.clone(),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map_err(MappingProviderError::driver)?;
+                    created.id
+                };
+                group_ids.insert(group_id);
+            }
+        }
+
+        if !group_ids.is_empty() {
+            identity_provider
+                .set_user_groups_expiring(
+                    &ctx,
+                    &user.id,
+                    HashSet::from_iter(group_ids.iter().map(|s| s.as_str())),
+                    idp_id,
+                    Some(&Utc::now()),
+                )
+                .await
+                .map_err(MappingProviderError::driver)?;
+        }
+
+        Ok(())
+    }
+
+    /// Upsert a virtual user shadow record with CAS-protected retry loop.
+    ///
+    /// If the record exists, refresh fields while preserving `created_at` and
+    /// `is_system` (immutable from initial creation). If new, create fresh.
+    /// Retries on `CasConflict` with exponential backoff.
+    pub(super) async fn upsert_virtual_user_shadow<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        virtual_user_id: &str,
+        match_result: &MatchResult,
+        ruleset: &MappingRuleSet,
+        unique_workload_id: &str,
+    ) -> Result<VirtualUser, MappingProviderError> {
+        let now = Utc::now().timestamp();
+        let max_retries = 5u64;
+
+        for attempt in 0..max_retries {
+            let existing = self
+                .backend_driver
+                .get_virtual_user(ctx.state(), virtual_user_id)
+                .await?;
+
+            let result = if let Some(mut vu) = existing {
+                // Update path: refresh fields, preserve created_at and
+                // is_system
+                vu.mapping_id = ruleset.mapping_id.clone();
+                vu.matched_rule_name = match_result.rule_name.clone();
+                vu.resolved_user_name = match_result.user_name.clone();
+                vu.resolved_group_bindings = match_result.resolved_group_bindings.clone();
+                vu.authorizations = match_result.authorizations.clone();
+                vu.ruleset_version = ruleset.ruleset_version;
+                vu.last_authenticated_at = now;
+                vu.enabled = true;
+                vu.domain_id = match_result.user_domain_id.clone();
+                // is_system is intentionally preserved from initial creation
+
+                // Persist updated record (CAS-protected at storage layer)
+                self.backend_driver
+                    .update_virtual_user(ctx.state(), virtual_user_id, vu.clone())
+                    .await
+            } else {
+                // Insert path: create fresh record
+                let vu = VirtualUser {
+                    user_id: virtual_user_id.to_string(),
+                    unique_workload_id: unique_workload_id.to_string(),
+                    mapping_id: ruleset.mapping_id.clone(),
+                    matched_rule_name: match_result.rule_name.clone(),
+                    domain_id: match_result.user_domain_id.clone(),
+                    resolved_user_name: match_result.user_name.clone(),
+                    is_system: match_result.is_system,
+                    resolved_group_bindings: match_result.resolved_group_bindings.clone(),
+                    authorizations: match_result.authorizations.clone(),
+                    ruleset_version: ruleset.ruleset_version,
+                    enabled: true,
+                    created_at: now,
+                    last_authenticated_at: now,
+                };
+
+                self.backend_driver
+                    .create_virtual_user(ctx.state(), vu.clone())
+                    .await
+            };
+
+            match result {
+                Ok(vu) => return Ok(vu),
+                Err(MappingProviderError::CasConflict { .. }) if attempt + 1 < max_retries => {
+                    let backoff_ms = 50 * (1u64 << attempt); // exponential: 50, 100, 200, 400, 800
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(MappingProviderError::CasConflict {
+            subject: virtual_user_id.to_string(),
+            description: format!(
+                "CAS upsert exceeded {max_retries} retries with exponential backoff"
+            ),
+        })
+    }
+}
+
+#[async_trait]
+impl MappingApi for MappingService {
+    /// Create a mapping ruleset.
+    ///
+    /// Validates the payload, generates UUID, computes content-aware version,
+    /// then delegates to the backend driver.
+    #[tracing::instrument(name = "provider.mapping.create_ruleset", level = "debug", skip_all)]
+    async fn create_ruleset<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        mut ruleset: MappingRuleSetCreate,
+    ) -> Result<MappingRuleSet, MappingProviderError> {
+        validation::validate_ruleset_create(&ruleset)?;
+        validation::validate_api_client_domain_scope(&ruleset.source, &ruleset.rules)?;
+        validate_roles_exist(ctx, &ruleset.rules).await?;
+        let mapping_id = ruleset
+            .mapping_id
+            .take()
+            .unwrap_or(Uuid::new_v4().simple().to_string());
+        let ruleset_version = version::compute_ruleset_version(&ruleset);
+        let ruleset_obj = MappingRuleSet {
+            mapping_id: mapping_id.clone(),
+            domain_id: ruleset.domain_id,
+            source: ruleset.source,
+            domain_resolution_mode: ruleset.domain_resolution_mode,
+            enabled: ruleset.enabled,
+            rules: ruleset.rules,
+            ruleset_version,
+        };
+        let created = if let Some(vsc) = ctx.ctx() {
+            let backend_driver = &self.backend_driver;
+            let ruleset_obj_clone = ruleset_obj.clone();
+            crate::audited_op! {
+                dispatcher: &ctx.state().event_dispatcher,
+                ctx: vsc,
+                event: Event::new(
+                    Operation::Create,
+                    EventPayload::MappingRuleSet { mapping_id: mapping_id.clone() },
+                ),
+                operation: async {
+                    backend_driver.create_ruleset(ctx.state(), ruleset_obj_clone).await
+                },
+                on_audit_error: |_: AuditDispatchError| MappingProviderError::Driver { source: "audit dispatch failed".into() },
+            }?
+        } else {
+            let created = self
+                .backend_driver
+                .create_ruleset(ctx.state(), ruleset_obj)
+                .await?;
+            ctx.state()
+                .event_dispatcher
+                .emit(Event::new(
+                    Operation::Create,
+                    EventPayload::MappingRuleSet {
+                        mapping_id: mapping_id.clone(),
+                    },
+                ))
+                .await;
+            created
+        };
+        Ok(MappingRuleSet {
+            mapping_id: mapping_id.clone(),
+            domain_id: created.domain_id,
+            source: created.source,
+            domain_resolution_mode: created.domain_resolution_mode,
+            enabled: created.enabled,
+            rules: created.rules,
+            ruleset_version: created.ruleset_version,
+        })
+    }
+
+    /// Delete a mapping ruleset.
+    #[tracing::instrument(name = "provider.mapping.delete_ruleset", level = "debug", skip_all, fields(mapping_id = %mapping_id))]
+    async fn delete_ruleset<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        mapping_id: &'a str,
+    ) -> Result<(), MappingProviderError> {
+        if let Some(vsc) = ctx.ctx() {
+            let backend_driver = &self.backend_driver;
+            let mapping_id_str = mapping_id.to_string();
+            crate::audited_op! {
+                dispatcher: &ctx.state().event_dispatcher,
+                ctx: vsc,
+                event: Event::new(
+                    Operation::Delete,
+                    EventPayload::MappingRuleSet { mapping_id: mapping_id_str.clone() },
+                ),
+                operation: async {
+                    let max_retries = 5u64;
+                    for attempt in 0..max_retries {
+                        if let Some(existing) = backend_driver.get_ruleset(ctx.state(), mapping_id).await?
+                            && existing.rules.iter().any(|r| r.identity.is_system)
+                        {
+                            return Err(MappingProviderError::RulesetImmutable(mapping_id.to_string()));
+                        }
+                        match backend_driver.delete_ruleset(ctx.state(), mapping_id).await {
+                            Ok(()) => return Ok::<(), MappingProviderError>(()),
+                            Err(MappingProviderError::CasConflict { .. }) if attempt + 1 < max_retries => {
+                                let backoff_ms = 50 * (1u64 << attempt);
+                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Err(MappingProviderError::CasConflict {
+                        subject: mapping_id.to_string(),
+                        description: format!("CAS delete exceeded {max_retries} retries with exponential backoff"),
+                    })
+                },
+                on_audit_error: |_: AuditDispatchError| MappingProviderError::Driver { source: "audit dispatch failed".into() },
+            }?;
+        } else {
+            let max_retries = 5u64;
+            for attempt in 0..max_retries {
+                if let Some(existing) = self
+                    .backend_driver
+                    .get_ruleset(ctx.state(), mapping_id)
+                    .await?
+                    && existing.rules.iter().any(|r| r.identity.is_system)
+                {
+                    return Err(MappingProviderError::RulesetImmutable(
+                        mapping_id.to_string(),
+                    ));
+                }
+
+                match self
+                    .backend_driver
+                    .delete_ruleset(ctx.state(), mapping_id)
+                    .await
+                {
+                    Ok(()) => {
+                        ctx.state()
+                            .event_dispatcher
+                            .emit(Event::new(
+                                Operation::Delete,
+                                EventPayload::MappingRuleSet {
+                                    mapping_id: mapping_id.to_string(),
+                                },
+                            ))
+                            .await;
+                        return Ok(());
+                    }
+                    Err(MappingProviderError::CasConflict { .. }) if attempt + 1 < max_retries => {
+                        let backoff_ms = 50 * (1u64 << attempt);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            return Err(MappingProviderError::CasConflict {
+                subject: mapping_id.to_string(),
+                description: format!(
+                    "CAS delete exceeded {max_retries} retries with exponential backoff"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Delete a virtual user shadow record.
+    #[tracing::instrument(name = "provider.mapping.delete_virtual_user", level = "debug", skip_all, fields(user_id = %user_id))]
+    async fn delete_virtual_user<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        user_id: &'a str,
+    ) -> Result<(), MappingProviderError> {
+        if let Some(vsc) = ctx.ctx() {
+            let backend_driver = &self.backend_driver;
+            let user_id_str = user_id.to_string();
+            crate::audited_op! {
+                dispatcher: &ctx.state().event_dispatcher,
+                ctx: vsc,
+                event: Event::new(
+                    Operation::Delete,
+                    EventPayload::VirtualUser { user_id: user_id_str.clone() },
+                ),
+                operation: async {
+                    let max_retries = 5u64;
+                    for attempt in 0..max_retries {
+                        match backend_driver.delete_virtual_user(ctx.state(), user_id).await {
+                            Ok(()) => return Ok::<(), MappingProviderError>(()),
+                            Err(MappingProviderError::CasConflict { .. }) if attempt + 1 < max_retries => {
+                                let backoff_ms = 50 * (1u64 << attempt);
+                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Err(MappingProviderError::CasConflict {
+                        subject: user_id.to_string(),
+                        description: format!("CAS delete exceeded {max_retries} retries with exponential backoff"),
+                    })
+                },
+                on_audit_error: |_: AuditDispatchError| MappingProviderError::Driver { source: "audit dispatch failed".into() },
+            }?;
+        } else {
+            let max_retries = 5u64;
+            for attempt in 0..max_retries {
+                match self
+                    .backend_driver
+                    .delete_virtual_user(ctx.state(), user_id)
+                    .await
+                {
+                    Ok(()) => {
+                        ctx.state()
+                            .event_dispatcher
+                            .emit(Event::new(
+                                Operation::Delete,
+                                EventPayload::VirtualUser {
+                                    user_id: user_id.to_string(),
+                                },
+                            ))
+                            .await;
+                        return Ok(());
+                    }
+                    Err(MappingProviderError::CasConflict { .. }) if attempt + 1 < max_retries => {
+                        let backoff_ms = 50 * (1u64 << attempt);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            return Err(MappingProviderError::CasConflict {
+                subject: user_id.to_string(),
+                description: format!(
+                    "CAS delete exceeded {max_retries} retries with exponential backoff"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Fetch a mapping ruleset by ID.
+    #[tracing::instrument(name = "provider.mapping.get_ruleset", level = "debug", skip_all, fields(mapping_id = %mapping_id))]
+    async fn get_ruleset<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        mapping_id: &'a str,
+    ) -> Result<Option<MappingRuleSet>, MappingProviderError> {
+        self.backend_driver
+            .get_ruleset(ctx.state(), mapping_id)
+            .await
+    }
+
+    /// Fetch a ruleset by its (domain_id, source) composite index.
+    #[tracing::instrument(name = "provider.mapping.get_ruleset_by_source", level = "debug", skip_all, fields(domain_id = %domain_id))]
+    async fn get_ruleset_by_source<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        domain_id: &'a str,
+        source: &'a IdentitySource,
+    ) -> Result<Option<MappingRuleSet>, MappingProviderError> {
+        self.backend_driver
+            .get_ruleset_by_source(ctx.state(), domain_id, source)
+            .await
+    }
+
+    /// Fetch a virtual user shadow record by user ID.
+    #[tracing::instrument(name = "provider.mapping.get_virtual_user", level = "debug", skip_all, fields(user_id = %user_id))]
+    async fn get_virtual_user<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        user_id: &'a str,
+    ) -> Result<Option<VirtualUser>, MappingProviderError> {
+        self.backend_driver
+            .get_virtual_user(ctx.state(), user_id)
+            .await
+    }
+
+    /// List mapping rulesets.
+    #[tracing::instrument(name = "provider.mapping.list_rulesets", level = "debug", skip_all, fields(params = ?params))]
+    async fn list_rulesets<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        params: &MappingRuleSetListParameters,
+    ) -> Result<Vec<MappingRuleSet>, MappingProviderError> {
+        self.backend_driver.list_rulesets(ctx.state(), params).await
+    }
+
+    /// Mutate rules within a mapping ruleset imperatively.
+    ///
+    /// Fetches the current ruleset, validates immutability, applies mutations
+    /// in memory, re-validates, computes new version, then delegates update.
+    #[tracing::instrument(name = "provider.mapping.mutate_rules", level = "debug", skip_all, fields(mapping_id = %mapping_id))]
+    async fn mutate_rules<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        mapping_id: &'a str,
+        mutations: RuleMutations,
+    ) -> Result<MappingRuleSet, MappingProviderError> {
+        // 1. Fetch current ruleset
+        let existing = self
+            .backend_driver
+            .get_ruleset(ctx.state(), mapping_id)
+            .await?
+            .ok_or_else(|| MappingProviderError::NotFound(mapping_id.to_string()))?;
+
+        // 2. Check immutability for system mappings
+        if existing.rules.iter().any(|r| r.identity.is_system) {
+            return Err(MappingProviderError::RulesetImmutable(
+                mapping_id.to_string(),
+            ));
+        }
+
+        // 3. Apply mutations in memory
+        let mut new_rules: Vec<MappingRule> = existing.rules.clone();
+        for mut mutation in mutations.mutations {
+            match &mut mutation {
+                RuleMutation::Insert { rule, position } => {
+                    match position {
+                        Some(RulePosition::Before { anchor }) => {
+                            let idx = new_rules
+                                .iter()
+                                .position(|r| r.name == *anchor)
+                                .ok_or_else(|| {
+                                    MappingProviderError::Conflict(format!(
+                                        "anchor rule '{}' not found",
+                                        anchor
+                                    ))
+                                })?;
+                            new_rules.insert(idx, rule.clone());
+                        }
+                        Some(RulePosition::After { anchor }) => {
+                            let idx = new_rules
+                                .iter()
+                                .position(|r| r.name == *anchor)
+                                .ok_or_else(|| {
+                                    MappingProviderError::Conflict(format!(
+                                        "anchor rule '{}' not found",
+                                        anchor
+                                    ))
+                                })?;
+                            new_rules.insert(idx + 1, rule.clone());
+                        }
+                        None => {
+                            // No position — append to end
+                            new_rules.push(rule.clone());
+                        }
+                    }
+                }
+                RuleMutation::Update { rule_name, rule } => {
+                    let idx = new_rules
+                        .iter()
+                        .position(|r| r.name == *rule_name)
+                        .ok_or_else(|| {
+                            MappingProviderError::Conflict(format!(
+                                "rule '{}' not found",
+                                rule_name
+                            ))
+                        })?;
+                    new_rules[idx] = rule.clone();
+                }
+                RuleMutation::Delete { rule_name } => {
+                    let found = new_rules
+                        .iter()
+                        .position(|r| r.name == *rule_name)
+                        .ok_or_else(|| {
+                            MappingProviderError::Conflict(format!(
+                                "rule '{}' not found",
+                                rule_name
+                            ))
+                        })?;
+                    new_rules.remove(found);
+                }
+            }
+        }
+
+        // 4. Re-validate the resulting ruleset
+        let create_payload = MappingRuleSetCreate {
+            mapping_id: Some(mapping_id.to_string()),
+            domain_id: existing.domain_id.clone(),
+            source: existing.source.clone(),
+            domain_resolution_mode: existing.domain_resolution_mode.clone(),
+            enabled: existing.enabled,
+            rules: new_rules.clone(),
+        };
+        validation::validate_ruleset_create(&create_payload)?;
+
+        validation::validate_api_client_domain_scope(&existing.source, &create_payload.rules)?;
+        validate_roles_exist(ctx, &create_payload.rules).await?;
+
+        // 5. Compute new version
+        let new_version = version::compute_ruleset_version(&create_payload);
+
+        // 6. Delegate update to backend
+        let update_payload = MappingRuleSetUpdate {
+            enabled: Some(existing.enabled),
+            allowed_domains: None,
+            rules: Some(new_rules),
+        };
+
+        let updated = if let Some(vsc) = ctx.ctx() {
+            let backend_driver = &self.backend_driver;
+            let update_payload_clone = update_payload.clone();
+            crate::audited_op! {
+                dispatcher: &ctx.state().event_dispatcher,
+                ctx: vsc,
+                event: Event::new(
+                    Operation::Update,
+                    EventPayload::MappingRuleSet { mapping_id: mapping_id.to_string() },
+                ),
+                operation: async {
+                    backend_driver.update_ruleset(ctx.state(), mapping_id, update_payload_clone).await
+                },
+                on_audit_error: |_: AuditDispatchError| MappingProviderError::Driver { source: "audit dispatch failed".into() },
+            }?
+        } else {
+            let updated = self
+                .backend_driver
+                .update_ruleset(ctx.state(), mapping_id, update_payload)
+                .await?;
+            ctx.state()
+                .event_dispatcher
+                .emit(Event::new(
+                    Operation::Update,
+                    EventPayload::MappingRuleSet {
+                        mapping_id: mapping_id.to_string(),
+                    },
+                ))
+                .await;
+            updated
+        };
+
+        Ok(MappingRuleSet {
+            mapping_id: existing.mapping_id.clone(),
+            domain_id: updated.domain_id,
+            source: updated.source,
+            domain_resolution_mode: updated.domain_resolution_mode,
+            enabled: updated.enabled,
+            rules: updated.rules,
+            ruleset_version: new_version,
+        })
+    }
+
+    /// Update a mapping ruleset.
+    ///
+    /// Validates the update payload against the existing ruleset, computes
+    /// new version, then delegates to the backend driver.
+    #[tracing::instrument(name = "provider.mapping.update_ruleset", level = "debug", skip_all, fields(mapping_id = %mapping_id))]
+    async fn update_ruleset<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        mapping_id: &'a str,
+        data: MappingRuleSetUpdate,
+    ) -> Result<MappingRuleSet, MappingProviderError> {
+        let existing = self
+            .backend_driver
+            .get_ruleset(ctx.state(), mapping_id)
+            .await?
+            .ok_or_else(|| MappingProviderError::NotFound(mapping_id.to_string()))?;
+
+        if existing.rules.iter().any(|r| r.identity.is_system) {
+            return Err(MappingProviderError::RulesetImmutable(
+                mapping_id.to_string(),
+            ));
+        }
+
+        validation::validate_ruleset_update(&existing, &data)?;
+
+        let merged_rules = data.rules.clone().unwrap_or(existing.rules.clone());
+
+        validation::validate_api_client_domain_scope(&existing.source, &merged_rules)?;
+        validate_roles_exist(ctx, &merged_rules).await?;
+
+        let new_version = version::compute_ruleset_version_from_parts(
+            &existing.mapping_id,
+            existing.domain_id.as_deref(),
+            &existing.source,
+            &existing.domain_resolution_mode,
+            existing.enabled,
+            &merged_rules,
+        );
+
+        let updated = if let Some(vsc) = ctx.ctx() {
+            let backend_driver = &self.backend_driver;
+            let data_clone = data.clone();
+            crate::audited_op! {
+                dispatcher: &ctx.state().event_dispatcher,
+                ctx: vsc,
+                event: Event::new(
+                    Operation::Update,
+                    EventPayload::MappingRuleSet { mapping_id: mapping_id.to_string() },
+                ),
+                operation: async {
+                    backend_driver.update_ruleset(ctx.state(), mapping_id, data_clone).await
+                },
+                on_audit_error: |_: AuditDispatchError| MappingProviderError::Driver { source: "audit dispatch failed".into() },
+            }?
+        } else {
+            let updated = self
+                .backend_driver
+                .update_ruleset(ctx.state(), mapping_id, data)
+                .await?;
+            ctx.state()
+                .event_dispatcher
+                .emit(Event::new(
+                    Operation::Update,
+                    EventPayload::MappingRuleSet {
+                        mapping_id: mapping_id.to_string(),
+                    },
+                ))
+                .await;
+            updated
+        };
+
+        Ok(MappingRuleSet {
+            mapping_id: existing.mapping_id.clone(),
+            domain_id: updated.domain_id,
+            source: updated.source,
+            domain_resolution_mode: updated.domain_resolution_mode,
+            enabled: updated.enabled,
+            rules: updated.rules,
+            ruleset_version: new_version,
+        })
+    }
+
+    /// Disable a virtual user shadow record.
+    #[tracing::instrument(name = "provider.mapping.disable_virtual_user", level = "debug", skip_all, fields(user_id = %user_id))]
+    async fn disable_virtual_user<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        user_id: &'a str,
+    ) -> Result<VirtualUser, MappingProviderError> {
+        let vu = if let Some(vsc) = ctx.ctx() {
+            let backend_driver = &self.backend_driver;
+            crate::audited_op! {
+                dispatcher: &ctx.state().event_dispatcher,
+                ctx: vsc,
+                event: Event::new(
+                    Operation::Disable,
+                    EventPayload::VirtualUser { user_id: user_id.to_string() },
+                ),
+                operation: async {
+                    backend_driver.disable_virtual_user(ctx.state(), user_id).await
+                },
+                on_audit_error: |_: AuditDispatchError| MappingProviderError::Driver { source: "audit dispatch failed".into() },
+            }?
+        } else {
+            let vu = self
+                .backend_driver
+                .disable_virtual_user(ctx.state(), user_id)
+                .await?;
+            ctx.state()
+                .event_dispatcher
+                .emit(Event::new(
+                    Operation::Disable,
+                    EventPayload::VirtualUser {
+                        user_id: user_id.to_string(),
+                    },
+                ))
+                .await;
+            vu
+        };
+        Ok(vu)
+    }
+
+    /// Enable (reactivate) a virtual user shadow record.
+    #[tracing::instrument(name = "provider.mapping.enable_virtual_user", level = "debug", skip_all, fields(user_id = %user_id))]
+    async fn enable_virtual_user<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        user_id: &'a str,
+    ) -> Result<VirtualUser, MappingProviderError> {
+        let vu = if let Some(vsc) = ctx.ctx() {
+            let backend_driver = &self.backend_driver;
+            crate::audited_op! {
+                dispatcher: &ctx.state().event_dispatcher,
+                ctx: vsc,
+                event: Event::new(
+                    Operation::Enable,
+                    EventPayload::VirtualUser { user_id: user_id.to_string() },
+                ),
+                operation: async {
+                    backend_driver.enable_virtual_user(ctx.state(), user_id).await
+                },
+                on_audit_error: |_: AuditDispatchError| MappingProviderError::Driver { source: "audit dispatch failed".into() },
+            }?
+        } else {
+            let vu = self
+                .backend_driver
+                .enable_virtual_user(ctx.state(), user_id)
+                .await?;
+            ctx.state()
+                .event_dispatcher
+                .emit(Event::new(
+                    Operation::Enable,
+                    EventPayload::VirtualUser {
+                        user_id: user_id.to_string(),
+                    },
+                ))
+                .await;
+            vu
+        };
+        Ok(vu)
+    }
+
+    /// Authenticate a principal through the unified mapping engine.
+    ///
+    /// When `req.source` is `IdentitySource::Federation`, also records
+    /// `keystone_federation_authentications_total{idp_id,outcome}` (ADR
+    /// 0031) — `idp_id` is the operator-configured identity provider the
+    /// caller authenticated against, and `outcome` reflects whether the
+    /// overall mapping authentication succeeded.
+    #[tracing::instrument(
+        name = "provider.mapping.authenticate_by_mapping",
+        level = "debug",
+        skip_all
+    )]
+    async fn authenticate_by_mapping<'a>(
+        &self,
+        exec: &ExecutionContext<'a>,
+        req: &'a MappingAuthRequest,
+    ) -> Result<AuthenticationResult, MappingProviderError> {
+        let result = self.authenticate_by_mapping_internal(exec, req).await;
+        if let IdentitySource::Federation { idp_id } = &req.source {
+            crate::federation::metrics::FEDERATION_METRICS
+                .record_authentication(idp_id.as_str(), result.is_ok());
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::ExecutionContext;
+    use crate::keystone::ServiceState;
+    use crate::mapping::backend::MockMappingBackend;
+    use crate::tests::get_mocked_state;
+    use openstack_keystone_config::Config;
+    use openstack_keystone_core_types::mapping::rule::{
+        ClaimCondition, IdentityBinding, MappingRule, MatchCondition, MatchCriteria,
+    };
+    use openstack_keystone_core_types::role::RoleRef;
+    use secrecy::SecretString;
+    use serde_json::Value;
+
+    /// Helper to create mocked state with a configured cluster_salt.
+    async fn get_mocked_state_with_salt() -> ServiceState {
+        let mut cfg = Config::default();
+        cfg.mapping.cluster_salt = Some(SecretString::from("test-salt-for-hmac-derivation!"));
+        get_mocked_state(Some(cfg), None).await
+    }
+
+    #[tokio::test]
+    async fn test_get_ruleset() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let mapping_id = "test-id";
+
+        let expected_ruleset = MappingRuleSet {
+            mapping_id: mapping_id.to_string(),
+            domain_id: None,
+            source: IdentitySource::Federation {
+                idp_id: "test-idp".to_string(),
+            },
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules: vec![],
+            ruleset_version: 1,
+        };
+
+        let expected_ruleset_clone = expected_ruleset.clone();
+        mock_backend
+            .expect_get_ruleset()
+            .withf(move |_, id| id == "test-id")
+            .returning(move |_, _| Ok(Some(expected_ruleset_clone.clone())));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .get_ruleset(&ExecutionContext::internal(&state), mapping_id)
+            .await
+            .unwrap();
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().mapping_id, "test-id");
+    }
+
+    #[tokio::test]
+    async fn test_create_ruleset() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+
+        let ruleset_create = MappingRuleSetCreate {
+            mapping_id: None,
+            domain_id: None,
+            source: IdentitySource::Federation {
+                idp_id: "test-idp".to_string(),
+            },
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules: vec![],
+        };
+
+        let expected_ruleset = MappingRuleSet {
+            mapping_id: "generated-id".to_string(),
+            domain_id: None,
+            source: ruleset_create.source.clone(),
+            domain_resolution_mode: ruleset_create.domain_resolution_mode.clone(),
+            enabled: ruleset_create.enabled,
+            rules: ruleset_create.rules.clone(),
+            ruleset_version: 1,
+        };
+
+        let expected_ruleset_clone = expected_ruleset.clone();
+        mock_backend
+            .expect_create_ruleset()
+            .returning(move |_, _| Ok(expected_ruleset_clone.clone()));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .create_ruleset(&ExecutionContext::internal(&state), ruleset_create)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.source,
+            IdentitySource::Federation {
+                idp_id: "test-idp".to_string()
+            }
+        );
+    }
+
+    fn project_scope_rule() -> MappingRule {
+        MappingRule {
+            name: "grant-project".to_string(),
+            description: None,
+            r#match: MatchCriteria::AllOf(vec![]),
+            identity: IdentityBinding {
+                identity_mode: None,
+                user_name: "test".to_string(),
+                user_id: None,
+                user_domain_id: None,
+                is_system: false,
+            },
+            authorizations: vec![Authorization::Project {
+                project_id: "project-1".to_string(),
+                project_domain_id: "domain-1".to_string(),
+                roles: vec![],
+            }],
+            groups: vec![],
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // RoleRef existence validation (`validate_roles_exist`)
+    // ---------------------------------------------------------------------
+
+    fn domain_scope_rule_with_role(role_name: &str) -> MappingRule {
+        MappingRule {
+            name: "grant-domain".to_string(),
+            description: None,
+            r#match: MatchCriteria::AllOf(vec![]),
+            identity: IdentityBinding {
+                identity_mode: None,
+                user_name: "test".to_string(),
+                user_id: None,
+                user_domain_id: None,
+                is_system: false,
+            },
+            authorizations: vec![Authorization::Domain {
+                domain_id: "domain-1".to_string(),
+                roles: vec![RoleRef {
+                    id: role_name.to_string(),
+                    name: Some(role_name.to_string()),
+                    domain_id: None,
+                }],
+            }],
+            groups: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_ruleset_rejects_nonexistent_role() {
+        let mut role_mock = crate::role::MockRoleProvider::default();
+        role_mock.expect_get_role().returning(|_, _| Ok(None));
+        let provider = crate::provider::Provider::mocked_builder().mock_role(role_mock);
+        let state = get_mocked_state(None, Some(provider)).await;
+
+        let service = MappingService::from_driver(MockMappingBackend::new());
+        let ruleset_create = MappingRuleSetCreate {
+            mapping_id: None,
+            domain_id: Some("domain-1".to_string()),
+            source: IdentitySource::Federation {
+                idp_id: "test-idp".to_string(),
+            },
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules: vec![domain_scope_rule_with_role("NotARealRole")],
+        };
+
+        let result = service
+            .create_ruleset(&ExecutionContext::internal(&state), ruleset_create)
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            MappingProviderError::RoleNotFound(name) if name == "NotARealRole"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_create_ruleset_accepts_existing_role() {
+        let mut role_mock = crate::role::MockRoleProvider::default();
+        role_mock.expect_get_role().returning(|_, role_id| {
+            if role_id == "manager" {
+                Ok(Some(
+                    openstack_keystone_core_types::role::RoleBuilder::default()
+                        .id("manager")
+                        .name("manager")
+                        .build()
+                        .unwrap(),
+                ))
+            } else {
+                Ok(None)
+            }
+        });
+        let provider = crate::provider::Provider::mocked_builder().mock_role(role_mock);
+        let state = get_mocked_state(None, Some(provider)).await;
+
+        let mut mock_backend = MockMappingBackend::new();
+        let ruleset_create = MappingRuleSetCreate {
+            mapping_id: None,
+            domain_id: Some("domain-1".to_string()),
+            source: IdentitySource::Federation {
+                idp_id: "test-idp".to_string(),
+            },
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules: vec![domain_scope_rule_with_role("manager")],
+        };
+        let expected = MappingRuleSet {
+            mapping_id: "generated-id".to_string(),
+            domain_id: ruleset_create.domain_id.clone(),
+            source: ruleset_create.source.clone(),
+            domain_resolution_mode: ruleset_create.domain_resolution_mode.clone(),
+            enabled: ruleset_create.enabled,
+            rules: ruleset_create.rules.clone(),
+            ruleset_version: 1,
+        };
+        let expected_clone = expected.clone();
+        mock_backend
+            .expect_create_ruleset()
+            .returning(move |_, _| Ok(expected_clone.clone()));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .create_ruleset(&ExecutionContext::internal(&state), ruleset_create)
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR 0024 §2.C: Authorization::Project forbidden on SCIM realm rulesets
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_ruleset_rejects_project_scope_for_api_client() {
+        let state = get_mocked_state(None, None).await;
+        let mock_backend = MockMappingBackend::new();
+        let service = MappingService::from_driver(mock_backend);
+
+        let ruleset_create = MappingRuleSetCreate {
+            mapping_id: None,
+            domain_id: Some("domain-1".to_string()),
+            source: IdentitySource::ApiClient {
+                provider_id: "provider-1".to_string(),
+            },
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules: vec![project_scope_rule()],
+        };
+
+        let result = service
+            .create_ruleset(&ExecutionContext::internal(&state), ruleset_create)
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            MappingProviderError::ApiClientNonDomainScopeForbidden(name) if name == "grant-project"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_create_ruleset_allows_project_scope_for_federation_source() {
+        // Non-ApiClient sources are not subject to domain-scope constraints.
+        let state = get_mocked_state(None, None).await;
+        let mut mock_backend = MockMappingBackend::new();
+        let ruleset_create = MappingRuleSetCreate {
+            mapping_id: None,
+            domain_id: Some("domain-1".to_string()),
+            source: IdentitySource::Federation {
+                idp_id: "okta".to_string(),
+            },
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules: vec![project_scope_rule()],
+        };
+        let expected = MappingRuleSet {
+            mapping_id: "generated-id".to_string(),
+            domain_id: ruleset_create.domain_id.clone(),
+            source: ruleset_create.source.clone(),
+            domain_resolution_mode: ruleset_create.domain_resolution_mode.clone(),
+            enabled: ruleset_create.enabled,
+            rules: ruleset_create.rules.clone(),
+            ruleset_version: 1,
+        };
+        let expected_clone = expected.clone();
+        mock_backend
+            .expect_create_ruleset()
+            .returning(move |_, _| Ok(expected_clone.clone()));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .create_ruleset(&ExecutionContext::internal(&state), ruleset_create)
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_update_ruleset_rejects_project_scope_for_api_client() {
+        let state = get_mocked_state(None, None).await;
+
+        let mapping_id = "test-id";
+        let mut mock_backend = MockMappingBackend::new();
+        mock_backend.expect_get_ruleset().returning(move |_, _| {
+            Ok(Some(MappingRuleSet {
+                mapping_id: mapping_id.to_string(),
+                domain_id: Some("domain-1".to_string()),
+                source: IdentitySource::ApiClient {
+                    provider_id: "provider-1".to_string(),
+                },
+                domain_resolution_mode: DomainResolutionMode::Fixed,
+                enabled: true,
+                rules: vec![],
+                ruleset_version: 1,
+            }))
+        });
+        mock_backend.expect_update_ruleset().never();
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .update_ruleset(
+                &ExecutionContext::internal(&state),
+                mapping_id,
+                MappingRuleSetUpdate {
+                    enabled: Some(true),
+                    allowed_domains: None,
+                    rules: Some(vec![project_scope_rule()]),
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            MappingProviderError::ApiClientNonDomainScopeForbidden(name) if name == "grant-project"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_delete_ruleset() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let mapping_id = "test-id";
+
+        mock_backend
+            .expect_get_ruleset()
+            .withf(move |_, id| id == "test-id")
+            .returning(move |_, _| {
+                Ok(Some(MappingRuleSet {
+                    mapping_id: "test-id".to_string(),
+                    domain_id: None,
+                    source: IdentitySource::Federation {
+                        idp_id: "test-idp".to_string(),
+                    },
+                    domain_resolution_mode: DomainResolutionMode::Fixed,
+                    enabled: true,
+                    rules: vec![],
+                    ruleset_version: 1,
+                }))
+            });
+
+        mock_backend
+            .expect_delete_ruleset()
+            .withf(move |_, id| id == "test-id")
+            .returning(|_, _| Ok(()));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        service
+            .delete_ruleset(&ExecutionContext::internal(&state), mapping_id)
+            .await
+            .unwrap();
+    }
+
+    fn make_ruleset(mapping_id: &str, is_system: bool) -> MappingRuleSet {
+        MappingRuleSet {
+            mapping_id: mapping_id.to_string(),
+            domain_id: None,
+            source: IdentitySource::Federation {
+                idp_id: "test-idp".to_string(),
+            },
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules: vec![MappingRule {
+                name: "test-rule".to_string(),
+                description: None,
+                r#match: MatchCriteria::AllOf(vec![]),
+                identity: IdentityBinding {
+                    identity_mode: None,
+                    user_name: "test".to_string(),
+                    user_id: None,
+                    user_domain_id: None,
+                    is_system,
+                },
+                authorizations: vec![],
+                groups: vec![],
+            }],
+            ruleset_version: 1,
+        }
+    }
+
+    fn make_virtual_user(user_id: &str) -> VirtualUser {
+        VirtualUser {
+            user_id: user_id.to_string(),
+            unique_workload_id: "workload-1".to_string(),
+            mapping_id: "test-id".to_string(),
+            matched_rule_name: "test-rule".to_string(),
+            domain_id: None,
+            resolved_user_name: "test".to_string(),
+            is_system: false,
+            resolved_group_bindings: vec![],
+            authorizations: vec![],
+            ruleset_version: 1,
+            enabled: true,
+            created_at: 0,
+            last_authenticated_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_virtual_user() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let user_id = "user-1";
+
+        mock_backend
+            .expect_delete_virtual_user()
+            .withf(move |_, id| id == "user-1")
+            .returning(|_, _| Ok(()));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        service
+            .delete_virtual_user(&ExecutionContext::internal(&state), user_id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete_ruleset_retries_on_cas_conflict() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let mapping_id = "test-id";
+
+        mock_backend
+            .expect_get_ruleset()
+            .withf(move |_, id| id == "test-id")
+            .times(5) // 5 retries with CAS conflict
+            .returning(move |_, _| {
+                Ok(Some(MappingRuleSet {
+                    mapping_id: "test-id".to_string(),
+                    domain_id: None,
+                    source: IdentitySource::Federation {
+                        idp_id: "test-idp".to_string(),
+                    },
+                    domain_resolution_mode: DomainResolutionMode::Fixed,
+                    enabled: true,
+                    rules: vec![],
+                    ruleset_version: 1,
+                }))
+            });
+
+        mock_backend
+            .expect_delete_ruleset()
+            .withf(move |_, id| id == "test-id")
+            .times(5) // 5 retries with CAS conflict
+            .returning(|_, _| {
+                Err(MappingProviderError::CasConflict {
+                    subject: "test-id".to_string(),
+                    description: "CAS conflict".to_string(),
+                })
+            });
+
+        let service = MappingService::from_driver(mock_backend);
+        let result = service
+            .delete_ruleset(&ExecutionContext::internal(&state), mapping_id)
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(MappingProviderError::CasConflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_delete_ruleset_succeeds_after_cas_retry() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let mapping_id = "test-id";
+
+        mock_backend
+            .expect_get_ruleset()
+            .withf(move |_, id| id == "test-id")
+            .times(1)
+            .returning(move |_, _| {
+                Ok(Some(MappingRuleSet {
+                    mapping_id: "test-id".to_string(),
+                    domain_id: None,
+                    source: IdentitySource::Federation {
+                        idp_id: "test-idp".to_string(),
+                    },
+                    domain_resolution_mode: DomainResolutionMode::Fixed,
+                    enabled: true,
+                    rules: vec![],
+                    ruleset_version: 1,
+                }))
+            });
+
+        mock_backend
+            .expect_delete_ruleset()
+            .withf(move |_, id| id == "test-id")
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let service = MappingService::from_driver(mock_backend);
+        let result = service
+            .delete_ruleset(&ExecutionContext::internal(&state), mapping_id)
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_delete_virtual_user_retries_on_cas_conflict() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let user_id = "user-1";
+
+        mock_backend
+            .expect_delete_virtual_user()
+            .withf(move |_, id| id == "user-1")
+            .times(5) // 5 retries with CAS conflict
+            .returning(|_, _| {
+                Err(MappingProviderError::CasConflict {
+                    subject: "user-1".to_string(),
+                    description: "CAS conflict".to_string(),
+                })
+            });
+
+        let service = MappingService::from_driver(mock_backend);
+        let result = service
+            .delete_virtual_user(&ExecutionContext::internal(&state), user_id)
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(MappingProviderError::CasConflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_virtual_user() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let user_id = "user-1";
+
+        let expected_vu = make_virtual_user(user_id);
+        let expected_vu_clone = expected_vu.clone();
+        mock_backend
+            .expect_get_virtual_user()
+            .withf(move |_, id| id == "user-1")
+            .returning(move |_, _| Ok(Some(expected_vu_clone.clone())));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .get_virtual_user(&ExecutionContext::internal(&state), user_id)
+            .await
+            .unwrap();
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().user_id, user_id);
+    }
+
+    #[tokio::test]
+    async fn test_list_rulesets() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+
+        let rulesets = vec![make_ruleset("id-1", false), make_ruleset("id-2", false)];
+        let rulesets_clone = rulesets.clone();
+        mock_backend
+            .expect_list_rulesets()
+            .returning(move |_, _| Ok(rulesets_clone.clone()));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .list_rulesets(
+                &ExecutionContext::internal(&state),
+                &MappingRuleSetListParameters::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_delete_ruleset_rejects_system_rules() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let mapping_id = "test-id";
+
+        mock_backend
+            .expect_get_ruleset()
+            .returning(move |_, _| Ok(Some(make_ruleset(mapping_id, true))));
+
+        mock_backend.expect_delete_ruleset().never();
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .delete_ruleset(&ExecutionContext::internal(&state), mapping_id)
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            MappingProviderError::RulesetImmutable(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_update_ruleset() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let mapping_id = "test-id";
+
+        let existing = make_ruleset(mapping_id, false);
+        let existing_clone = existing.clone();
+        mock_backend
+            .expect_get_ruleset()
+            .returning(move |_, _| Ok(Some(existing_clone.clone())));
+
+        let updated = make_ruleset(mapping_id, false);
+        let updated_clone = updated.clone();
+        mock_backend
+            .expect_update_ruleset()
+            .returning(move |_, _, _| Ok(updated_clone.clone()));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .update_ruleset(
+                &ExecutionContext::internal(&state),
+                mapping_id,
+                MappingRuleSetUpdate {
+                    enabled: Some(true),
+                    allowed_domains: None,
+                    rules: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.mapping_id, mapping_id);
+    }
+
+    #[tokio::test]
+    async fn test_update_ruleset_rejects_system_rules() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let mapping_id = "test-id";
+
+        mock_backend
+            .expect_get_ruleset()
+            .returning(move |_, _| Ok(Some(make_ruleset(mapping_id, true))));
+
+        mock_backend.expect_update_ruleset().never();
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .update_ruleset(
+                &ExecutionContext::internal(&state),
+                mapping_id,
+                MappingRuleSetUpdate {
+                    enabled: Some(true),
+                    allowed_domains: None,
+                    rules: None,
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            MappingProviderError::RulesetImmutable(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_mutate_rules_insert() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let mapping_id = "test-id";
+
+        let existing_rules = vec![
+            MappingRule {
+                name: "rule-a".to_string(),
+                description: None,
+                r#match: MatchCriteria::AllOf(vec![]),
+                identity: IdentityBinding {
+                    identity_mode: None,
+                    user_name: "a".to_string(),
+                    user_id: None,
+                    user_domain_id: None,
+                    is_system: false,
+                },
+                authorizations: vec![],
+                groups: vec![],
+            },
+            MappingRule {
+                name: "rule-b".to_string(),
+                description: None,
+                r#match: MatchCriteria::AllOf(vec![]),
+                identity: IdentityBinding {
+                    identity_mode: None,
+                    user_name: "b".to_string(),
+                    user_id: None,
+                    user_domain_id: None,
+                    is_system: false,
+                },
+                authorizations: vec![],
+                groups: vec![],
+            },
+        ];
+
+        let existing = MappingRuleSet {
+            mapping_id: mapping_id.to_string(),
+            domain_id: None,
+            source: IdentitySource::Federation {
+                idp_id: "test-idp".to_string(),
+            },
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules: existing_rules.clone(),
+            ruleset_version: 1,
+        };
+
+        let existing_clone = existing.clone();
+        mock_backend
+            .expect_get_ruleset()
+            .returning(move |_, _| Ok(Some(existing_clone.clone())));
+
+        let updated = MappingRuleSet {
+            mapping_id: mapping_id.to_string(),
+            domain_id: None,
+            source: IdentitySource::Federation {
+                idp_id: "test-idp".to_string(),
+            },
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules: vec![
+                MappingRule {
+                    name: "rule-a".to_string(),
+                    description: None,
+                    r#match: MatchCriteria::AllOf(vec![]),
+                    identity: IdentityBinding {
+                        identity_mode: None,
+                        user_name: "a".to_string(),
+                        user_id: None,
+                        user_domain_id: None,
+                        is_system: false,
+                    },
+                    authorizations: vec![],
+                    groups: vec![],
+                },
+                MappingRule {
+                    name: "rule-x".to_string(),
+                    description: None,
+                    r#match: MatchCriteria::AllOf(vec![]),
+                    identity: IdentityBinding {
+                        identity_mode: None,
+                        user_name: "x".to_string(),
+                        user_id: None,
+                        user_domain_id: None,
+                        is_system: false,
+                    },
+                    authorizations: vec![],
+                    groups: vec![],
+                },
+                MappingRule {
+                    name: "rule-b".to_string(),
+                    description: None,
+                    r#match: MatchCriteria::AllOf(vec![]),
+                    identity: IdentityBinding {
+                        identity_mode: None,
+                        user_name: "b".to_string(),
+                        user_id: None,
+                        user_domain_id: None,
+                        is_system: false,
+                    },
+                    authorizations: vec![],
+                    groups: vec![],
+                },
+            ],
+            ruleset_version: 2,
+        };
+
+        let updated_clone = updated.clone();
+        mock_backend
+            .expect_update_ruleset()
+            .returning(move |_, _, _| Ok(updated_clone.clone()));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let new_rule = MappingRule {
+            name: "rule-x".to_string(),
+            description: None,
+            r#match: MatchCriteria::AllOf(vec![]),
+            identity: IdentityBinding {
+                identity_mode: None,
+                user_name: "x".to_string(),
+                user_id: None,
+                user_domain_id: None,
+                is_system: false,
+            },
+            authorizations: vec![],
+            groups: vec![],
+        };
+
+        let result = service
+            .mutate_rules(
+                &ExecutionContext::internal(&state),
+                mapping_id,
+                RuleMutations {
+                    mutations: vec![RuleMutation::Insert {
+                        rule: new_rule,
+                        position: Some(RulePosition::Before {
+                            anchor: "rule-b".to_string(),
+                        }),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.rules.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_mutate_rules_rejects_system_rules() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let mapping_id = "test-id";
+
+        mock_backend
+            .expect_get_ruleset()
+            .returning(move |_, _| Ok(Some(make_ruleset(mapping_id, true))));
+
+        mock_backend.expect_update_ruleset().never();
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .mutate_rules(
+                &ExecutionContext::internal(&state),
+                mapping_id,
+                RuleMutations {
+                    mutations: vec![RuleMutation::Delete {
+                        rule_name: "test-rule".to_string(),
+                    }],
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            MappingProviderError::RulesetImmutable(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_mutate_rules_not_found() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let mapping_id = "test-id";
+
+        mock_backend.expect_get_ruleset().returning(|_, _| Ok(None));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .mutate_rules(
+                &ExecutionContext::internal(&state),
+                mapping_id,
+                RuleMutations {
+                    mutations: vec![RuleMutation::Delete {
+                        rule_name: "some-rule".to_string(),
+                    }],
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            MappingProviderError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_mutation_insert_invalid_anchor() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let mapping_id = "test-id";
+
+        let existing = make_ruleset(mapping_id, false);
+        let existing_clone = existing.clone();
+        mock_backend
+            .expect_get_ruleset()
+            .returning(move |_, _| Ok(Some(existing_clone.clone())));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let new_rule = MappingRule {
+            name: "rule-x".to_string(),
+            description: None,
+            r#match: MatchCriteria::AllOf(vec![]),
+            identity: IdentityBinding {
+                identity_mode: None,
+                user_name: "x".to_string(),
+                user_id: None,
+                user_domain_id: None,
+                is_system: false,
+            },
+            authorizations: vec![],
+            groups: vec![],
+        };
+
+        let result = service
+            .mutate_rules(
+                &ExecutionContext::internal(&state),
+                mapping_id,
+                RuleMutations {
+                    mutations: vec![RuleMutation::Insert {
+                        rule: new_rule,
+                        position: Some(RulePosition::Before {
+                            anchor: "nonexistent".to_string(),
+                        }),
+                    }],
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            MappingProviderError::Conflict(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_by_mapping_no_matching_ruleset() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state_with_salt().await;
+
+        let source = IdentitySource::Federation {
+            idp_id: "okta".to_string(),
+        };
+
+        mock_backend
+            .expect_get_ruleset_by_source()
+            .returning(move |_, _, _| Ok(None));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .authenticate_by_mapping(
+                &ExecutionContext::internal(&state),
+                &MappingAuthRequest {
+                    domain_id: Some("default-domain".to_string()),
+                    source: source.clone(),
+                    unique_workload_id: "workload-1".to_string(),
+                    claims: HashMap::new(),
+                    rule_name: None,
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            MappingProviderError::NoMatchingRule
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_by_mapping_disabled_ruleset() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state_with_salt().await;
+
+        let disabled_ruleset = MappingRuleSet {
+            mapping_id: "test-id".to_string(),
+            domain_id: Some("default-domain".to_string()),
+            source: IdentitySource::Federation {
+                idp_id: "okta".to_string(),
+            },
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: false,
+            rules: vec![],
+            ruleset_version: 1,
+        };
+
+        let disabled_ruleset_clone = disabled_ruleset.clone();
+        mock_backend
+            .expect_get_ruleset_by_source()
+            .returning(move |_, _, _| Ok(Some(disabled_ruleset_clone.clone())));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .authenticate_by_mapping(
+                &ExecutionContext::internal(&state),
+                &MappingAuthRequest {
+                    domain_id: Some("default-domain".to_string()),
+                    source: IdentitySource::Federation {
+                        idp_id: "okta".to_string(),
+                    },
+                    unique_workload_id: "workload-1".to_string(),
+                    claims: HashMap::new(),
+                    rule_name: None,
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            MappingProviderError::DisabledRuleset
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_by_mapping_missing_salt() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+
+        let ruleset = MappingRuleSet {
+            mapping_id: "test-id".to_string(),
+            domain_id: Some("default-domain".to_string()),
+            source: IdentitySource::Federation {
+                idp_id: "okta".to_string(),
+            },
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules: vec![],
+            ruleset_version: 1,
+        };
+
+        let ruleset_clone = ruleset.clone();
+        mock_backend
+            .expect_get_ruleset_by_source()
+            .returning(move |_, _, _| Ok(Some(ruleset_clone.clone())));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .authenticate_by_mapping(
+                &ExecutionContext::internal(&state),
+                &MappingAuthRequest {
+                    domain_id: Some("default-domain".to_string()),
+                    source: IdentitySource::Federation {
+                        idp_id: "okta".to_string(),
+                    },
+                    unique_workload_id: "workload-1".to_string(),
+                    claims: HashMap::new(),
+                    rule_name: None,
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            MappingProviderError::HmacDerivationFailed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_enable_virtual_user() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let user_id = "user-123";
+
+        let enabled_vu = VirtualUser {
+            user_id: user_id.to_string(),
+            unique_workload_id: "workload-1".to_string(),
+            mapping_id: "test-mapping".to_string(),
+            matched_rule_name: "test-rule".to_string(),
+            domain_id: None,
+            resolved_user_name: "test-user".to_string(),
+            is_system: false,
+            resolved_group_bindings: vec![],
+            authorizations: vec![],
+            ruleset_version: 1,
+            enabled: true,
+            created_at: 0,
+            last_authenticated_at: 0,
+        };
+
+        let enabled_vu_clone = enabled_vu.clone();
+        mock_backend
+            .expect_enable_virtual_user()
+            .withf(move |_, id| id == user_id)
+            .returning(move |_, _| Ok(enabled_vu_clone.clone()));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .enable_virtual_user(&ExecutionContext::internal(&state), user_id)
+            .await
+            .unwrap();
+
+        assert_eq!(result.user_id, user_id);
+        assert!(result.enabled);
+    }
+
+    #[tokio::test]
+    async fn test_disable_virtual_user() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+        let user_id = "user-123";
+
+        let disabled_vu = VirtualUser {
+            user_id: user_id.to_string(),
+            unique_workload_id: "workload-1".to_string(),
+            mapping_id: "test-mapping".to_string(),
+            matched_rule_name: "test-rule".to_string(),
+            domain_id: None,
+            resolved_user_name: "test-user".to_string(),
+            is_system: false,
+            resolved_group_bindings: vec![],
+            authorizations: vec![],
+            ruleset_version: 1,
+            enabled: false,
+            created_at: 0,
+            last_authenticated_at: 0,
+        };
+
+        let disabled_vu_clone = disabled_vu.clone();
+        mock_backend
+            .expect_disable_virtual_user()
+            .withf(move |_, id| id == user_id)
+            .returning(move |_, _| Ok(disabled_vu_clone.clone()));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .disable_virtual_user(&ExecutionContext::internal(&state), user_id)
+            .await
+            .unwrap();
+
+        assert_eq!(result.user_id, user_id);
+        assert!(!result.enabled);
+    }
+
+    #[tokio::test]
+    async fn test_get_ruleset_by_source() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state(None, None).await;
+
+        let source = IdentitySource::Federation {
+            idp_id: "test-idp".to_string(),
+        };
+
+        let expected_ruleset = MappingRuleSet {
+            mapping_id: "test-mapping".to_string(),
+            domain_id: Some("default-domain".to_string()),
+            source: source.clone(),
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules: vec![],
+            ruleset_version: 1,
+        };
+
+        let expected_ruleset_clone = expected_ruleset.clone();
+        mock_backend
+            .expect_get_ruleset_by_source()
+            .returning(move |_, _, _| Ok(Some(expected_ruleset_clone.clone())));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .get_ruleset_by_source(
+                &ExecutionContext::internal(&state),
+                "default-domain",
+                &source,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_some());
+        let ruleset = result.unwrap();
+        assert_eq!(ruleset.mapping_id, "test-mapping");
+        assert_eq!(
+            ruleset.source,
+            IdentitySource::Federation {
+                idp_id: "test-idp".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_by_mapping_success() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state_with_salt().await;
+
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), vec!["workload-123".to_string()]);
+
+        let source = IdentitySource::Federation {
+            idp_id: "okta".to_string(),
+        };
+
+        let rules = vec![MappingRule {
+            name: "matching-rule".to_string(),
+            description: None,
+            r#match: MatchCriteria::AllOf(vec![MatchCondition::Condition(
+                ClaimCondition::Equals {
+                    claim: "sub".to_string(),
+                    value: Value::String("workload-123".to_string()),
+                },
+            )]),
+            identity: IdentityBinding {
+                identity_mode: Some(IdentityMode::Ephemeral),
+                user_name: "${claims.sub}-mapped".to_string(),
+                user_id: None,
+                user_domain_id: None,
+                is_system: false,
+            },
+            authorizations: vec![],
+            groups: vec![],
+        }];
+
+        let matching_ruleset = MappingRuleSet {
+            mapping_id: "test-mapping".to_string(),
+            domain_id: Some("default-domain".to_string()),
+            source: source.clone(),
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules,
+            ruleset_version: 1,
+        };
+
+        let matching_ruleset_clone = matching_ruleset.clone();
+
+        mock_backend
+            .expect_get_ruleset_by_source()
+            .returning(move |_, _, _| Ok(Some(matching_ruleset_clone.clone())));
+
+        mock_backend
+            .expect_get_virtual_user()
+            .returning(|_, _| Ok(None));
+
+        mock_backend
+            .expect_create_virtual_user()
+            .returning(move |_, vu: VirtualUser| Ok(vu));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .authenticate_by_mapping(
+                &ExecutionContext::internal(&state),
+                &MappingAuthRequest {
+                    domain_id: Some("default-domain".to_string()),
+                    source: source.clone(),
+                    unique_workload_id: "workload-123".to_string(),
+                    claims: claims.clone(),
+                    rule_name: None,
+                },
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let auth_result = result.unwrap();
+        if let AuthenticationContext::Mapping(ctx) = auth_result.context {
+            assert_eq!(ctx.mapping_id, "test-mapping");
+            assert_eq!(ctx.matched_rule_name, "matching-rule");
+        } else {
+            panic!("Expected Mapping context");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_local_reuses_scim_provisioned_user() {
+        // ADR 0024 dedup fix: a user already provisioned via SCIM with the
+        // same deterministic id as this federated login would derive must
+        // be reused directly, without ever touching `find_federated_user`
+        // or `create_user` — proving the pre-check in
+        // `find_or_create_federated_user` short-circuits before the
+        // legacy `federated_user`-table lookup/create fallback.
+        let mut mock_backend = MockMappingBackend::new();
+
+        let source = IdentitySource::Federation {
+            idp_id: "okta".to_string(),
+        };
+
+        let rules = vec![MappingRule {
+            name: "matching-rule".to_string(),
+            description: None,
+            r#match: MatchCriteria::AllOf(vec![MatchCondition::Condition(
+                ClaimCondition::Equals {
+                    claim: "sub".to_string(),
+                    value: Value::String("ext-1".to_string()),
+                },
+            )]),
+            identity: IdentityBinding {
+                identity_mode: Some(IdentityMode::Local),
+                user_name: "should-not-be-used".to_string(),
+                user_id: None,
+                user_domain_id: None,
+                is_system: false,
+            },
+            authorizations: vec![],
+            groups: vec![],
+        }];
+
+        let matching_ruleset = MappingRuleSet {
+            mapping_id: "test-mapping".to_string(),
+            domain_id: Some("domain-1".to_string()),
+            source: source.clone(),
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules,
+            ruleset_version: 1,
+        };
+
+        mock_backend
+            .expect_get_ruleset_by_source()
+            .returning(move |_, _, _| Ok(Some(matching_ruleset.clone())));
+
+        let scim_user_id = crate::identity::generate_public_id("domain-1", "ext-1", "user");
+        let scim_user_id_clone = scim_user_id.clone();
+
+        let mut federation_mock = crate::federation::MockFederationProvider::default();
+        federation_mock
+            .expect_get_identity_provider()
+            .returning(|_, id| {
+                Ok(Some(
+                    openstack_keystone_core_types::federation::IdentityProviderBuilder::default()
+                        .id(id)
+                        .name("okta")
+                        .enabled(true)
+                        .build()
+                        .unwrap(),
+                ))
+            });
+
+        let mut identity_mock = crate::identity::MockIdentityProvider::default();
+        identity_mock.expect_get_user().returning(move |_, id| {
+            if id == scim_user_id_clone {
+                Ok(Some(
+                    openstack_keystone_core_types::identity::UserResponseBuilder::default()
+                        .id(id.to_string())
+                        .domain_id("domain-1".to_string())
+                        .name("scim-provisioned-user".to_string())
+                        .enabled(true)
+                        .build()
+                        .unwrap(),
+                ))
+            } else {
+                Ok(None)
+            }
+        });
+        // Must never be reached: the deterministic-id pre-check short-
+        // circuits before this legacy lookup/create fallback.
+        identity_mock.expect_find_federated_user().never();
+        identity_mock.expect_create_user().never();
+        identity_mock
+            .expect_list_groups_of_user()
+            .returning(|_, _| Ok(vec![]));
+        identity_mock
+            .expect_list_groups()
+            .returning(|_, _| Ok(vec![]));
+
+        let provider = crate::provider::Provider::mocked_builder()
+            .mock_identity(identity_mock)
+            .mock_federation(federation_mock);
+        let mut cfg = Config::default();
+        cfg.mapping.cluster_salt = Some(SecretString::from("test-salt-for-hmac-derivation!"));
+        let state = get_mocked_state(Some(cfg), Some(provider)).await;
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), vec!["ext-1".to_string()]);
+
+        let result = service
+            .authenticate_by_mapping(
+                &ExecutionContext::internal(&state),
+                &MappingAuthRequest {
+                    domain_id: Some("domain-1".to_string()),
+                    source: source.clone(),
+                    unique_workload_id: "ext-1".to_string(),
+                    claims,
+                    rule_name: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let AuthenticationContext::Oidc { .. } = result.context else {
+            panic!("Expected Oidc authentication context");
+        };
+        let IdentityInfo::User(user_identity) = result.principal.identity else {
+            panic!("Expected a User principal");
+        };
+        assert_eq!(user_identity.user_id, scim_user_id);
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_local_creates_new_federated_user_with_deterministic_id() {
+        // ADR 0024 dedup fix, reverse ordering: when federation JIT-
+        // provisions a brand-new user (no SCIM-provisioned row yet), the
+        // `create_user` call must still receive the same deterministic id
+        // `generate_public_id(domain_id, sub, "user")` would compute — so
+        // that a *later* SCIM provisioning of the same person (matching
+        // `externalId` == this `sub`) converges on this same row instead of
+        // creating a duplicate.
+        let mut mock_backend = MockMappingBackend::new();
+
+        let source = IdentitySource::Federation {
+            idp_id: "okta".to_string(),
+        };
+
+        let rules = vec![MappingRule {
+            name: "matching-rule".to_string(),
+            description: None,
+            r#match: MatchCriteria::AllOf(vec![MatchCondition::Condition(
+                ClaimCondition::Equals {
+                    claim: "sub".to_string(),
+                    value: Value::String("ext-2".to_string()),
+                },
+            )]),
+            identity: IdentityBinding {
+                identity_mode: Some(IdentityMode::Local),
+                user_name: "jit-user".to_string(),
+                user_id: None,
+                user_domain_id: None,
+                is_system: false,
+            },
+            authorizations: vec![],
+            groups: vec![],
+        }];
+
+        let matching_ruleset = MappingRuleSet {
+            mapping_id: "test-mapping".to_string(),
+            domain_id: Some("domain-1".to_string()),
+            source: source.clone(),
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules,
+            ruleset_version: 1,
+        };
+
+        mock_backend
+            .expect_get_ruleset_by_source()
+            .returning(move |_, _, _| Ok(Some(matching_ruleset.clone())));
+
+        let expected_id = crate::identity::generate_public_id("domain-1", "ext-2", "user");
+        let expected_id_clone = expected_id.clone();
+
+        let mut federation_mock = crate::federation::MockFederationProvider::default();
+        federation_mock
+            .expect_get_identity_provider()
+            .returning(|_, id| {
+                Ok(Some(
+                    openstack_keystone_core_types::federation::IdentityProviderBuilder::default()
+                        .id(id)
+                        .name("okta")
+                        .enabled(true)
+                        .build()
+                        .unwrap(),
+                ))
+            });
+
+        let mut identity_mock = crate::identity::MockIdentityProvider::default();
+        // No SCIM-provisioned user exists yet at the deterministic id.
+        identity_mock.expect_get_user().returning(|_, _| Ok(None));
+        identity_mock
+            .expect_find_federated_user()
+            .returning(|_, _, _| Ok(None));
+        identity_mock.expect_create_user().returning(move |_, req| {
+            assert_eq!(req.id.as_deref(), Some(expected_id_clone.as_str()));
+            Ok(
+                openstack_keystone_core_types::identity::UserResponseBuilder::default()
+                    .id(req.id.clone().unwrap())
+                    .domain_id(req.domain_id.clone().unwrap_or_default())
+                    .name(req.name.clone())
+                    .enabled(true)
+                    .build()
+                    .unwrap(),
+            )
+        });
+        identity_mock
+            .expect_list_groups_of_user()
+            .returning(|_, _| Ok(vec![]));
+        identity_mock
+            .expect_list_groups()
+            .returning(|_, _| Ok(vec![]));
+
+        let provider = crate::provider::Provider::mocked_builder()
+            .mock_identity(identity_mock)
+            .mock_federation(federation_mock);
+        let mut cfg = Config::default();
+        cfg.mapping.cluster_salt = Some(SecretString::from("test-salt-for-hmac-derivation!"));
+        let state = get_mocked_state(Some(cfg), Some(provider)).await;
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), vec!["ext-2".to_string()]);
+
+        let result = service
+            .authenticate_by_mapping(
+                &ExecutionContext::internal(&state),
+                &MappingAuthRequest {
+                    domain_id: Some("domain-1".to_string()),
+                    source: source.clone(),
+                    unique_workload_id: "ext-2".to_string(),
+                    claims,
+                    rule_name: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let IdentityInfo::User(user_identity) = result.principal.identity else {
+            panic!("Expected a User principal");
+        };
+        assert_eq!(user_identity.user_id, expected_id);
+    }
+
+    #[test]
+    fn test_derive_authz_info_empty() {
+        assert!(derive_authz_info(&[]).is_none());
+    }
+
+    #[test]
+    fn test_derive_authz_info_project() {
+        let authz = Authorization::Project {
+            project_id: "proj-1".to_string(),
+            project_domain_id: "dom-1".to_string(),
+            roles: vec![RoleRef {
+                id: "member".to_string(),
+                name: Some("member".to_string()),
+                domain_id: None,
+            }],
+        };
+        let result = derive_authz_info(&[authz]).unwrap();
+        match result.scope {
+            ScopeInfo::Project {
+                ref project,
+                ref project_domain,
+            } => {
+                assert_eq!(project.id, "proj-1");
+                assert_eq!(project_domain.id, "dom-1");
+            }
+            _ => panic!("Expected Project scope"),
+        }
+        assert_eq!(result.effective_roles().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_derive_authz_info_domain() {
+        let authz = Authorization::Domain {
+            domain_id: "dom-1".to_string(),
+            roles: vec![RoleRef {
+                id: "admin".to_string(),
+                name: Some("admin".to_string()),
+                domain_id: None,
+            }],
+        };
+        let result = derive_authz_info(&[authz]).unwrap();
+        match result.scope {
+            ScopeInfo::Domain(ref domain) => {
+                assert_eq!(domain.id, "dom-1");
+            }
+            _ => panic!("Expected Domain scope"),
+        }
+        assert_eq!(result.effective_roles().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_derive_authz_info_system() {
+        let authz = Authorization::System {
+            system_id: "all".to_string(),
+            roles: vec![RoleRef {
+                id: "admin".to_string(),
+                name: Some("admin".to_string()),
+                domain_id: None,
+            }],
+        };
+        let result = derive_authz_info(&[authz]).unwrap();
+        match result.scope {
+            ScopeInfo::System(ref sys) => {
+                assert_eq!(sys, "all");
+            }
+            _ => panic!("Expected System scope"),
+        }
+        assert_eq!(result.effective_roles().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_by_mapping_authz_is_set() {
+        let mut mock_backend = MockMappingBackend::new();
+        let state = get_mocked_state_with_salt().await;
+
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), vec!["workload-123".to_string()]);
+
+        let source = IdentitySource::Federation {
+            idp_id: "okta".to_string(),
+        };
+
+        let rules = vec![MappingRule {
+            name: "matching-rule".to_string(),
+            description: None,
+            r#match: MatchCriteria::AllOf(vec![MatchCondition::Condition(
+                ClaimCondition::Equals {
+                    claim: "sub".to_string(),
+                    value: Value::String("workload-123".to_string()),
+                },
+            )]),
+            identity: IdentityBinding {
+                identity_mode: Some(IdentityMode::Ephemeral),
+                user_name: "${claims.sub}-mapped".to_string(),
+                user_id: None,
+                user_domain_id: None,
+                is_system: false,
+            },
+            authorizations: vec![Authorization::Project {
+                project_id: "proj-123".to_string(),
+                project_domain_id: "dom-default".to_string(),
+                roles: vec![RoleRef {
+                    id: "member".to_string(),
+                    name: Some("member".to_string()),
+                    domain_id: None,
+                }],
+            }],
+            groups: vec![],
+        }];
+
+        let matching_ruleset = MappingRuleSet {
+            mapping_id: "test-mapping".to_string(),
+            domain_id: Some("default-domain".to_string()),
+            source: source.clone(),
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules,
+            ruleset_version: 1,
+        };
+
+        let matching_ruleset_clone = matching_ruleset.clone();
+
+        mock_backend
+            .expect_get_ruleset_by_source()
+            .returning(move |_, _, _| Ok(Some(matching_ruleset_clone.clone())));
+
+        mock_backend
+            .expect_get_virtual_user()
+            .returning(|_, _| Ok(None));
+
+        mock_backend
+            .expect_create_virtual_user()
+            .returning(move |_, vu| Ok(vu));
+
+        let service = MappingService::from_driver(mock_backend);
+
+        let result = service
+            .authenticate_by_mapping(
+                &ExecutionContext::internal(&state),
+                &MappingAuthRequest {
+                    domain_id: Some("default-domain".to_string()),
+                    source: source.clone(),
+                    unique_workload_id: "workload-123".to_string(),
+                    claims: claims.clone(),
+                    rule_name: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let authz = result.authorization.expect("authorization should be set");
+        match authz.scope {
+            ScopeInfo::Project {
+                ref project,
+                ref project_domain,
+            } => {
+                assert_eq!(project.id, "proj-123");
+                assert_eq!(project_domain.id, "dom-default");
+            }
+            _ => panic!("Expected Project scope"),
+        }
+        assert_eq!(authz.effective_roles().unwrap().len(), 1);
+    }
+}

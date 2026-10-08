@@ -1,0 +1,421 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+pub mod api_key_auth;
+pub mod auth;
+pub mod common;
+#[cfg(any(test, feature = "mock"))]
+pub mod policy_contract;
+pub mod v3;
+pub mod v4;
+
+pub use openstack_keystone_api_types::error::KeystoneApiError;
+
+#[cfg(any(test, feature = "mock"))]
+#[allow(clippy::unwrap_used)]
+pub mod tests {
+    use sea_orm::DatabaseConnection;
+    use std::sync::Arc;
+
+    use crate::auth::ValidatedSecurityContext;
+    use cadf::AuditDispatcher;
+    use openstack_keystone_config::{Config, ConfigManager};
+    use openstack_keystone_core_types::auth::{
+        AuthenticationContext, AuthzInfoBuilder, IdentityInfo, PrincipalInfo, ScopeInfo,
+        SecurityContext, UserIdentityInfoBuilder,
+    };
+    use openstack_keystone_core_types::resource::{Domain, Project};
+    use openstack_keystone_core_types::role::RoleRef;
+
+    use crate::keystone::{Service, ServiceState};
+    use crate::policy::{MockPolicy, PolicyError, PolicyEvaluationResult};
+    use crate::provider::ProviderBuilder;
+
+    /// Build a project-scoped ValidatedSecurityContext with admin role for unit
+    /// tests.
+    ///
+    /// Directly constructs the struct via `ValidatedSecurityContext::test_new`
+    /// so no provider mocks are needed. The `fully_resolved` check passes
+    /// because `authorization` contains a non-empty roles list.
+    #[cfg(any(test, feature = "mock"))]
+    pub fn test_fixture_scoped() -> ValidatedSecurityContext {
+        let user = openstack_keystone_core_types::identity::UserResponseBuilder::default()
+            .id("uid")
+            .domain_id("domain_id")
+            .enabled(true)
+            .name("testuser")
+            .build()
+            .unwrap();
+
+        let authz = AuthzInfoBuilder::default()
+            .roles(vec![RoleRef {
+                id: "admin".to_string(),
+                name: Some("admin".to_string()),
+                domain_id: None,
+            }])
+            .scope(ScopeInfo::Project {
+                project: Project {
+                    id: "project_id".to_string(),
+                    domain_id: "domain_id".to_string(),
+                    enabled: true,
+                    name: "admin".to_string(),
+                    ..Default::default()
+                },
+                project_domain: Domain {
+                    id: "domain_id".to_string(),
+                    name: "domain_name".to_string(),
+                    enabled: true,
+                    ..Default::default()
+                },
+            })
+            .build()
+            .unwrap();
+
+        let sc = SecurityContext::test_build()
+            .authentication_context(AuthenticationContext::Password)
+            .principal(PrincipalInfo {
+                identity: IdentityInfo::User(
+                    UserIdentityInfoBuilder::default()
+                        .user_id("uid")
+                        .user(user)
+                        .user_domain(openstack_keystone_core_types::resource::Domain {
+                            id: "domain_id".to_string(),
+                            name: "domain_name".to_string(),
+                            enabled: true,
+                            ..Default::default()
+                        })
+                        .build()
+                        .unwrap(),
+                ),
+            })
+            .authorization(authz)
+            .build();
+
+        ValidatedSecurityContext::test_new(sc)
+    }
+
+    /// Build a project-scoped ValidatedSecurityContext with EC2 authentication
+    /// context, for testing the `reject_if_ec2` guard.
+    #[cfg(any(test, feature = "mock"))]
+    pub fn test_fixture_ec2_scoped() -> ValidatedSecurityContext {
+        let user = openstack_keystone_core_types::identity::UserResponseBuilder::default()
+            .id("uid")
+            .domain_id("domain_id")
+            .enabled(true)
+            .name("testuser")
+            .build()
+            .unwrap();
+
+        let authz = AuthzInfoBuilder::default()
+            .roles(vec![RoleRef {
+                id: "admin".to_string(),
+                name: Some("admin".to_string()),
+                domain_id: None,
+            }])
+            .scope(ScopeInfo::Project {
+                project: Project {
+                    id: "project_id".to_string(),
+                    domain_id: "domain_id".to_string(),
+                    enabled: true,
+                    name: "admin".to_string(),
+                    ..Default::default()
+                },
+                project_domain: Domain {
+                    id: "domain_id".to_string(),
+                    name: "domain_name".to_string(),
+                    enabled: true,
+                    ..Default::default()
+                },
+            })
+            .build()
+            .unwrap();
+
+        let sc = SecurityContext::test_build()
+            .authentication_context(AuthenticationContext::Ec2Credential)
+            .principal(PrincipalInfo {
+                identity: IdentityInfo::User(
+                    UserIdentityInfoBuilder::default()
+                        .user_id("uid")
+                        .user(user)
+                        .user_domain(openstack_keystone_core_types::resource::Domain {
+                            id: "domain_id".to_string(),
+                            name: "domain_name".to_string(),
+                            enabled: true,
+                            ..Default::default()
+                        })
+                        .build()
+                        .unwrap(),
+                ),
+            })
+            .token(
+                openstack_keystone_core_types::token::FernetToken::ProjectScope(
+                    openstack_keystone_core_types::token::ProjectScopePayload {
+                        user_id: "bar".into(),
+                        methods: vec!["ec2credential".into()],
+                        audit_ids: vec![],
+                        expires_at: chrono::Utc::now(),
+                        project_id: "pid".into(),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .authorization(authz)
+            .build();
+
+        ValidatedSecurityContext::test_new(sc)
+    }
+
+    /// Initialize the mocked service state.
+    ///
+    /// # Arguments
+    /// * `provider_builder` - The provider builder with mock expectations set.
+    /// * `policy_allow` - Whether the mock policy should allow all requests or
+    ///   not.
+    /// * `policy_allow_see_other_domains` - Policy extension flag to include
+    ///   "allow_to_see_other_domain" in the response.
+    pub async fn get_mocked_state(
+        provider_builder: ProviderBuilder,
+        policy_allow: bool,
+        policy_allow_see_other_domains: Option<bool>,
+    ) -> ServiceState {
+        let mut config = Config::default();
+        // Unit tests have no `public_endpoint`; keep the development-only
+        // Host-header issuer working for them. Tests of the production
+        // behaviour pass their own config.
+        config.oauth2.allow_host_header_issuer = true;
+        get_mocked_state_with_config(
+            provider_builder,
+            policy_allow,
+            policy_allow_see_other_domains,
+            config,
+        )
+        .await
+    }
+
+    /// Like [`get_mocked_state`], but with a caller-supplied [`Config`].
+    ///
+    /// Needed to exercise anything the configuration governs — notably the
+    /// `list_limit`/`max_db_limit` pagination chain, which `Config::default()`
+    /// leaves entirely unset and therefore cannot distinguish a resolved
+    /// limit from the raw request value.
+    pub async fn get_mocked_state_with_config(
+        provider_builder: ProviderBuilder,
+        policy_allow: bool,
+        policy_allow_see_other_domains: Option<bool>,
+        config: Config,
+    ) -> ServiceState {
+        mocked_state(
+            provider_builder,
+            policy_allow,
+            policy_allow_see_other_domains,
+            config,
+            AuditDispatcher::noop(),
+        )
+        .await
+    }
+
+    /// Like [`get_mocked_state`], but with a live audit dispatcher whose
+    /// channel receivers are returned, so a test can assert on the audit
+    /// records a handler emitted.
+    pub async fn get_mocked_state_with_audit(
+        provider_builder: ProviderBuilder,
+        policy_allow: bool,
+        config: Config,
+    ) -> (ServiceState, cadf::AuditChannelReceivers) {
+        let (dispatcher, receivers) = AuditDispatcher::new(
+            "test-node",
+            uuid::Uuid::new_v4().to_string(),
+            Arc::from(b"test-hmac-key-32-bytes-long!!!!".as_slice()),
+            0,
+        );
+        let state = mocked_state(provider_builder, policy_allow, None, config, dispatcher).await;
+        (state, receivers)
+    }
+
+    async fn mocked_state(
+        provider_builder: ProviderBuilder,
+        policy_allow: bool,
+        policy_allow_see_other_domains: Option<bool>,
+        config: Config,
+        audit_dispatcher: Arc<AuditDispatcher>,
+    ) -> ServiceState {
+        let provider = provider_builder.build().unwrap();
+
+        let mut policy_enforcer_mock = MockPolicy::default();
+
+        policy_enforcer_mock
+            .expect_enforce()
+            .returning(move |_, _, _, _| {
+                if policy_allow {
+                    if policy_allow_see_other_domains.is_some_and(|x| x) {
+                        Ok(PolicyEvaluationResult::allowed_admin())
+                    } else {
+                        Ok(PolicyEvaluationResult::allowed())
+                    }
+                } else {
+                    Err(PolicyError::Forbidden(PolicyEvaluationResult::forbidden()))
+                }
+            });
+
+        policy_enforcer_mock
+            .expect_health_check()
+            .returning(|| Ok(()));
+
+        Arc::new(
+            Service::new(
+                ConfigManager::not_watched(config),
+                DatabaseConnection::default(),
+                provider,
+                Arc::new(policy_enforcer_mock),
+                audit_dispatcher,
+                None,
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    /// Initialize service state with a caller-configured policy mock.
+    ///
+    /// This supports handler tests whose policy decision depends on the
+    /// individual resource instead of a single allow/deny value.
+    pub async fn get_state_with_mock_policy(
+        provider_builder: ProviderBuilder,
+        mut policy_enforcer_mock: MockPolicy,
+    ) -> ServiceState {
+        let provider = provider_builder.build().unwrap();
+        policy_enforcer_mock
+            .expect_health_check()
+            .returning(|| Ok(()));
+
+        Arc::new(
+            Service::new(
+                ConfigManager::not_watched(Config::default()),
+                DatabaseConnection::default(),
+                provider,
+                Arc::new(policy_enforcer_mock),
+                AuditDispatcher::noop(),
+                None,
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    /// One recorded `enforce()` call, as observed by [`CapturingPolicy`].
+    ///
+    /// This is Gate B2 (security review V3a, issue #978): the shared,
+    /// non-opt-in capture point every handler-under-test's `(policy_name,
+    /// target, existing)` triple flows through, so the input-contract
+    /// assertions in [`super::policy_contract`] apply uniformly instead of
+    /// being re-derived (or skipped) per test.
+    #[derive(Clone, Debug)]
+    pub struct PolicyCall {
+        pub policy_name: &'static str,
+        pub target: serde_json::Value,
+        pub existing: Option<serde_json::Value>,
+    }
+
+    /// A [`crate::policy::PolicyEnforcer`] test double that records every
+    /// call instead of judging it, and always allows -- decision-making is
+    /// `opa test policy`'s job (Gate A) and, once built, Gate B3's; this
+    /// harness exists solely to assert what the handler *fed* the policy.
+    #[derive(Clone, Default)]
+    pub struct CapturingPolicy {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<PolicyCall>>>,
+    }
+
+    impl CapturingPolicy {
+        /// Every call recorded so far, in order.
+        #[allow(clippy::unwrap_used)]
+        pub fn calls(&self) -> Vec<PolicyCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::policy::PolicyEnforcer for CapturingPolicy {
+        async fn enforce(
+            &self,
+            policy_name: &'static str,
+            _credentials: &ValidatedSecurityContext,
+            target: serde_json::Value,
+            existing: Option<serde_json::Value>,
+        ) -> Result<PolicyEvaluationResult, PolicyError> {
+            #[allow(clippy::unwrap_used)]
+            self.calls.lock().unwrap().push(PolicyCall {
+                policy_name,
+                target: target.clone(),
+                existing: existing.clone(),
+            });
+            Ok(PolicyEvaluationResult::allowed_admin())
+        }
+
+        async fn health_check(&self) -> Result<(), PolicyError> {
+            Ok(())
+        }
+    }
+
+    /// Like [`get_mocked_state`], but wired to a caller-supplied
+    /// [`crate::policy::PolicyEnforcer`].
+    ///
+    /// [`get_mocked_state`] decides uniformly (allow-all or deny-all) and
+    /// [`get_capturing_state`] always allows, so neither can express
+    /// "allow the collection check, deny *this* item" — which is exactly
+    /// what a list handler's per-item re-check (security model I8) needs to
+    /// be tested for, along with propagation of non-`Forbidden` policy
+    /// errors.
+    pub async fn get_state_with_policy(
+        provider_builder: ProviderBuilder,
+        policy: Arc<dyn crate::policy::PolicyEnforcer>,
+    ) -> ServiceState {
+        let provider = provider_builder.build().unwrap();
+        Arc::new(
+            Service::new(
+                ConfigManager::not_watched(Config::default()),
+                DatabaseConnection::default(),
+                provider,
+                policy,
+                AuditDispatcher::noop(),
+                None,
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    /// Like [`get_mocked_state`], but wired to a [`CapturingPolicy`] instead
+    /// of an allow/deny-only mock, so the test can inspect exactly what
+    /// `(policy_name, target, existing)` the handler under test sent.
+    pub async fn get_capturing_state(
+        provider_builder: ProviderBuilder,
+    ) -> (ServiceState, CapturingPolicy) {
+        let provider = provider_builder.build().unwrap();
+        let policy = CapturingPolicy::default();
+
+        let state = Arc::new(
+            Service::new(
+                ConfigManager::not_watched(Config::default()),
+                DatabaseConnection::default(),
+                provider,
+                Arc::new(policy.clone()),
+                AuditDispatcher::noop(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        (state, policy)
+    }
+}

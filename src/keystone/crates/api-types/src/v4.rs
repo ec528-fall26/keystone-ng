@@ -1,0 +1,35 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # V4 API types
+pub mod api_key;
+pub mod auth;
+pub mod auth_plugin;
+pub mod mapping;
+pub mod oauth2_client;
+pub mod oauth2_key;
+pub mod scim_realm;
+pub mod token_restriction;
+pub mod user;
+pub mod vendordata;
+
+#[cfg(feature = "conv")]
+mod api_key_conv;
+#[cfg(feature = "conv")]
+mod oauth2_client_conv;
+#[cfg(feature = "conv")]
+mod scim_realm_conv;
+#[cfg(feature = "conv")]
+mod token_restriction_conv;
+#[cfg(feature = "conv")]
+mod user_conv;

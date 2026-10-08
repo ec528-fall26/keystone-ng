@@ -1,0 +1,557 @@
+# Skaffold configuration for deploying keystone development environment
+#
+# # Requirements:
+# * local registry running at `localhost:5000` when `local` profile is used
+#
+# # Modules:
+#
+# * `infra` - peripheral components: spire, certmanager, keycloak, dex, etc
+# * `keystone` - Keystone
+#
+# # Usage
+#
+# `skaffold run --cleanup=false -p local --default-repo localhost:5000
+#
+# * (re)deploy only keystone: `skaffold deploy -m keystone`
+# * delete only keystone resource: `skaffold delete -m keystone`
+#
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: infra
+manifests:
+  kustomize:
+    paths:
+      - tools/k8s/tests/keycloak
+      - tools/k8s/tests/dex
+      - tools/k8s/tests/callback
+  rawYaml:
+    - tools/k8s/tests/selenium.yaml
+deploy:
+  statusCheck: true
+  statusCheckDeadlineSeconds: 300
+  tolerateFailuresUntilDeadline: true
+  helm:
+    releases:
+      - name: cloudnative-pg
+        repo: https://cloudnative-pg.github.io/charts
+        remoteChart: cloudnative-pg
+        createNamespace: true
+        namespace: cnpg
+      - name: cert-manager
+        repo: https://charts.jetstack.io
+        remoteChart: cert-manager
+        version: 1.20.2
+        createNamespace: true
+        namespace: cert-manager
+        setValues:
+          crds.enabled: true
+      - name: spire-crds
+        repo: https://spiffe.github.io/helm-charts-hardened
+        remoteChart: spire-crds
+        namespace: spire
+        createNamespace: true
+      - name: spire
+        repo: https://spiffe.github.io/helm-charts-hardened
+        remoteChart: spire
+        namespace: spire
+---
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: keystone
+build:
+  insecureRegistries:
+    - localhost:5000
+  artifacts:
+    - image: keystone-rs
+      context: .
+      docker:
+        dockerfile: tools/Dockerfile.skaffold
+
+  local:
+    concurrency: 0
+
+manifests:
+  kustomize:
+    paths:
+      - tools/k8s/keystone/overlays/skaffold
+  rawYaml:
+    - tools/k8s/tests/k8s-auth-test-sa.yaml
+    - tools/k8s/tests/cluster-issuer.yaml
+    - tools/k8s/tests/keystone-ca.yaml
+    - tools/k8s/tests/keystone-peer-cert.yaml
+    - tools/k8s/tests/keystone-raft-spiffe-id.yaml
+    - tools/k8s/tests/keystone-storage-operator.yaml
+deploy:
+  statusCheck: true
+  statusCheckDeadlineSeconds: 300
+  tolerateFailuresUntilDeadline: true
+  kubectl:
+    flags:
+      apply: ["--wait"]
+    hooks:
+      before:
+        - host:
+            # Delete keystone-bootstrap job before apply to avoid immutable job error
+            command: ["kubectl", "delete", "job", "keystone-bootstrap", "--ignore-not-found", "--wait", "--timeout=30s"]
+      after:
+        - host:
+            # This command will block Skaffold until the bootstrap job hits 'Completed'
+            command: ["kubectl", "wait", "--for=condition=complete", "job/keystone-bootstrap", "--timeout=180s"]
+        - host:
+            # Wait for all Raft pods and the storage operator pod to be ready
+            command: ["sh", "-c", "kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=keystone-rs --timeout=180s && kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=keystone-storage-operator --timeout=180s"]
+        - host:
+            # Join non-zero Raft nodes to the cluster (node 0 initialized by
+            # bootstrap). Run from each joining node so its own
+            # ``config` node_id and node_cluster_addr are used in the
+            # add_learner request sent to the leader (ADR 0016-v2 §4.1).
+            # Fail-fast (no || true) so a broken cluster is caught early.
+            command: ["sh", "-c", 'REPLICAS=$(kubectl get sts keystone-rs -o jsonpath="{.spec.replicas}"); for i in $(seq 1 $(($REPLICAS - 1))); do kubectl exec keystone-rs-$i -- keystone-manage storage join https://keystone-rs-0.keystone-rs-internal.default.svc.cluster.local:8300; sleep 2; done']
+        - host:
+            # Wait for replication to start so promote doesn't race the
+            # initial add_learner log entry (learner must have a non-None
+            # replication state before it can be promoted).
+            # Wait for all joined nodes to appear in the cluster membership
+            # by polling list-peers from the leader (node 0). Counts table
+            # data rows (those starting with "│" and containing a node
+            # hostname). This avoids a blind sleep and works reliably for
+            # any replica count.
+            command:
+              - sh
+              - -c
+              - |
+                REPLICAS=$(kubectl get sts keystone-rs -o jsonpath="{.spec.replicas}")
+                max_attempts=60
+                attempt=0
+                until [ "$attempt" -ge "$max_attempts" ]; do
+                  OUTPUT=$(kubectl exec deploy/keystone-storage-operator -- keystone-manage storage list-peers 2>&1)
+                  FOUND=0
+                  for i in $(seq 0 $((REPLICAS - 1))); do
+                    if echo "$OUTPUT" | grep -q "keystone-rs-$i.keystone-rs-internal"; then
+                      FOUND=$((FOUND + 1))
+                    fi
+                  done
+                  if [ "$FOUND" -eq "$REPLICAS" ]; then
+                    echo "All $REPLICAS nodes present in cluster membership"
+                    break
+                  fi
+                  attempt=$((attempt + 1))
+                  echo "Wait-replication: $FOUND/$REPLICAS nodes visible (attempt $attempt)"
+                  sleep 2
+                done
+                if [ "$attempt" -ge "$max_attempts" ]; then
+                  echo "Wait-replication timed out: only $FOUND/$REPLICAS nodes visible"
+                  exit 1
+                fi
+        - host:
+            # Promote newly-joined learners to voters (ADR 0016-v2 §4.1
+            # "Step 4: promote"). Run from node 0 (the leader) so the
+            # change_membership RPC is sent to the right node.
+            command: ["sh", "-c", 'REPLICAS=$(kubectl get sts keystone-rs -o jsonpath="{.spec.replicas}"); for i in $(seq 1 $(($REPLICAS - 1))); do kubectl exec deploy/keystone-storage-operator -- keystone-manage storage promote $i; done']
+        - host:
+            # Verify all replicas are voters before proceeding. Polls
+            # list-peers from node 0 and counts rows where the Voter
+            # column (last before closing │) contains "yes".
+            command:
+              - sh
+              - -c
+              - |
+                REPLICAS=$(kubectl get sts keystone-rs -o jsonpath="{.spec.replicas}")
+                max_attempts=30
+                attempt=0
+                until [ "$attempt" -ge "$max_attempts" ]; do
+                  OUTPUT=$(kubectl exec deploy/keystone-storage-operator -- keystone-manage storage list-peers 2>&1)
+                  VOTERS=$(echo "$OUTPUT" | grep -cP '\x{2506}\s+yes\s+\x{2502}' || true)
+                  if [ "$VOTERS" -ge "$REPLICAS" ]; then
+                    echo "All $REPLICAS replicas confirmed as voters"
+                    break
+                  fi
+                  attempt=$((attempt + 1))
+                  echo "Post-promote verify: $VOTERS voters (need $REPLICAS, attempt $attempt)"
+                  sleep 2
+                done
+                if [ "$attempt" -ge "$max_attempts" ]; then
+                  echo "Post-promote verification failed: only $VOTERS voters"
+                  exit 1
+                fi
+        - host:
+            # ADR 0026 §3: `default` is bootstrapped by the legacy Python
+            # `keystone-manage bootstrap` (bootstrap-job.yaml), which writes
+            # straight to the DB and never fires the Rust API's
+            # `Oauth2KeyHook`, so `default` would otherwise never get an
+            # OAuth2 signing key. Run the idempotent
+            # `keystone-manage oauth2 ensure-signing-key` via `kubectl exec`
+            # into the already-running keystone-rs-0 pod (same pod/SPIFFE
+            # identity as `[interface_admin] admin_svid`, so it
+            # auto-authenticates as SystemAdmin -- see
+            # `crates/core/src/api/auth.rs`). Retried here, from the host,
+            # rather than from an in-pod hook/sidecar: raft may not have a
+            # leader yet and OPA may not have bound its socket yet on a
+            # fresh cluster, both transient.
+            command:
+              - sh
+              - -c
+              - |
+                attempt=0
+                max_attempts=60
+                until kubectl exec keystone-rs-0 -c keystone -- keystone-manage oauth2 ensure-signing-key --domain default; do
+                  attempt=$((attempt + 1))
+                  if [ "$attempt" -ge "$max_attempts" ]; then
+                    echo "ensure-signing-key failed after $attempt attempts, giving up"
+                    exit 1
+                  fi
+                  backoff=12
+                  [ "$attempt" -lt 6 ] && backoff=$((attempt * 2))
+                  echo "ensure-signing-key attempt $attempt failed, retrying in ${backoff}s"
+                  sleep "$backoff"
+                done
+                echo "OAuth2 signing key ensured for domain default"
+        - host:
+            # Extend catalog with identity-rs catalog entry
+            command:
+              - sh
+              - -c
+              - |
+                kubectl exec keystone-rs-0 -c keystone -- keystone-manage catalog service create --name keystone-rs --type identity-rs --enabled || true
+                kubectl exec keystone-rs-0 -c keystone -- keystone-manage catalog endpoint create --service-name keystone-rs --interface public --url "http://keystone-rs.local" --enabled || true
+                kubectl exec keystone-rs-0 -c keystone -- keystone-manage catalog endpoint create --service-name keystone-rs --interface internal --url "http://keystone-rs.default.svc.cluster.local:8080" --enabled || true
+
+verify:
+  - &api_test_v3
+    name: "api-test-v3"
+    container:
+      image: "keystone-rs"
+      name: "api-test-v3"
+      command: ["/tests/test-api-v3"]
+      env:
+        - name: "RUST_LOG"
+          value: "info,reqwest=off,h2=off,hyper=off"
+        - name: "KEYSTONE_URL"
+          value: "http://keystone-rs.default.svc.cluster.local:8080"
+        - name: "OS_AUTH_URL"
+          value: "http://keystone-rs.default.svc.cluster.local:8080"
+        - name: "OS_USERNAME"
+          value: "admin"
+        - name: "OS_PASSWORD"
+          value: "password"
+        - name: "OS_USER_DOMAIN_ID"
+          value: "default"
+        - name: "OS_PROJECT_NAME"
+          value: "admin"
+        - name: "OS_PROJECT_DOMAIN_ID"
+          value: "default"
+    executionMode:
+      kubernetesCluster: {}
+
+  - &api_test_v4
+    name: "api-test-v4"
+    container:
+      image: "keystone-rs"
+      name: "api-test-v4"
+      command: ["/tests/test-api-v4"]
+      env:
+        - name: "RUST_LOG"
+          value: "debug,reqwest=off,h2=off,hyper=off"
+        - name: "KEYSTONE_URL"
+          value: "http://keystone-rs.default.svc.cluster.local:8080"
+        - name: "OS_AUTH_URL"
+          value: "http://keystone-rs.default.svc.cluster.local:8080"
+        - name: "OS_USERNAME"
+          value: "admin"
+        - name: "OS_PASSWORD"
+          value: "password"
+        - name: "OS_USER_DOMAIN_ID"
+          value: "default"
+        - name: "OS_PROJECT_NAME"
+          value: "admin"
+        - name: "OS_PROJECT_DOMAIN_ID"
+          value: "default"
+        - name: "WEBAUTHN_URL"
+          value: "https://keystone.local"
+    executionMode:
+      kubernetesCluster: {}
+
+  - &k8s_auth_test
+    name: "k8s-auth-test"
+    container:
+      image: "keystone-rs"
+      name: "k8s-auth-test"
+      command: ["/tests/test-k8s-auth", "--nocapture"]
+      env:
+        - name: "RUST_LOG"
+          value: "info,reqwest=off,h2=off,hyper=off"
+        - name: "KEYSTONE_URL"
+          value: "http://keystone-rs.default.svc.cluster.local:8080"
+        - name: "OS_AUTH_URL"
+          value: "http://keystone-rs.default.svc.cluster.local:8080"
+        - name: "OS_USERNAME"
+          value: "admin"
+        - name: "OS_PASSWORD"
+          value: "password"
+        - name: "OS_USER_DOMAIN_ID"
+          value: "default"
+        - name: "OS_PROJECT_NAME"
+          value: "admin"
+        - name: "OS_PROJECT_DOMAIN_ID"
+          value: "default"
+    executionMode:
+      kubernetesCluster:
+        overrides: '{ "spec": { "template": { "spec": { "serviceAccountName": "keystone-k8s-auth-test-sa" } } } }'
+
+  - &spiffe
+    name: "raft-spiffe-test"
+    container:
+      image: "keystone-rs"
+      name: "raft-spiffe-test"
+      command: ["/tests/test-raft-spiffe", "--nocapture"]
+      env:
+        - name: "RUST_LOG"
+          value: "info,spiffe=info"
+        - name: "OS_DISTRIBUTED_STORAGE__TRUST_DOMAINS"
+          value: "example.org"
+        - name: "SPIFFE_ENDPOINT_SOCKET"
+          value: "unix:///run/spire/sockets/spire-agent.sock"
+    executionMode:
+      kubernetesCluster:
+        # The Raft gRPC services authorize by SPIFFE role. This pod calls the
+        # cluster admin API, so it takes the `storage-operator` identity (the
+        # keystone-raft-operator ClusterSPIFFEID selects this label).
+        overrides: '{ "metadata": { "labels": { "app.kubernetes.io/name": "keystone-storage-operator" } } }'
+
+  - &keycloak
+    name: "keycloak"
+    container:
+      image: "keystone-rs"
+      name: "keycloak"
+      command: ["/tests/test-keycloak", "--nocapture"]
+      env:
+        - name: "RUST_LOG"
+          value: "info,reqwest=off,h2=off,hyper=off"
+        - name: "BROWSERDRIVER_URL"
+          value: "http://selenium-service:4444"
+        - name: "KEYSTONE_URL"
+          value: "http://keystone-rs:8080"
+        - name: "KEYCLOAK_URL"
+          value: "http://keycloak:8080"
+        - name: "KEYCLOAK_PASSWORD"
+          value: "admin"
+    executionMode:
+      kubernetesCluster: {}
+
+  - &dex
+    name: "dex"
+    container:
+      image: "keystone-rs"
+      name: "dex"
+      command: ["/tests/test-dex", "--nocapture"]
+      env:
+        - name: "RUST_LOG"
+          value: "info,reqwest=off,h2=off,hyper=off"
+        - name: "KEYSTONE_URL"
+          value: "http://keystone-rs:8080"
+        - name: "DEX_URL"
+          value: "http://dex:5556"
+    executionMode:
+      kubernetesCluster: {}
+
+profiles:
+  # Export traces to the `observability` module's Jaeger (deploy that module
+  # first): `skaffold run -m keystone -p local,otel`.
+  - name: otel
+    patches:
+      - op: replace
+        path: /manifests/kustomize/paths/0
+        value: tools/k8s/keystone/overlays/skaffold-otel
+
+  - name: github-ci
+    build:
+      local:
+        useBuildkit: true
+        concurrency: 0
+        tryImportMissing: true
+
+      artifacts:
+        # Built through tools/ci-build-image.sh so the layers can be cached
+        # in a remote registry between CI runs (BUILDCACHE_REF env).
+        - image: keystone-rs
+          context: .
+          custom:
+            buildCommand: ./tools/ci-build-image.sh
+            dependencies:
+              dockerfile:
+                path: tools/Dockerfile.skaffold
+    verify:
+      - name: "github"
+        container:
+          image: "keystone-rs"
+          name: "github"
+          command: ["/tests/test-github", "--nocapture"]
+          env:
+            - name: "RUST_LOG"
+              value: "info,reqwest=off,h2=off,hyper=off"
+            - name: "KEYSTONE_URL"
+              value: "http://keystone-rs:8080"
+            - name: "ACTIONS_ID_TOKEN_AUDIENCE"
+              value: "https://github.com"
+        executionMode:
+          kubernetesCluster: {}
+      - *api_test_v3
+      - *api_test_v4
+      - *k8s_auth_test
+      - *keycloak
+      - *dex
+      - *spiffe
+
+  - name: local
+    build:
+      insecureRegistries:
+        - localhost:5000
+      local:
+        useDockerCLI: true
+        concurrency: 0
+        push: true
+---
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: tempest
+# Tempest identity compatibility tests. Run independently of the `keystone`
+# module's verify tests (`skaffold verify -m tempest -a build.artifacts`) so
+# CI can treat their results as advisory rather than blocking - not every
+# v3 operation is implemented by keystone-rs yet, so failures here track
+# compatibility gaps rather than regressions to fix before merging.
+build:
+  insecureRegistries:
+    - localhost:5000
+  artifacts:
+    - image: tempest-identity
+      context: tools/
+      docker:
+        dockerfile: Dockerfile.tempest
+  local:
+    concurrency: 0
+
+# Only the rust target runs by default (see the `python-identity` profile
+# below to opt in to also running against keystone-py): keystone-py is
+# already the reference implementation the suite is written against, so its
+# results add little signal day-to-day and doubling the run time isn't
+# worth it for routine CI/local runs. It stays available on demand to
+# confirm the test suite/config themselves are sound whenever tempest is
+# upgraded or the config template changes.
+verify:
+  - &tempest_identity_rust
+    name: "tempest-identity-rust"
+    container:
+      image: "tempest-identity"
+      name: "tempest-identity-rust"
+      env:
+        - name: "TEMPEST_TARGET"
+          value: "rust"
+        - name: "OS_AUTH_URL"
+          value: "http://keystone-rs.default.svc.cluster.local:8080"
+        - name: "OS_USERNAME"
+          value: "admin"
+        - name: "OS_PASSWORD"
+          value: "password"
+        - name: "OS_USER_DOMAIN_ID"
+          value: "default"
+        - name: "OS_PROJECT_NAME"
+          value: "admin"
+        - name: "OS_PROJECT_DOMAIN_ID"
+          value: "default"
+        - name: "OS_IDENTITY_SERVICE_TYPE"
+          value: "identity-rs"
+    executionMode:
+      kubernetesCluster: {}
+
+  - &tempest_identity_python
+    name: "tempest-identity-python"
+    container:
+      image: "tempest-identity"
+      name: "tempest-identity-python"
+      env:
+        - name: "TEMPEST_TARGET"
+          value: "python"
+        - name: "OS_AUTH_URL"
+          value: "http://keystone-py.default.svc.cluster.local:5000"
+        - name: "OS_USERNAME"
+          value: "admin"
+        - name: "OS_PASSWORD"
+          value: "password"
+        - name: "OS_USER_DOMAIN_ID"
+          value: "default"
+        - name: "OS_PROJECT_NAME"
+          value: "admin"
+        - name: "OS_PROJECT_DOMAIN_ID"
+          value: "default"
+        - name: "OS_IDENTITY_SERVICE_TYPE"
+          value: "identity"
+    executionMode:
+      kubernetesCluster: {}
+
+profiles:
+  - name: github-ci
+    build:
+      local:
+        useBuildkit: true
+        concurrency: 0
+        tryImportMissing: true
+      artifacts:
+        - image: tempest-identity
+          context: tools/
+          docker:
+            dockerfile: Dockerfile.tempest
+            buildArgs: {}
+    verify:
+      - *tempest_identity_rust
+
+  - name: local
+    build:
+      insecureRegistries:
+        - localhost:5000
+      local:
+        useDockerCLI: true
+        concurrency: 0
+        push: true
+
+  # Opt-in: also run against keystone-py, e.g. `skaffold verify -m tempest
+  # -a build.artifacts -p python-identity` (or `-p github-ci,python-identity`
+  # in CI). Uses a JSON patch instead of its own `verify:` list so it adds
+  # to whichever other profile's verify list is already active rather than
+  # replacing it.
+  - name: python-identity
+    patches:
+      - op: add
+        path: /verify/-
+        value: *tempest_identity_python
+---
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: observability
+# Jaeger (traces), Prometheus (scrapes keystone-rs `/metrics`) and Grafana for
+# the development stack. Deploy with `skaffold run -m observability`; see
+# doc/src/contributor/observability.md.
+manifests:
+  kustomize:
+    paths:
+      - tools/k8s/observability
+deploy:
+  statusCheck: true
+  statusCheckDeadlineSeconds: 120
+  kubectl: {}
+portForward:
+  - resourceType: service
+    resourceName: jaeger
+    port: 16686
+    localPort: 16686
+  - resourceType: service
+    resourceName: prometheus
+    port: 9090
+    localPort: 9090
+  - resourceType: service
+    resourceName: grafana
+    port: 3000
+    localPort: 3000

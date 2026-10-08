@@ -1,0 +1,42 @@
+[package]
+name = "openstack-keystone-api-types"
+description = "OpenStack Keystone API types"
+version = "0.1.0"
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+builder = ["dep:derive_builder", "dep:openstack-keystone-core-types"]
+openapi = ["dep:utoipa"]
+validate = ["dep:validator"]
+conv = ["dep:axum", "dep:openstack-keystone-core-types", "dep:uuid", "builder", "dep:serde_urlencoded", "dep:url", "dep:validator"]
+
+[dependencies]
+axum = { workspace = true, features = ["json"], optional = true }
+base64.workspace = true
+chrono = { workspace = true, default-features = false, features = ["serde", "alloc"] }
+derive_builder = { workspace = true, optional = true }
+eyre.workspace = true
+http = { workspace = true, optional = true }
+openstack-keystone-core-types = { workspace = true, optional = true }
+secrecy = { workspace = true, features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded = { workspace = true, optional = true }
+thiserror.workspace = true
+utoipa = { workspace = true, features = ["chrono", "url"], optional = true }
+validator = { workspace = true, features = ["derive"], optional = true }
+webauthn-rs-proto.workspace = true
+url = { workspace = true, optional = true }
+uuid = { workspace = true, features = ["v4"], optional = true }
+tracing.workspace = true
+
+[dev-dependencies]
+serde_urlencoded.workspace = true
+
+[lints]
+workspace = true

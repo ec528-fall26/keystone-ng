@@ -1,0 +1,189 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use chrono::DateTime;
+use serde_json::Value;
+use tracing::error;
+
+use openstack_keystone_core::trust::TrustProviderError;
+use openstack_keystone_core_types::role::RoleRef;
+use openstack_keystone_core_types::trust::*;
+
+use crate::entity::{trust as db_trust, trust_role as db_trust_role};
+
+mod create;
+mod delete;
+mod get;
+mod list;
+
+pub use create::create;
+pub use delete::delete;
+pub use get::{get, get_delegation_chain};
+pub use list::list;
+
+impl TryFrom<db_trust::Model> for Trust {
+    type Error = TrustProviderError;
+
+    fn try_from(value: db_trust::Model) -> Result<Self, Self::Error> {
+        let mut builder = TrustBuilder::default();
+        if let Some(val) = &value.deleted_at {
+            builder.deleted_at(val.and_utc());
+        }
+        if let Some(val) = value.expires_at_int {
+            match DateTime::from_timestamp_micros(val).map(|val| val.to_utc()) {
+                Some(dt) => {
+                    builder.expires_at(dt);
+                }
+                None => {
+                    // `expires_at_int` is out of chrono's representable
+                    // range (corrupt write, bad migration, manual DB edit).
+                    // Hard-erroring here would 500 every read of this trust
+                    // forever; fall back to the legacy `expires_at` column
+                    // if it still holds a usable value, otherwise treat the
+                    // trust as non-expiring rather than making it
+                    // permanently unreadable.
+                    error!(
+                        trust_id = %value.id,
+                        expires_at_int = val,
+                        "trust.expires_at_int is out of range; falling back to expires_at"
+                    );
+                    if let Some(val) = value.expires_at {
+                        builder.expires_at(val.and_utc());
+                    }
+                }
+            }
+        } else if let Some(val) = value.expires_at {
+            builder.expires_at(val.and_utc());
+        }
+        if let Some(extra) = &value.extra
+            && extra != "{}"
+        {
+            match serde_json::from_str::<Value>(extra) {
+                Ok(extras) => {
+                    builder.extra(extras);
+                }
+                Err(e) => {
+                    error!("failed to deserialize trust extra: {e}");
+                }
+            }
+        }
+
+        if let Some(val) = value.redelegation_count {
+            match u32::try_from(val) {
+                Ok(val) => {
+                    builder.redelegation_count(val);
+                }
+                Err(_) => {
+                    error!(
+                        trust_id = %value.id,
+                        redelegation_count = val,
+                        "trust.redelegation_count is negative; treating as unset"
+                    );
+                }
+            }
+        }
+
+        if let Some(val) = value.remaining_uses {
+            match u32::try_from(val) {
+                Ok(val) => {
+                    builder.remaining_uses(val);
+                }
+                Err(_) => {
+                    error!(
+                        trust_id = %value.id,
+                        remaining_uses = val,
+                        "trust.remaining_uses is negative; treating as unset"
+                    );
+                }
+            }
+        }
+
+        builder.id(value.id);
+        builder.impersonation(value.impersonation);
+        if let Some(val) = &value.project_id {
+            builder.project_id(val);
+        }
+        if let Some(val) = &value.redelegated_trust_id {
+            builder.redelegated_trust_id(val);
+        }
+        builder.trustor_user_id(value.trustor_user_id);
+        builder.trustee_user_id(value.trustee_user_id);
+        Ok(builder.build()?)
+    }
+}
+
+impl TryFrom<&db_trust::Model> for Trust {
+    type Error = TrustProviderError;
+
+    fn try_from(value: &db_trust::Model) -> Result<Self, Self::Error> {
+        Self::try_from(value.clone())
+    }
+}
+
+impl From<db_trust_role::Model> for RoleRef {
+    fn from(value: db_trust_role::Model) -> Self {
+        Self {
+            id: value.role_id,
+            name: None,
+            domain_id: None,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+
+    use crate::entity::trust;
+
+    pub fn get_trust_mock<S: Into<String>, U1: Into<String>, U2: Into<String>>(
+        id: S,
+        trustor_id: U1,
+        trustee_id: U2,
+    ) -> trust::Model {
+        trust::Model {
+            id: id.into(),
+            trustor_user_id: trustor_id.into(),
+            trustee_user_id: trustee_id.into(),
+            project_id: Some("pid".into()),
+            impersonation: false,
+            deleted_at: None,
+            expires_at: None,
+            remaining_uses: None,
+            extra: Some("{}".into()),
+            expires_at_int: None,
+            redelegated_trust_id: None,
+            redelegation_count: None,
+        }
+    }
+
+    pub fn get_trust_redelegation_mock<S: Into<String>, R: Into<String>>(
+        id: S,
+        redelegated_trust_id: Option<R>,
+    ) -> trust::Model {
+        trust::Model {
+            id: id.into(),
+            trustor_user_id: "foo".to_string(),
+            trustee_user_id: "bar".to_string(),
+            project_id: Some("pid".into()),
+            impersonation: false,
+            deleted_at: None,
+            expires_at: None,
+            remaining_uses: None,
+            extra: Some("{}".into()),
+            expires_at_int: None,
+            redelegated_trust_id: redelegated_trust_id.map(Into::into),
+            redelegation_count: None,
+        }
+    }
+}

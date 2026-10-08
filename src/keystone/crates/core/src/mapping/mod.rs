@@ -1,0 +1,41 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # Mapping provider
+
+pub mod backend;
+pub mod engine;
+pub mod error;
+pub mod hmac;
+pub mod hook;
+mod interpolation;
+pub mod metrics;
+mod provider_api;
+pub mod service;
+mod validation;
+mod version;
+
+// Re-export core-types submodules for internal use by version.rs
+pub use openstack_keystone_core_types::mapping::resolution;
+pub use openstack_keystone_core_types::mapping::rule;
+pub use openstack_keystone_core_types::mapping::ruleset;
+
+pub use backend::MappingBackend;
+pub use error::MappingProviderError;
+pub use hook::MappingHook;
+pub use provider_api::MappingApi;
+pub use service::MappingService;
+pub use validation::{validate_regex, validate_ruleset_create, validate_ruleset_update};
+
+#[cfg(any(test, feature = "mock"))]
+pub use crate::mocks::MockMappingProvider;

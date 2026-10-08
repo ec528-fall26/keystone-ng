@@ -1,0 +1,306 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! JWT based authentication API.
+
+use axum::{
+    debug_handler,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    response::IntoResponse,
+};
+use tracing::warn;
+use utoipa_axum::{router::OpenApiRouter, routes};
+
+use crate::api::common::PeerAddr;
+use crate::api::error::KeystoneApiError;
+use crate::api::v4::auth::token::types::TokenResponse as KeystoneTokenResponse;
+use crate::audit::{CorrelationId, emit_perimeter_authenticate_event, perimeter_outcome};
+use crate::federation::api::error::OidcError;
+use crate::keystone::ServiceState;
+use cadf::sanitize::{HostKind, sanitize_initiator_host};
+use cadf::types::{Host, Initiator};
+use openstack_keystone_core::auth::ExecutionContext;
+use openstack_keystone_core_types::auth::AuthenticationResult;
+use openstack_keystone_core_types::mapping::auth::MappingAuthRequest;
+use openstack_keystone_core_types::mapping::resolution::IdentitySource;
+
+use super::common;
+use super::oidc_utils::{build_http_client, discover, fetch_jwks, verify_jwt};
+
+pub(super) fn openapi_router() -> OpenApiRouter<ServiceState> {
+    OpenApiRouter::new().routes(routes!(login))
+}
+
+#[utoipa::path(
+    post,
+    path = "/identity_providers/{idp_id}/jwt",
+    operation_id = "/federation/identity_provider/jwt:login",
+    params(
+        ("openstack-mapping" = String, Header, description = "Rule name hint for targeted rule matching"),
+    ),
+    responses(
+        (
+            status = OK,
+            description = "Authentication Token object",
+            body = KeystoneTokenResponse,
+            headers(
+                ("x-subject-token" = String, description = "Keystone token"),
+            ),
+        ),
+    ),
+    security(("jwt" = [])),
+    tag="identity_providers"
+)]
+#[tracing::instrument(
+    name = "api::identity_provider_jwt_login",
+    level = "debug",
+    skip(state),
+    err(Debug)
+)]
+#[debug_handler]
+pub async fn login(
+    CorrelationId(cid): CorrelationId,
+    State(state): State<ServiceState>,
+    headers: HeaderMap,
+    PeerAddr(peer_addr): PeerAddr,
+    Path(idp_id): Path<String>,
+) -> Result<impl IntoResponse, KeystoneApiError> {
+    let result = login_inner(&state, headers, peer_addr, &idp_id).await;
+    // `idp_id` is a pre-auth signal known before any validation happens, so it
+    // is recorded as `Initiator.host` regardless of outcome (ADR 0023
+    // §"Perimeter Auditing").
+    let host = sanitize_initiator_host(&idp_id, HostKind::FederationIdpUuid)
+        .or_else(|| sanitize_initiator_host(&idp_id, HostKind::FederationIdpNonUuid))
+        .map(Host::from_id);
+    let initiator = Initiator::new("unknown".to_string(), None, None, host);
+    let (outcome, reason) = perimeter_outcome(&result);
+    emit_perimeter_authenticate_event(&state.audit_dispatcher, &cid, initiator, outcome, reason);
+    result
+}
+
+async fn login_inner(
+    state: &ServiceState,
+    headers: HeaderMap,
+    peer_addr: Option<std::net::SocketAddr>,
+    idp_id: &str,
+) -> Result<axum::response::Response, KeystoneApiError> {
+    // Security review V6: this is an unauthenticated, crypto-bearing
+    // endpoint (JWKS fetch + JWT signature verification). Rate-limit before
+    // any of that work, same posture as `/v3/auth/tokens`.
+    if let Err(retry_after) = state
+        .rate_limiters
+        .check_ip(&headers, peer_addr.map(|addr| addr.ip()))
+    {
+        return Err(KeystoneApiError::TooManyRequests {
+            retry_after: retry_after.as_secs(),
+        });
+    }
+
+    state
+        .config_manager
+        .config
+        .read()
+        .await
+        .auth
+        .methods
+        .iter()
+        .find(|m| *m == "openid")
+        .ok_or(KeystoneApiError::AuthMethodNotSupported)?;
+
+    // Parse the Bearer token from the Authorization header.
+    let jwt: String = match headers
+        .get(AUTHORIZATION)
+        .ok_or(KeystoneApiError::SubjectTokenMissing)?
+        .to_str()
+        .map_err(|_| KeystoneApiError::InvalidHeader)?
+        .split_once(' ')
+    {
+        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.to_string(),
+        _ => return Err(OidcError::BearerJwtTokenMissing.into()),
+    };
+
+    // The `openstack-mapping` header is optional. When present, it specifies a
+    // rule name hint that the mapping engine will evaluate first before falling
+    // back to the standard first-match-wins iteration.
+    let rule_name: Option<String> = if let Some(v) = headers.get("openstack-mapping") {
+        Some(
+            v.to_str()
+                .map_err(|_| KeystoneApiError::InvalidHeader)?
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
+    let idp = state
+        .provider
+        .get_federation_provider()
+        .get_identity_provider(&ExecutionContext::internal(state), idp_id)
+        .await
+        .map(|x| {
+            x.ok_or_else(|| KeystoneApiError::NotFound {
+                resource: "identity provider".into(),
+                identifier: idp_id.to_string(),
+            })
+        })??;
+
+    if !idp.enabled {
+        return Err(OidcError::IdentityProviderDisabled.into());
+    }
+
+    // Build the HTTP client with strict redirect policy.
+    let http_client = build_http_client()?;
+
+    // Discover metadata when issuer or jwks_url is not known.
+    let metadata = if let Some(discovery_url) = &idp.oidc_discovery_url
+        && (idp.bound_issuer.is_none() || idp.jwks_url.is_none())
+    {
+        Some(
+            discover(discovery_url, &http_client)
+                .await
+                .map_err(|err| OidcError::discovery(discovery_url, &err))?,
+        )
+    } else {
+        None
+    };
+
+    let issuer_url = idp
+        .bound_issuer
+        .as_deref()
+        .map(|s| s.to_string())
+        .or_else(|| metadata.as_ref().map(|m| m.issuer.to_string()));
+
+    if issuer_url.is_none() {
+        warn!("No issuer_url can be determined for {:?}", idp);
+        return Err(OidcError::NoJwtIssuer.into());
+    }
+
+    let jwks_url = if let Some(jwks_url) = &idp.jwks_url {
+        jwks_url.clone()
+    } else if let Some(ref md) = metadata {
+        md.jwks_uri.clone()
+    } else {
+        warn!("No jwks_url can be determined for {:?}", idp);
+        return Err(OidcError::NoJwtIssuer.into());
+    };
+
+    let jwks = fetch_jwks(&jwks_url, &http_client)
+        .await
+        .map_err(|err| OidcError::discovery(&jwks_url, &err))?;
+
+    // Verify the JWT and extract claims. In the JWT flow we don't enforce
+    // audience matching because the JWT Bearer token is not necessarily
+    // issued to the keystone audience. The identity provider handles
+    // audience validation through its configured bound_issuer.
+    let claims_value: serde_json::Value =
+        verify_jwt(&jwt, &jwks, issuer_url.as_deref(), None, &[])?;
+
+    // Flatten claims for the mapping engine. The `sub` claim provides a stable
+    // unique identifier for the federated user.
+    let flattened = common::flatten_federation_claims(&claims_value)
+        .map_err(|_| OidcError::ClaimsMapTooLarge)?;
+
+    // Extract the unique workload identifier from the required `sub` claim.
+    // OIDC Core §3.1.2: "REQUIRED subject identifier"
+    let unique_workload_id = claims_value["sub"]
+        .as_str()
+        .ok_or_else(|| {
+            KeystoneApiError::BadRequest("`sub` claim is missing from ID token".to_string())
+        })?
+        .to_string();
+
+    // Delegate to the mapping engine for identity resolution. The rule_name
+    // hint from the `openstack-mapping` header allows targeted rule matching.
+    let mapping_req = MappingAuthRequest {
+        domain_id: idp.domain_id.clone(),
+        source: IdentitySource::Federation {
+            idp_id: idp.id.clone(),
+        },
+        unique_workload_id,
+        claims: flattened,
+        rule_name,
+    };
+
+    let auth_result: AuthenticationResult = state
+        .provider
+        .get_mapping_provider()
+        .authenticate_by_mapping(&ExecutionContext::internal(state), &mapping_req)
+        .await?;
+
+    // No scope is requested in JWT flow, so we resolve unscoped token.
+    let (token_str, api_token) = common::build_token_response(state, &auth_result, None).await?;
+
+    tracing::trace!("Token response is {:?}", api_token);
+    Ok((
+        StatusCode::OK,
+        [("x-subject-token", token_str)],
+        axum::Json(api_token),
+    )
+        .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode, header},
+    };
+    use cadf::Outcome;
+    use tower::ServiceExt;
+    use tower_http::trace::TraceLayer;
+
+    use super::openapi_router;
+    use crate::provider::Provider;
+
+    async fn login_without_bearer(uri: &str) -> (StatusCode, Option<cadf::CadfEvent>) {
+        let (state, mut receivers) =
+            openstack_keystone_core::api::tests::get_mocked_state_with_audit(
+                Provider::mocked_builder(),
+                true,
+                openstack_keystone_config::Config::default(),
+            )
+            .await;
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        (response.status(), receivers.perimeter.try_recv().ok())
+    }
+
+    /// A rejected login still leaves exactly one perimeter record, with an
+    /// unknown initiator, a `failure` outcome and the IdP as `host.id`.
+    #[tokio::test]
+    async fn test_rejected_login_emits_failure_event_with_idp_host() {
+        let (status, event) = login_without_bearer("/identity_providers/idp-1/jwt").await;
+        assert!(status.is_client_error(), "got {status}");
+
+        let event = event.expect("perimeter audit event should have been emitted");
+        assert_eq!(event.payload().action(), "authenticate");
+        assert_eq!(event.payload().outcome(), Outcome::Failure);
+        let initiator = event.payload().initiator();
+        assert_eq!(initiator.id(), "unknown");
+        assert_eq!(initiator.host().expect("host").id(), Some("idp-1"));
+    }
+}

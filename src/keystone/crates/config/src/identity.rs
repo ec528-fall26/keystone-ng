@@ -1,0 +1,142 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use crate::common::{default_sql_driver, default_true};
+use crate::pagination::ListLimitConfig;
+
+/// Identity provider.
+///
+/// Also the single definition of the `identity` group of the per-domain
+/// configuration API; see [`crate::ldap::LdapProvider`] for how the two are
+/// related.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct IdentityProvider {
+    /// Caching.
+    #[serde(default)]
+    pub caching: bool,
+
+    /// A domain with this ID can optionally be created for you
+    /// by `keystone-manage bootstrap`.
+    #[serde(default = "default_domain_id")]
+    pub default_domain_id: String,
+
+    /// Directory holding per-domain `keystone.{domain_name}.conf` overrides,
+    /// read by the filesystem domain-config driver. The files are loaded once
+    /// at startup, so a change to them takes effect only after a restart.
+    #[serde(default = "default_domain_config_dir")]
+    pub domain_config_dir: PathBuf,
+
+    /// Whether per-domain identity/LDAP driver configuration is loaded from
+    /// `domain_config_dir` files. Off by default, as in python-keystone; the
+    /// resolution layer overlays file-based configuration only when this is
+    /// set.
+    #[serde(default)]
+    pub domain_specific_drivers_enabled: bool,
+
+    /// Whether per-domain configuration is taken from the database, at the
+    /// highest precedence, in addition to any file-based configuration. On by
+    /// default, matching python-keystone.
+    #[serde(default = "default_true")]
+    pub domain_configurations_from_database: bool,
+
+    /// Identity provider driver.
+    #[serde(default = "default_sql_driver")]
+    pub driver: String,
+
+    /// Maximal password length.
+    #[serde(default = "default_max_password_length")]
+    pub max_password_length: usize,
+
+    /// Default password hashing algorithm.
+    #[serde(default)]
+    pub password_hashing_algorithm: PasswordHashingAlgo,
+
+    /// Default number of password hashing rounds.
+    #[serde(default)]
+    pub password_hash_rounds: Option<usize>,
+
+    /// User options id to name mapping.
+    #[serde(default = "default_user_options_mapping")]
+    pub user_options_id_name_mapping: HashMap<String, String>,
+
+    /// `GET /v3/users` and `/v4/users` pagination limits.
+    #[serde(default)]
+    pub list_limit: ListLimitConfig,
+}
+
+impl Default for IdentityProvider {
+    fn default() -> Self {
+        Self {
+            caching: false,
+            default_domain_id: default_domain_id(),
+            domain_config_dir: default_domain_config_dir(),
+            domain_specific_drivers_enabled: false,
+            domain_configurations_from_database: default_true(),
+            driver: default_sql_driver(),
+            max_password_length: default_max_password_length(),
+            password_hashing_algorithm: PasswordHashingAlgo::Bcrypt,
+            password_hash_rounds: None,
+            user_options_id_name_mapping: default_user_options_mapping(),
+            list_limit: ListLimitConfig::default(),
+        }
+    }
+}
+
+/// Password hashing algorithm.
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub enum PasswordHashingAlgo {
+    /// Bcrypt.
+    #[default]
+    Bcrypt,
+    /// Bcrypt combined with SHA256.
+    BcryptSha256,
+    /// PBKDF2 with SHA512.
+    Pbkdf2Sha512,
+    /// Scrypt.
+    Scrypt,
+    // #[cfg(test)]
+    /// None. Should not be used outside of testing where expected value is
+    /// necessary.
+    None,
+}
+
+fn default_user_options_mapping() -> HashMap<String, String> {
+    HashMap::from([
+        (
+            "1000".into(),
+            "ignore_change_password_upon_first_use".into(),
+        ),
+        ("1001".into(), "ignore_password_expiry".into()),
+        ("1002".into(), "ignore_lockout_failure_attempts".into()),
+        ("1003".into(), "lock_password".into()),
+        ("1004".into(), "ignore_user_inactivity".into()),
+        ("MFAR".into(), "multi_factor_auth_rules".into()),
+        ("MFAE".into(), "multi_factor_auth_rules".into()),
+    ])
+}
+
+fn default_max_password_length() -> usize {
+    4096
+}
+
+fn default_domain_id() -> String {
+    "default".into()
+}
+
+fn default_domain_config_dir() -> PathBuf {
+    PathBuf::from("/etc/keystone/domains")
+}

@@ -1,0 +1,318 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # Domain API types.
+
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "validate")]
+use validator::Validate;
+
+pub use crate::v3::project::ProjectOptions;
+use crate::{Link, ResourceLinks};
+
+/// Short domain representation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(
+    feature = "builder",
+    derive(derive_builder::Builder),
+    builder(
+        build_fn(error = "crate::error::BuilderError"),
+        setter(strip_option, into)
+    )
+)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "validate", derive(validator::Validate))]
+pub struct DomainShort {
+    /// If set to true, domain is enabled. If set to false, domain is disabled.
+    pub enabled: bool,
+
+    /// The domain ID.
+    #[cfg_attr(feature = "validate", validate(length(min = 1, max = 64)))]
+    pub id: String,
+
+    /// The domain name.
+    #[cfg_attr(feature = "validate", validate(length(min = 1, max = 255)))]
+    pub name: String,
+}
+
+/// Full domain representation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(
+    feature = "builder",
+    derive(derive_builder::Builder),
+    builder(
+        build_fn(error = "crate::error::BuilderError"),
+        setter(strip_option, into)
+    )
+)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "validate", derive(validator::Validate))]
+pub struct Domain {
+    /// The description of the domain. Empty string when not set.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[serde(default)]
+    #[cfg_attr(feature = "validate", validate(length(max = 255)))]
+    pub description: String,
+
+    /// If set to true, domain is enabled. If set to false, domain is disabled.
+    pub enabled: bool,
+
+    /// Additional domain properties.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[cfg_attr(feature = "openapi", schema(inline, additional_properties))]
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+
+    /// The domain ID.
+    #[cfg_attr(feature = "validate", validate(length(min = 1, max = 64)))]
+    pub id: String,
+
+    /// Links of the domain.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<ResourceLinks>,
+
+    /// The domain name.
+    #[cfg_attr(feature = "validate", validate(length(min = 1, max = 255)))]
+    pub name: String,
+
+    /// The resource options for the domain. A domain is a project with
+    /// `is_domain = true` and shares its resource options, hence the shared
+    /// `ProjectOptions` type.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "validate", validate(nested))]
+    pub options: Option<ProjectOptions>,
+}
+
+/// New domain data.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(
+    feature = "builder",
+    derive(derive_builder::Builder),
+    builder(
+        build_fn(error = "crate::error::BuilderError"),
+        setter(strip_option, into)
+    )
+)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "validate", derive(validator::Validate))]
+pub struct DomainCreate {
+    /// The description of the domain.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[cfg_attr(feature = "validate", validate(length(max = 255)))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// If set to true, domain is enabled. If set to false, domain is disabled.
+    #[cfg_attr(feature = "builder", builder(default = "crate::default_true()"))]
+    #[serde(default = "crate::default_true")]
+    pub enabled: bool,
+
+    /// Additional domain properties.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[cfg_attr(feature = "openapi", schema(inline, additional_properties))]
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+
+    /// The domain ID.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[cfg_attr(feature = "validate", validate(length(min = 1, max = 64)))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
+    /// The domain name.
+    #[cfg_attr(feature = "validate", validate(length(min = 1, max = 64)))]
+    pub name: String,
+
+    /// The resource options for the domain. A domain is a project with
+    /// `is_domain = true` and shares its resource options, hence the shared
+    /// `ProjectOptions` type.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "validate", validate(nested))]
+    pub options: Option<ProjectOptions>,
+}
+
+/// Complete response with the domain data.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "validate", derive(validator::Validate))]
+pub struct DomainResponse {
+    /// Domain object.
+    #[cfg_attr(feature = "validate", validate(nested))]
+    pub domain: Domain,
+}
+
+/// New domain creation request.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "validate", derive(validator::Validate))]
+pub struct DomainCreateRequest {
+    /// Domain object.
+    #[cfg_attr(feature = "validate", validate(nested))]
+    pub domain: DomainCreate,
+}
+
+/// Update domain data.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(
+    feature = "builder",
+    derive(derive_builder::Builder),
+    builder(
+        build_fn(error = "crate::error::BuilderError"),
+        setter(strip_option, into)
+    )
+)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "validate", derive(validator::Validate))]
+pub struct DomainUpdate {
+    /// The description of the domain.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[cfg_attr(feature = "validate", validate(length(max = 255)))]
+    pub description: Option<String>,
+
+    /// If set to true, domain is enabled. If set to false, domain is disabled.
+    #[cfg_attr(feature = "builder", builder(default))]
+    pub enabled: Option<bool>,
+
+    /// Additional domain properties.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[cfg_attr(feature = "openapi", schema(inline, additional_properties))]
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+
+    /// The domain name.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[cfg_attr(feature = "validate", validate(length(min = 1, max = 64)))]
+    pub name: Option<String>,
+
+    /// The resource options for the domain. A domain is a project with
+    /// `is_domain = true` and shares its resource options, hence the shared
+    /// `ProjectOptions` type.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "validate", validate(nested))]
+    pub options: Option<ProjectOptions>,
+}
+
+/// Domain update request.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "validate", derive(validator::Validate))]
+pub struct DomainUpdateRequest {
+    /// Domain object.
+    #[cfg_attr(feature = "validate", validate(nested))]
+    pub domain: DomainUpdate,
+}
+
+/// List of domains.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "validate", derive(validator::Validate))]
+pub struct DomainList {
+    /// Collection of domain objects.
+    #[cfg_attr(feature = "validate", validate(nested))]
+    pub domains: Vec<Domain>,
+
+    /// Pagination links.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<Vec<Link>>,
+}
+
+/// Domain list parameters.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+#[cfg_attr(feature = "validate", derive(validator::Validate))]
+pub struct DomainListParameters {
+    /// Filter domains by the `id` attribute.
+    #[cfg_attr(feature = "validate", validate(length(min = 1, max = 64)))]
+    pub ids: Option<String>,
+
+    /// Filter domains by the `name` attribute.
+    #[cfg_attr(feature = "validate", validate(length(max = 255)))]
+    pub name: Option<String>,
+
+    /// Filter domains by the `enabled` flag.
+    #[serde(default, deserialize_with = "crate::deserialize_lenient_bool_opt")]
+    pub enabled: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "builder")]
+    use super::*;
+
+    #[cfg(feature = "builder")]
+    #[test]
+    fn test_domain_create() {
+        let sot = DomainCreateBuilder::default().name("name").build().unwrap();
+        assert!(sot.enabled, "enabled defaults to true");
+        assert!(sot.id.is_none());
+    }
+
+    #[test]
+    fn test_domain_create_deserialize_omitted_enabled_defaults_true() {
+        // Real clients (tempest, python-openstackclient) omit `enabled` on
+        // create and rely on the server defaulting it to true, matching
+        // python-keystone; deserializing must not 422 on a missing field.
+        let sot: super::DomainCreate = serde_json::from_str(r#"{"name": "name"}"#).unwrap();
+        assert!(sot.enabled);
+    }
+
+    #[cfg(feature = "builder")]
+    #[test]
+    fn test_domain_serialize_extra() {
+        assert_eq!(
+            serde_json::json!({"name": "name", "enabled": true}),
+            serde_json::to_value(DomainCreateBuilder::default().name("name").build().unwrap())
+                .unwrap()
+        );
+        assert_eq!(
+            serde_json::json!({"name": "name", "enabled": true, "unknown": "bar"}),
+            serde_json::to_value(
+                DomainCreateBuilder::default()
+                    .name("name")
+                    .extra(std::collections::HashMap::from([(
+                        "unknown".into(),
+                        serde_json::json!("bar")
+                    )]))
+                    .build()
+                    .unwrap()
+            )
+            .unwrap()
+        );
+    }
+
+    #[cfg(feature = "validate")]
+    #[test]
+    fn test_domain_name_length() {
+        use validator::Validate;
+        let ok = "a".repeat(64);
+        let long = "a".repeat(65);
+
+        let req: super::DomainCreateRequest =
+            serde_json::from_value(serde_json::json!({"domain": {"name": ok}})).unwrap();
+        assert!(req.validate().is_ok());
+        let req: super::DomainCreateRequest =
+            serde_json::from_value(serde_json::json!({"domain": {"name": long}})).unwrap();
+        assert!(req.validate().is_err(), "create rejects name > 64");
+
+        let req: super::DomainUpdateRequest =
+            serde_json::from_value(serde_json::json!({"domain": {"name": ok}})).unwrap();
+        assert!(req.validate().is_ok());
+        let req: super::DomainUpdateRequest =
+            serde_json::from_value(serde_json::json!({"domain": {"name": long}})).unwrap();
+        assert!(req.validate().is_err(), "update rejects name > 64");
+    }
+}

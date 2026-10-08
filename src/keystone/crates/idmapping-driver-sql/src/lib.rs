@@ -1,0 +1,188 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # OpenStack Keystone SQL driver for the ID Mapping provider
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use sea_orm::{DatabaseConnection, Schema};
+
+use openstack_keystone_core::idmapping::IdMappingProviderError;
+use openstack_keystone_core::idmapping::backend::IdMappingBackend;
+use openstack_keystone_core::keystone::ServiceState;
+use openstack_keystone_core::plugin_manager::BackendRegistration;
+use openstack_keystone_core::{
+    SqlDriver, SqlDriverRegistration, db::create_table, error::DatabaseError,
+};
+use openstack_keystone_core_types::idmapping::*;
+
+pub mod entity;
+mod id_mapping;
+#[cfg(test)]
+pub mod test_support;
+
+#[derive(Default)]
+pub struct SqlBackend {}
+
+/// Linkage anchor — see ADR-0018. Referenced by the `keystone` crate's
+/// `build.rs`-generated `_ANCHORS` static so the linker extracts `.rlib`
+/// members, keeping `inventory::submit!` sections visible at runtime.
+#[allow(dead_code)]
+pub fn anchor() {}
+
+// Submit the plugin to the registry at compile-time
+static PLUGIN: SqlBackend = SqlBackend {};
+inventory::submit! {
+    SqlDriverRegistration { driver: &PLUGIN }
+}
+inventory::submit! {
+    BackendRegistration::<dyn IdMappingBackend> {
+        name: "sql",
+        selected: |_| true,
+        build: |_cfg| Box::pin(async {
+            Ok(Arc::new(SqlBackend::default()) as Arc<dyn IdMappingBackend>)
+        }),
+    }
+}
+
+#[async_trait]
+impl IdMappingBackend for SqlBackend {
+    /// Get the `IdMapping` by the local data.
+    ///
+    /// # Parameters
+    /// - `state`: The service state.
+    /// - `local_id`: The local ID.
+    /// - `domain_id`: The domain ID.
+    /// - `entity_type`: The entity type.
+    ///
+    /// # Returns
+    /// A `Result` containing an `Option` with the `IdMapping` if found, or an
+    /// `Error`.
+    #[tracing::instrument(name = "driver.sql.idmapping.get_by_local_id", level = "debug", skip_all, fields(local_id = %local_id, domain_id = %domain_id, entity_type = ?entity_type))]
+    async fn get_by_local_id<'a>(
+        &self,
+        state: &ServiceState,
+        local_id: &'a str,
+        domain_id: &'a str,
+        entity_type: IdMappingEntityType,
+    ) -> Result<Option<IdMapping>, IdMappingProviderError> {
+        Ok(
+            id_mapping::get_by_local_id(&state.db.connection(), local_id, domain_id, entity_type)
+                .await?,
+        )
+    }
+
+    /// Get the IdMapping by the public_id.
+    ///
+    /// # Parameters
+    /// - `state`: The service state.
+    /// - `public_id`: The public ID.
+    ///
+    /// # Returns
+    /// A `Result` containing an `Option` with the `IdMapping` if found, or an
+    /// `Error`.
+    #[tracing::instrument(name = "driver.sql.idmapping.get_by_public_id", level = "debug", skip_all, fields(public_id = %public_id))]
+    async fn get_by_public_id<'a>(
+        &self,
+        state: &ServiceState,
+        public_id: &'a str,
+    ) -> Result<Option<IdMapping>, IdMappingProviderError> {
+        Ok(id_mapping::get_by_public_id(&state.db.connection(), public_id).await?)
+    }
+
+    /// Create a new `IdMapping`.
+    ///
+    /// # Parameters
+    /// - `state`: The service state.
+    /// - `local_id`: The local ID.
+    /// - `domain_id`: The domain ID.
+    /// - `entity_type`: The entity type.
+    /// - `public_id`: The public ID to store the mapping under.
+    ///
+    /// # Returns
+    /// A `Result` containing the created (or already-existing, on a benign
+    /// race) `IdMapping`, or an `Error`.
+    #[tracing::instrument(name = "driver.sql.idmapping.create_id_mapping", level = "debug", skip_all, fields(local_id = %local_id, domain_id = %domain_id, entity_type = ?entity_type, public_id = %public_id))]
+    async fn create_id_mapping<'a>(
+        &self,
+        state: &ServiceState,
+        local_id: &'a str,
+        domain_id: &'a str,
+        entity_type: IdMappingEntityType,
+        public_id: &'a str,
+    ) -> Result<IdMapping, IdMappingProviderError> {
+        id_mapping::create(
+            &state.db.connection(),
+            local_id,
+            domain_id,
+            entity_type.into(),
+            public_id,
+        )
+        .await
+    }
+
+    /// Delete the `IdMapping` by the public identifier.
+    ///
+    /// # Parameters
+    /// - `state`: The service state.
+    /// - `public_id`: The public ID.
+    ///
+    /// # Returns
+    /// A `Result` indicating success, or an `Error`.
+    #[tracing::instrument(name = "driver.sql.idmapping.delete_id_mapping", level = "debug", skip_all, fields(public_id = %public_id))]
+    async fn delete_id_mapping<'a>(
+        &self,
+        state: &ServiceState,
+        public_id: &'a str,
+    ) -> Result<(), IdMappingProviderError> {
+        id_mapping::delete(&state.db.connection(), public_id).await
+    }
+
+    /// Delete every `IdMapping` row belonging to a domain.
+    ///
+    /// # Parameters
+    /// - `state`: The service state.
+    /// - `domain_id`: The domain ID.
+    ///
+    /// # Returns
+    /// A `Result` indicating success, or an `Error`.
+    #[tracing::instrument(name = "driver.sql.idmapping.delete_mappings_for_domain", level = "debug", skip_all, fields(domain_id = %domain_id))]
+    async fn delete_mappings_for_domain<'a>(
+        &self,
+        state: &ServiceState,
+        domain_id: &'a str,
+    ) -> Result<(), IdMappingProviderError> {
+        id_mapping::delete_by_domain(&state.db.connection(), domain_id).await
+    }
+}
+
+#[async_trait]
+impl SqlDriver for SqlBackend {
+    /// Set up the database.
+    ///
+    /// # Parameters
+    /// - `connection`: The database connection.
+    /// - `schema`: The database schema.
+    ///
+    /// # Returns
+    /// A `Result` indicating success or failure.
+    async fn setup(
+        &self,
+        connection: &DatabaseConnection,
+        schema: &Schema,
+    ) -> Result<(), DatabaseError> {
+        create_table(connection, schema, crate::entity::prelude::IdMapping).await?;
+        Ok(())
+    }
+}

@@ -1,0 +1,149 @@
+[package]
+name = "openstack-keystone"
+description = "OpenStack Keystone service"
+version = "0.1.1"
+build = "build.rs"
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+#[package.metadata.clippy]
+#warn = ["clippy::unused_results"]
+
+[[bin]]
+name="keystone"
+path="src/bin/keystone.rs"
+
+[dependencies]
+async-trait.workspace = true
+askama = { workspace = true, features = ["derive"] }
+axum = { workspace = true, features = ["form", "http1", "http2", "macros", "matched-path", "original-uri", "query", "tokio", "tracing"] }
+axum-extra = { workspace = true, features = ["cookie"] }
+base64.workspace = true
+chrono.workspace = true
+clap = { workspace = true, features = ["derive"] }
+color-eyre.workspace = true
+dashmap.workspace = true
+derive_builder.workspace = true
+eyre.workspace = true
+futures-util.workspace = true
+governor.workspace = true
+hmac.workspace = true
+hyper-util.workspace = true
+hyper.workspace = true
+inventory.workspace = true
+ipnet = { workspace = true }
+jsonwebtoken = { workspace = true }
+nix = { workspace = true, features = ["socket", "user"] }
+openstack-keystone-api-key-driver-raft.workspace = true
+openstack-keystone-api-types = { workspace = true, features = ["openapi", "validate", "conv"]}
+cadf = { workspace = true, features = ["runtime"] }
+openstack-keystone-appcred-driver-sql.workspace = true
+openstack-keystone-assignment-driver-openfga = { workspace = true, optional = true }
+openstack-keystone-assignment-driver-sql.workspace = true
+openstack-keystone-auth-plugin-runtime.workspace = true
+openstack-keystone-catalog-driver-sql.workspace = true
+openstack-keystone-config.workspace = true
+oslo-config.workspace = true
+openstack-keystone-credential-driver-sql.workspace = true
+openstack-keystone-auth-plugin-identity-driver-raft.workspace = true
+openstack-keystone-core = { workspace = true, features = ["api"] }
+openstack-keystone-core-types.workspace = true
+openstack-keystone-distributed-storage.workspace = true
+openstack-keystone-domain-config-driver-fs.workspace = true
+openstack-keystone-domain-config-driver-sql.workspace = true
+openstack-keystone-storage-api.workspace = true
+openstack-keystone-federation-driver-sql.workspace = true
+openstack-keystone-k8s-auth-driver-sql.workspace = true
+openstack-keystone-limit-driver-sql.workspace = true
+openstack-keystone-k8s-auth-driver-raft.workspace = true
+openstack-keystone-mapping-driver-raft.workspace = true
+openstack-keystone-oauth2-client-driver-raft.workspace = true
+openstack-keystone-oauth2-key-driver-raft.workspace = true
+openstack-keystone-oauth2-session-driver-raft.workspace = true
+openstack-keystone-key-repository.workspace = true
+openstack-keystone-identity-driver-ldap.workspace = true
+openstack-keystone-identity-driver-sql.workspace = true
+openstack-keystone-idmapping-driver-sql.workspace = true
+openstack-keystone-password-hashing.workspace = true
+openstack-keystone-policy-store-driver-sql.workspace = true
+openstack-keystone-resource-driver-sql.workspace = true
+openstack-keystone-revoke-driver-sql.workspace = true
+openstack-keystone-role-driver-sql.workspace = true
+openstack-keystone-scim-driver-raft.workspace = true
+openstack-keystone-token-driver-fernet.workspace = true
+openstack-keystone-telemetry.workspace = true
+openstack-keystone-token-driver-jws.workspace = true
+openstack-keystone-token-restriction-driver-sql.workspace = true
+openstack-keystone-trust-driver-sql.workspace = true
+openstack-keystone-webauthn.workspace = true
+pem = "4"
+rand.workspace = true
+reqwest = { workspace = true, features = ["json", "form", "http2", "gzip", "deflate"] }
+sha2.workspace = true
+rustls = { workspace = true, features = ["aws-lc-rs"] }
+sea-orm = { workspace = true, features = ["sqlx-mysql", "sqlx-postgres", "sqlx-sqlite", "runtime-tokio", "runtime-tokio-native-tls"] }
+secrecy = { workspace = true, features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded.workspace = true
+spiffe = { workspace = true, features = ["x509-source"] }
+spiffe-rustls.workspace = true
+spiffe-rustls-tokio.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "process", "signal", "rt-multi-thread"] }
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+tonic = { workspace = true, features = ["server", "tls-aws-lc" ] }
+tower.workspace = true
+tower-http = { workspace = true, features = ["compression-full", "normalize-path", "request-id", "sensitive-headers", "trace", "util"] }
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-error = "0.2"
+tracing-journald.workspace = true
+tracing-subscriber.workspace = true
+url = { workspace = true, features = ["serde"] }
+utoipa = { workspace = true, features = ["axum_extras", "yaml"] }
+utoipa-axum.workspace = true
+utoipa-swagger-ui = { workspace = true, features = ["axum", "vendored"] }
+uuid = { workspace = true, features = ["v4"] }
+validator = { workspace = true, features = ["derive"] }
+
+[build-dependencies]
+toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
+
+[dev-dependencies]
+openstack-keystone-telemetry = { workspace = true, features = ["golden"] }
+rcgen.workspace = true
+http-body-util.workspace = true
+httpmock = { version = "0.8", features = ["http2"] }
+cadf = { workspace = true, features = ["testing"] }
+openstack-keystone-core = { workspace = true, features = ["api", "mock"] }
+openstack-keystone-core-types = { workspace = true, features = ["mock"] }
+openstack-keystone-distributed-storage = { workspace = true, features = ["mock"] }
+rstest.workspace = true
+secrecy = { workspace = true, features = ["serde"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["process", "macros"] }
+tracing-test = { workspace = true, features = ["no-env-filter"] }
+url.workspace = true
+
+[features]
+default = []
+openfga = ["dep:openstack-keystone-assignment-driver-openfga"]
+# RFC 5424 syslog audit sink (`[audit] sink = { type = "syslog", .. }`).
+audit-syslog = ["cadf/syslog"]
+# OTLP trace and metric export (`[otel]`, ADR 0040), over OTLP/HTTP.
+otel = ["openstack-keystone-telemetry/otel"]
+# Adds the OTLP/gRPC transport (`[otel] protocol = grpc`); use with `otel`.
+otlp-grpc = ["openstack-keystone-telemetry/otlp-grpc"]
+
+# Hardware-backed KEK providers for the distributed storage
+# (`[distributed_storage] kek_provider = "pkcs11" | "tpm"`).
+pkcs11 = ["openstack-keystone-distributed-storage/pkcs11"]
+tpm = ["openstack-keystone-distributed-storage/tpm"]
+
+[lints]
+workspace = true

@@ -1,0 +1,316 @@
+#![cfg(feature = "bench_internals")]
+use std::collections::HashMap;
+use std::hint::black_box;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use eyre::Result;
+use openraft::async_runtime::AsyncRuntime;
+use openraft::type_config::TypeConfigExt;
+use openraft::type_config::alias::AsyncRuntimeOf;
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, SanType,
+};
+use reserve_port::ReservedSocketAddr;
+use tempfile::TempDir;
+use tokio::runtime::Runtime;
+
+use openstack_keystone_config::{TlsConfiguration, TlsConfigurationBuilder};
+use openstack_keystone_distributed_storage::config::{
+    DistributedStorageConfiguration, KekProvider, RaftTlsConfiguration, config_manager,
+};
+use openstack_keystone_distributed_storage::{
+    Metadata, StorageApi, StoreDataEnvelope, TypeConfig,
+    app::{Storage, get_app_server, init_storage},
+    network::get_server_tls_config,
+    protobuf as pb,
+    store_command::*,
+};
+
+#[allow(dead_code)]
+struct InstanceHolder {
+    pub node_id: u64,
+    pub config: DistributedStorageConfiguration,
+    storage_dir: TempDir,
+    pub storage: Arc<Storage>,
+    pub addr: SocketAddr,
+}
+
+impl InstanceHolder {
+    fn get_ds_config(
+        node_id: u64,
+        db_path: PathBuf,
+        tls_config: TlsConfiguration,
+        addr: &SocketAddr,
+    ) -> DistributedStorageConfiguration {
+        DistributedStorageConfiguration {
+            node_cluster_addr: format!("https://{}", addr).parse().unwrap(),
+            node_listener_addr: addr.clone(),
+            node_id: node_id,
+            path: db_path,
+            tls_configuration: RaftTlsConfiguration::Tls(tls_config.clone()),
+            dev_mode: true,
+            kek_provider: KekProvider::Env,
+            ..Default::default()
+        }
+    }
+
+    async fn new(node_id: u64, tls_config: TlsConfiguration) -> Result<Self> {
+        let storage_dir = tempfile::TempDir::new().unwrap();
+        let addr = ReservedSocketAddr::reserve_random_socket_addr()?.socket_addr();
+        let ds_config = InstanceHolder::get_ds_config(
+            node_id,
+            storage_dir.path().to_path_buf(),
+            tls_config,
+            &addr,
+        );
+        let storage = init_storage(&config_manager(ds_config.clone())).await?;
+        Ok(Self {
+            node_id,
+            config: ds_config,
+            storage_dir,
+            storage,
+            addr,
+        })
+    }
+}
+
+pub async fn start_raft_app(
+    ds_config: &DistributedStorageConfiguration,
+    storage: &Storage,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr = ds_config.node_listener_addr.clone();
+    let node_id = ds_config.node_id;
+
+    let mut server =
+        tonic::transport::Server::builder().tls_config(get_server_tls_config(ds_config)?)?;
+
+    let server_future = server
+        .add_routes(get_app_server(&storage).await?)
+        .serve(addr.clone());
+
+    println!("Node {node_id} starting server at {addr}");
+    server_future.await?;
+
+    Ok(())
+}
+
+fn make_certificates() -> Result<TlsConfiguration> {
+    // 1. Generate CA private key and certificate
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::CrlSign,
+    ];
+
+    let mut ca_dn = DistinguishedName::new();
+    ca_dn.push(DnType::CommonName, "CA");
+    ca_params.distinguished_name = ca_dn;
+
+    let ca_key = KeyPair::generate()?;
+    let ca_cert = ca_params.self_signed(&ca_key)?;
+    let ca = Issuer::new(ca_params, ca_key);
+
+    // 2. Generate peer certificate (signed by CA)
+    let mut peer_cert_params = CertificateParams::default();
+
+    // Leaf cert validity must not exceed 30 days (ADR 0016-v2 §4.2, enforced
+    // by check_cert_max_validity via
+    // get_client_tls_config/get_server_tls_config).
+    let now = time::OffsetDateTime::now_utc();
+    peer_cert_params.not_before = now - time::Duration::days(1);
+    peer_cert_params.not_after = now + time::Duration::days(28);
+
+    let client_ip: IpAddr = "127.0.0.1".parse()?;
+    peer_cert_params.subject_alt_names = vec![SanType::IpAddress(client_ip)];
+    peer_cert_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    peer_cert_params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    let peer_key = KeyPair::generate()?;
+    let peer_cert = peer_cert_params.signed_by(&peer_key, &ca)?;
+
+    Ok(TlsConfigurationBuilder::default()
+        .tls_client_ca_content(ca_cert.pem().as_bytes().to_vec())
+        .tls_cert_content(peer_cert.pem().as_bytes().to_vec())
+        .tls_key_content(peer_key.serialize_pem().as_bytes().to_vec())
+        .build()?)
+}
+
+async fn build_cluster(count_nodes: u64) -> Result<Vec<Arc<InstanceHolder>>> {
+    let tls_configuration = make_certificates()?;
+    //let tls_client_config = load_tls_client_config(&tls_configuration)?;
+    let mut instances: Vec<Arc<InstanceHolder>> = Vec::new();
+
+    for num in 0..count_nodes {
+        let instance = Arc::new(InstanceHolder::new(num, tls_configuration.clone()).await?);
+        let loc_inst = instance.clone();
+        let _h1 = thread::spawn(move || {
+            let mut rt = AsyncRuntimeOf::<TypeConfig>::new(1);
+            let x = rt.block_on(start_raft_app(&loc_inst.config, &loc_inst.storage));
+            tracing::info!("raft app exit result: {:?}", x);
+        });
+        instances.push(instance);
+    }
+
+    // Wait for server to start up.
+    TypeConfig::sleep(Duration::from_millis(200)).await;
+
+    let mut nodes: HashMap<u64, pb::raft::Node> = HashMap::new();
+    for inst in &instances {
+        nodes.insert(
+            inst.node_id,
+            pb::raft::Node {
+                node_id: inst.node_id,
+                rpc_addr: inst.addr.to_string(),
+            },
+        );
+    }
+    if let Some(inst) = instances.first() {
+        inst.storage.raft.initialize(nodes).await?;
+    }
+    // Wait for server to start up.
+    TypeConfig::sleep(Duration::from_millis(200)).await;
+    Ok(instances)
+}
+
+async fn test_write(instances: &Vec<Arc<InstanceHolder>>) {
+    if let Some(inst) = instances.first() {
+        inst.storage
+            .set_value(
+                "foo".to_string(),
+                StoreDataEnvelope {
+                    metadata: Metadata::new(),
+                    data: rmp_serde::to_vec("barz").unwrap(),
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+}
+
+async fn test_read(instances: &Vec<Arc<InstanceHolder>>) {
+    if let Some(inst) = instances.first() {
+        let _: Option<StoreDataEnvelope<Vec<u8>>> =
+            inst.storage.get_by_key(b"foo", None::<&str>).await.unwrap();
+    }
+}
+
+async fn test_prefix(instances: &Vec<Arc<InstanceHolder>>) {
+    if let Some(inst) = instances.first() {
+        let _: Vec<(String, StoreDataEnvelope<Vec<u8>>)> =
+            inst.storage.prefix(b"foo", None::<&str>).await.unwrap();
+    }
+}
+
+async fn test_remove(instances: &Vec<Arc<InstanceHolder>>) {
+    if let Some(inst) = instances.first() {
+        inst.storage.remove("foo".to_string(), None).await.unwrap();
+    }
+}
+
+fn bench_command_serde(c: &mut Criterion) {
+    let delete_cmd = StoreCommand::Transaction(vec![
+        MutationInner::convert(Mutation::remove("foo", Some("bar"), None)).unwrap(),
+    ]);
+    let delete_index_cmd = StoreCommand::Transaction(vec![
+        MutationInner::convert(Mutation::remove_index("foo")).unwrap(),
+    ]);
+    let set_cmd = StoreCommand::Transaction(vec![
+        MutationInner::convert(
+            Mutation::set("foo", "bar", Metadata::new(), Some("bar"), None).unwrap(),
+        )
+        .unwrap(),
+    ]);
+    let set_index_cmd = StoreCommand::Transaction(vec![
+        MutationInner::convert(Mutation::set_index("foo")).unwrap(),
+    ]);
+    let mut group = c.benchmark_group("Command_Serde");
+    for (cmd, name) in [
+        (&set_cmd, "set"),
+        (&set_index_cmd, "set_index"),
+        (&delete_cmd, "delete"),
+        (&delete_index_cmd, "delete_index"),
+    ] {
+        group.bench_with_input(BenchmarkId::new("pack", name), &cmd, |b, cmd| {
+            b.iter(|| cmd.pack());
+        });
+    }
+    for (data, name) in [
+        (set_cmd.pack().unwrap(), "set"),
+        (set_index_cmd.pack().unwrap(), "set_index"),
+        (delete_cmd.pack().unwrap(), "delete"),
+        (delete_index_cmd.pack().unwrap(), "delete_index"),
+    ] {
+        group.bench_with_input(BenchmarkId::new("unpack", name), &data, |b, data| {
+            b.iter(|| StoreCommand::unpack(black_box(data)));
+        });
+    }
+    group.finish();
+}
+
+fn bench_storage_cluster(_c: &mut Criterion) {
+    temp_env::with_vars(
+        [
+            (
+                "KEYSTONE_DEV_KEK",
+                Some("4242424242424242424242424242424242424242424242424242424242424242"),
+            ),
+            ("KEYSTONE_ALLOW_ENV_KEK", Some("1")),
+        ],
+        || {
+            let c = _c;
+            let provider = rustls::crypto::aws_lc_rs::default_provider();
+            rustls::crypto::CryptoProvider::install_default(provider).unwrap();
+
+            let rt = Runtime::new().unwrap();
+
+            let instances = rt.block_on(build_cluster(1)).unwrap();
+
+            let mut group = c.benchmark_group("Raft_1Node_Latency");
+
+            group.bench_with_input(
+                BenchmarkId::new("write", "1node"),
+                &instances,
+                |b, instances| {
+                    b.to_async(&rt).iter(|| test_write(instances));
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("read", "1node"),
+                &instances,
+                |b, instances| {
+                    b.to_async(&rt).iter(|| test_read(instances));
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("prefix", "1node"),
+                &instances,
+                |b, instances| {
+                    b.to_async(&rt).iter(|| test_prefix(instances));
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("remove", "1node"),
+                &instances,
+                |b, instances| {
+                    b.to_async(&rt).iter(|| test_remove(instances));
+                },
+            );
+            group.finish();
+        },
+    );
+}
+
+criterion_group!(benches, bench_storage_cluster, bench_command_serde);
+criterion_main!(benches);

@@ -1,0 +1,29 @@
+configMapGenerator:
+  - name: keystone
+    files:
+      - conf/keystone.conf
+  - name: spiffe-helper-cfg
+    files:
+      - conf/helper.conf
+images:
+  - name: py-keystone
+    newName: ghcr.io/openstack-experimental/keystone/py-keystone
+    newTag: main
+  - name: busybox
+    newTag: 1.36.1
+secretGenerator:
+  - name: fernet-keys
+    # NOTE: Secret keys cannot be digits,so prefix them with letter
+    literals:
+      - k0=2Rlc-npWYOGqqG1zM-bmfBj2apLacLXhIbBsdyqQ0zg=
+      - k1=sQyQVikArus5DRomTHCLPEIJO2yYkeB5nDdaasIKHVQ=
+    type: generic
+resources:
+  - bootstrap-job.yaml
+  - deployment-py.yaml
+  - statefulset-rs.yaml
+  - db.yaml
+  - sa.yaml
+  - service.yaml
+  - ingress.yaml
+  - memcached.yaml

@@ -1,0 +1,57 @@
+[package]
+name = "cadf"
+description = "CADF-compliant audit framework for OpenStack services"
+version = "0.1.0"
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+async-trait.workspace = true
+chrono = { workspace = true, features = ["serde", "now"] }
+getrandom.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+openstack-keystone-telemetry.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+rustls = { workspace = true, features = ["aws-lc-rs"], optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, features = ["std"], optional = true }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "time", "fs", "io-util", "macros"] }
+tokio-rustls = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[features]
+default = []
+testing = []
+# Service bootstrap: KEK load/generate, spool sealing, writer, shipper and
+# key reloader (`cadf::runtime::init`).
+runtime = ["dep:tokio-util"]
+# RFC 5424 syslog sink over TCP, optionally wrapped in TLS.
+syslog = [
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:rustls-pki-types",
+    "dep:tokio-rustls",
+    "tokio/net",
+]
+
+[dev-dependencies]
+openstack-keystone-telemetry = { workspace = true, features = ["golden"] }
+nix = { workspace = true, features = ["user"] }
+rcgen.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,633 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # Kubernetes authentication.
+
+use std::collections::HashMap;
+
+use secrecy::{ExposeSecret, SecretString};
+use serde_json::Value;
+
+use openstack_keystone_core_types::auth::AuthenticationResult;
+use openstack_keystone_core_types::k8s_auth::{
+    K8sAuthInstance, K8sAuthRequest, K8sClaims, QueryTokenReviewResult,
+};
+use openstack_keystone_core_types::mapping::auth::MappingAuthRequest;
+use openstack_keystone_core_types::mapping::resolution::IdentitySource;
+
+use super::K8sAuthApi;
+use crate::auth::ExecutionContext;
+use crate::k8s_auth::{K8sAuthProviderError, service::K8sAuthService};
+
+impl K8sAuthService {
+    /// Authenticate via K8s TokenReview + mapping engine.
+    ///
+    /// Validates the JWT through the K8s TokenReview API, flattens the
+    /// response into claims, and delegates to the unified mapping engine
+    /// for identity resolution and shadow registry upsert.
+    ///
+    /// # Arguments
+    /// * `state` - Service state.
+    /// * `req` - A reference to the [`K8sAuthRequest`].
+    ///
+    /// # Returns
+    /// * Success with [`AuthenticationResult`] via mapping engine.
+    /// * `K8sAuthProviderError` if authentication fails.
+    pub(super) async fn authenticate_by_mapping(
+        &self,
+        exec: &ExecutionContext<'_>,
+        req: &K8sAuthRequest,
+    ) -> Result<AuthenticationResult, K8sAuthProviderError> {
+        // Fetch k8s auth instance.
+        let instance = self
+            .get_auth_instance(exec, &req.auth_instance_id)
+            .await?
+            .ok_or(K8sAuthProviderError::AuthInstanceNotFound(
+                req.auth_instance_id.clone(),
+            ))?;
+        if !instance.enabled {
+            return Err(K8sAuthProviderError::AuthInstanceNotActive(
+                req.auth_instance_id.clone(),
+            ));
+        }
+
+        // Call the TokenReview.
+        let review = self.query_k8s_token_review(&req.jwt, &instance).await?;
+
+        // Flatten TokenReview response and JWT claims.
+        let claims = self.flatten_k8s_claims(&review.token_review, &review.claims)?;
+
+        // Derive unique workload ID from claims: "<sa>:<ns>" per ADR-0020
+        // §11.2.
+        let sa_name = &claims["k8s.serviceaccount.name"][0];
+        let namespace = &claims["k8s.serviceaccount.namespace"][0];
+        let unique_workload_id = format!("{sa_name}:{namespace}");
+
+        // Delegate to the unified mapping engine.
+        let mapping_req = MappingAuthRequest {
+            domain_id: Some(instance.domain_id.clone()),
+            source: IdentitySource::K8s {
+                cluster_id: instance.id.clone(),
+            },
+            unique_workload_id,
+            claims,
+            rule_name: req.rule_name.clone(),
+        };
+
+        let auth_result = exec
+            .provider
+            .get_mapping_provider()
+            .authenticate_by_mapping(exec, &mapping_req)
+            .await
+            .map_err(|e| K8sAuthProviderError::MappingEngine(e.to_string()))?;
+
+        Ok(auth_result)
+    }
+
+    /// Validate K8s Token Review response and extract service account info.
+    ///
+    /// Returns `(namespace, service_account_name)` parsed from the username.
+    ///
+    /// # Arguments
+    /// * `token_review_data` - JSON representation of the TokenReview response.
+    ///
+    /// # Returns
+    /// * Success with `(namespace, service_account_name)`.
+    /// * `K8sAuthProviderError` when the token was not authenticated or the
+    ///   username format is invalid.
+    pub(super) fn extract_k8s_service_account(
+        &self,
+        token_review_data: &Value,
+    ) -> Result<(String, String), K8sAuthProviderError> {
+        if !token_review_data["status"]["authenticated"]
+            .as_bool()
+            .unwrap_or(false)
+        {
+            return Err(K8sAuthProviderError::InvalidToken);
+        }
+
+        let username = token_review_data["status"]["user"]["username"]
+            .as_str()
+            .ok_or(K8sAuthProviderError::InvalidTokenReviewResponse)?;
+
+        let parts: Vec<&str> = username.split(':').collect();
+
+        match parts.as_slice() {
+            ["system", "serviceaccount", ns, sa] => Ok((ns.to_string(), sa.to_string())),
+            _ => Err(K8sAuthProviderError::InvalidTokenReviewResponse),
+        }
+    }
+
+    /// Flatten TokenReview response and JWT claims into a claims map for
+    /// the mapping engine.
+    ///
+    /// Per ADR-0020 §11.2, produces claims with keys:
+    /// - `k8s.serviceaccount.name`
+    /// - `k8s.serviceaccount.namespace`
+    /// - `k8s.aud` (from `aud` claim of the service account token).
+    ///
+    /// # Arguments
+    /// * `token_review_data` - TokenReview JSON response.
+    /// * `jwt_claims` - Decoded JWT claims containing `aud`.
+    ///
+    /// # Returns
+    /// A flattened claims map.
+    pub(super) fn flatten_k8s_claims(
+        &self,
+        token_review_data: &Value,
+        jwt_claims: &K8sClaims,
+    ) -> Result<HashMap<String, Vec<String>>, K8sAuthProviderError> {
+        let (namespace, sa_name) = self.extract_k8s_service_account(token_review_data)?;
+
+        let mut result = HashMap::new();
+        result.insert("k8s.serviceaccount.name".to_string(), vec![sa_name.clone()]);
+        result.insert(
+            "k8s.serviceaccount.namespace".to_string(),
+            vec![namespace.clone()],
+        );
+        result.insert("k8s.aud".to_string(), jwt_claims.aud.clone());
+
+        Ok(result)
+    }
+
+    /// Query the K8s Token Review endpoint.
+    ///
+    /// JWT decoding and validation is delegated to the [`K8sHttpClient`]
+    /// implementation.
+    ///
+    /// # Arguments
+    /// * `token` - [`SecretString`] with the JWT token.
+    /// * `instance` - reference to the [`K8sAuthInstance`].
+    ///
+    /// # Returns
+    /// * Success with [`QueryTokenReviewResult`].
+    /// * `K8sAuthProviderError` if the token is invalid.
+    pub(super) async fn query_k8s_token_review(
+        &self,
+        token: &SecretString,
+        instance: &K8sAuthInstance,
+    ) -> Result<QueryTokenReviewResult, K8sAuthProviderError> {
+        self.http_client
+            .query_token_review(instance, token.expose_secret())
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    use openstack_keystone_core_types::auth::ScopeInfo;
+    use openstack_keystone_core_types::k8s_auth::{K8sClaims, QueryTokenReviewResult};
+    use openstack_keystone_core_types::mapping::resolution::IdentitySource;
+    use openstack_keystone_core_types::mapping::*;
+    use openstack_keystone_core_types::role::RoleRef;
+
+    use super::*;
+    use crate::k8s_auth::K8sHttpClient;
+    use crate::k8s_auth::backend::MockK8sAuthBackend;
+    use crate::mapping::backend::MockMappingBackend;
+    use crate::mapping::service::MappingService;
+    use crate::provider::Provider;
+    use crate::tests::get_mocked_state;
+
+    struct TestK8sHttpClient;
+
+    #[async_trait]
+    impl K8sHttpClient for TestK8sHttpClient {
+        async fn query_token_review(
+            &self,
+            _instance: &K8sAuthInstance,
+            _jwt: &str,
+        ) -> Result<QueryTokenReviewResult, K8sAuthProviderError> {
+            Ok(QueryTokenReviewResult {
+                claims: K8sClaims {
+                    aud: vec![],
+                    exp: 0,
+                    sub: String::new(),
+                },
+                token_review: json!({}),
+            })
+        }
+    }
+
+    fn make_service(backend: MockK8sAuthBackend) -> K8sAuthService {
+        K8sAuthService {
+            backend_driver: Arc::new(backend),
+            http_client: Arc::new(TestK8sHttpClient),
+        }
+    }
+
+    #[test]
+    fn test_extract_k8s_service_account_not_authenticated() {
+        let provider = make_service(MockK8sAuthBackend::default());
+
+        if let Err(K8sAuthProviderError::InvalidToken) =
+            provider.extract_k8s_service_account(&json!({"status": {"authenticated": false}}))
+        {
+        } else {
+            panic!("not authenticated token should result in InvalidToken");
+        }
+    }
+
+    #[test]
+    fn test_extract_k8s_service_account_no_user() {
+        let provider = make_service(MockK8sAuthBackend::default());
+
+        if let Err(K8sAuthProviderError::InvalidTokenReviewResponse) =
+            provider.extract_k8s_service_account(&json!({"status": {"authenticated": true}}))
+        {
+        } else {
+            panic!("no user should result in InvalidTokenReviewResponse");
+        }
+    }
+
+    #[test]
+    fn test_extract_k8s_service_account_wrong_pattern() {
+        let provider = make_service(MockK8sAuthBackend::default());
+
+        if let Err(K8sAuthProviderError::InvalidTokenReviewResponse) = provider
+            .extract_k8s_service_account(
+                &json!({"status": {"authenticated": true, "user": {"username": "system"}}}),
+            )
+        {
+        } else {
+            panic!("wrong username pattern should result in InvalidTokenReviewResponse");
+        }
+    }
+
+    #[test]
+    fn test_extract_k8s_service_account_valid() {
+        let provider = make_service(MockK8sAuthBackend::default());
+
+        let (ns, sa) = provider
+            .extract_k8s_service_account(&json!({
+                "status": {"authenticated": true, "user": {"username": "system:serviceaccount:my_ns:my_sa"}}
+            }))
+            .expect("valid token should succeed");
+
+        assert_eq!(ns, "my_ns");
+        assert_eq!(sa, "my_sa");
+    }
+
+    #[test]
+    fn test_flatten_k8s_claims() {
+        let provider = make_service(MockK8sAuthBackend::default());
+
+        let claims = provider
+            .flatten_k8s_claims(
+                &json!({
+                    "status": {"authenticated": true, "user": {"username": "system:serviceaccount:target_ns:target_sa"}}
+                }),
+                &K8sClaims {
+                    aud: vec!["10.0.0.1".to_string(), "kubernetes".to_string()],
+                    exp: 1234567890,
+                    sub: "system:serviceaccount:target_ns:target_sa".to_string(),
+                },
+            )
+            .expect("valid claims should succeed");
+
+        assert_eq!(claims["k8s.serviceaccount.name"], vec!["target_sa"]);
+        assert_eq!(claims["k8s.serviceaccount.namespace"], vec!["target_ns"]);
+        assert_eq!(claims["k8s.aud"], vec!["10.0.0.1", "kubernetes"]);
+    }
+
+    #[tokio::test]
+    async fn test_auth_instance_not_found() {
+        let state = get_mocked_state(None, None).await;
+        let mut backend = MockK8sAuthBackend::default();
+        backend
+            .expect_get_auth_instance()
+            .returning(|_, _| Ok(None));
+
+        let service = make_service(backend);
+        let result = service
+            .authenticate_by_mapping(
+                &ExecutionContext::internal(&state),
+                &K8sAuthRequest {
+                    auth_instance_id: "missing".into(),
+                    jwt: SecretString::new("jwt".into()),
+                    rule_name: Some("rule".into()),
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(K8sAuthProviderError::AuthInstanceNotFound(x)) if x == "missing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_auth_instance_disabled() {
+        let state = get_mocked_state(None, None).await;
+        let mut backend = MockK8sAuthBackend::default();
+        backend.expect_get_auth_instance().returning(|_, _| {
+            Ok(Some(K8sAuthInstance {
+                ca_cert: None,
+                disable_local_ca_jwt: true,
+                domain_id: "did".into(),
+                enabled: false,
+                host: "http://localhost:6443".into(),
+                id: "cid".into(),
+                name: Some("t".into()),
+            }))
+        });
+
+        let service = make_service(backend);
+        let result = service
+            .authenticate_by_mapping(
+                &ExecutionContext::internal(&state),
+                &K8sAuthRequest {
+                    auth_instance_id: "cid".into(),
+                    jwt: SecretString::new("jwt".into()),
+                    rule_name: Some("r".into()),
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(K8sAuthProviderError::AuthInstanceNotActive(x)) if x == "cid"
+        ));
+    }
+
+    // ───────── Integration tests: full k8s -> mapping engine flow ─────────
+
+    struct MockK8sHttpClientOk;
+
+    #[async_trait]
+    impl K8sHttpClient for MockK8sHttpClientOk {
+        async fn query_token_review(
+            &self,
+            _instance: &K8sAuthInstance,
+            _jwt: &str,
+        ) -> Result<QueryTokenReviewResult, K8sAuthProviderError> {
+            Ok(QueryTokenReviewResult {
+                claims: K8sClaims {
+                    aud: vec!["kubernetes".to_string()],
+                    exp: 0,
+                    sub: "system:serviceaccount:default:sa".to_string(),
+                },
+                token_review: json!({
+                    "status": {
+                        "authenticated": true,
+                        "user": {
+                            "username": "system:serviceaccount:default:sa"
+                        }
+                    }
+                }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_k8s_authenticate_by_mapping_full_flow_project_authz() {
+        // 1. Build MappingService with mock backend
+        let mut mapping_backend = MockMappingBackend::new();
+
+        let source = IdentitySource::K8s {
+            cluster_id: "k8s-cluster-1".to_string(),
+        };
+
+        let rules = vec![MappingRule {
+            name: "any-sa".to_string(),
+            description: None,
+            r#match: MatchCriteria::AllOf(vec![
+                MatchCondition::Condition(ClaimCondition::MatchesRegex {
+                    claim: "k8s.serviceaccount.name".to_string(),
+                    regex: ".*".to_string(),
+                }),
+                MatchCondition::Condition(ClaimCondition::MatchesRegex {
+                    claim: "k8s.serviceaccount.namespace".to_string(),
+                    regex: ".*".to_string(),
+                }),
+            ]),
+            identity: IdentityBinding {
+                identity_mode: Some(IdentityMode::Ephemeral),
+                user_name: "svc-k8s".to_string(),
+                user_id: None,
+                user_domain_id: None,
+                is_system: false,
+            },
+            authorizations: vec![Authorization::Project {
+                project_id: "proj-123".to_string(),
+                project_domain_id: "default".to_string(),
+                roles: vec![RoleRef {
+                    id: "member-role".to_string(),
+                    name: Some("member".to_string()),
+                    domain_id: None,
+                }],
+            }],
+            groups: vec![],
+        }];
+
+        let matching_ruleset = MappingRuleSet {
+            mapping_id: "k8s-mapping".to_string(),
+            domain_id: Some("default".to_string()),
+            source: source.clone(),
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules,
+            ruleset_version: 1,
+        };
+        let ruleset_clone = matching_ruleset.clone();
+
+        mapping_backend
+            .expect_get_ruleset_by_source()
+            .returning(move |_, _, _| Ok(Some(ruleset_clone.clone())));
+        mapping_backend
+            .expect_get_virtual_user()
+            .returning(|_, _| Ok(None));
+        mapping_backend
+            .expect_create_virtual_user()
+            .returning(|_, vu| Ok(vu));
+
+        let mapping_service = MappingService::from_driver(mapping_backend);
+
+        // 2. Wire mapping service into provider
+        let provider_builder = Provider::mocked_builder().mock_mapping(mapping_service);
+
+        // 3. Build ServiceState with salt for HMAC
+        let mut cfg = openstack_keystone_config::Config::default();
+        cfg.mapping.cluster_salt = Some(SecretString::from("test-salt-for-hmac-derivation!"));
+
+        let state = get_mocked_state(Some(cfg), Some(provider_builder)).await;
+
+        // 4. Build K8sAuthService with mock backend + mock HTTP client
+        let instance = K8sAuthInstance {
+            ca_cert: None,
+            disable_local_ca_jwt: false,
+            domain_id: "default".to_string(),
+            enabled: true,
+            host: "http://localhost:6443".to_string(),
+            id: "k8s-cluster-1".to_string(),
+            name: Some("test".to_string()),
+        };
+
+        let mut k8s_backend = MockK8sAuthBackend::new();
+        k8s_backend
+            .expect_get_auth_instance()
+            .returning(move |_, _| Ok(Some(instance.clone())));
+
+        let k8s_service = K8sAuthService {
+            backend_driver: Arc::new(k8s_backend),
+            http_client: Arc::new(MockK8sHttpClientOk),
+        };
+
+        // 5. Execute authenticate
+        let result = k8s_service
+            .authenticate_by_mapping(
+                &ExecutionContext::internal(&state),
+                &K8sAuthRequest {
+                    auth_instance_id: "k8s-cluster-1".to_string(),
+                    jwt: SecretString::from("valid.jwt.token"),
+                    rule_name: None,
+                },
+            )
+            .await
+            .expect("authentication should succeed");
+
+        // 6. Verify: authorization is set with correct scope and roles
+        let authz = result
+            .authorization
+            .expect("authorization should be set by derive_authz_info");
+
+        match authz.scope {
+            ScopeInfo::Project {
+                ref project,
+                ref project_domain,
+            } => {
+                assert_eq!(project.id, "proj-123");
+                assert_eq!(project_domain.id, "default");
+            }
+            _ => panic!("Expected Project scope, got {:?}", authz.scope),
+        }
+
+        let roles = authz
+            .effective_roles()
+            .expect("effective_roles should be populated");
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].id, "member-role");
+    }
+
+    #[tokio::test]
+    async fn test_k8s_authenticate_by_mapping_unscoped() {
+        // Ruleset with no authorizations -> unscoped
+        let source = IdentitySource::K8s {
+            cluster_id: "k8s-unscoped".to_string(),
+        };
+
+        let rules = vec![MappingRule {
+            name: "wildcard".to_string(),
+            description: None,
+            r#match: MatchCriteria::AllOf(vec![
+                MatchCondition::Condition(ClaimCondition::MatchesRegex {
+                    claim: "k8s.serviceaccount.name".to_string(),
+                    regex: ".*".to_string(),
+                }),
+                MatchCondition::Condition(ClaimCondition::MatchesRegex {
+                    claim: "k8s.serviceaccount.namespace".to_string(),
+                    regex: ".*".to_string(),
+                }),
+            ]),
+            identity: IdentityBinding {
+                identity_mode: Some(IdentityMode::Ephemeral),
+                user_name: "svc-k8s".to_string(),
+                user_id: None,
+                user_domain_id: None,
+                is_system: false,
+            },
+            authorizations: vec![],
+            groups: vec![],
+        }];
+
+        let matching_ruleset = MappingRuleSet {
+            mapping_id: "k8s-unscoped".to_string(),
+            domain_id: Some("default".to_string()),
+            source: source.clone(),
+            domain_resolution_mode: DomainResolutionMode::Fixed,
+            enabled: true,
+            rules,
+            ruleset_version: 1,
+        };
+        let ruleset_clone = matching_ruleset.clone();
+
+        let mut mapping_backend = MockMappingBackend::new();
+        mapping_backend
+            .expect_get_ruleset_by_source()
+            .returning(move |_, _, _| Ok(Some(ruleset_clone.clone())));
+        mapping_backend
+            .expect_get_virtual_user()
+            .returning(|_, _| Ok(None));
+        mapping_backend
+            .expect_create_virtual_user()
+            .returning(|_, vu| Ok(vu));
+
+        let mapping_service = MappingService::from_driver(mapping_backend);
+
+        let provider_builder = Provider::mocked_builder().mock_mapping(mapping_service);
+
+        let mut cfg = openstack_keystone_config::Config::default();
+        cfg.mapping.cluster_salt = Some(SecretString::from("test-salt-for-hmac-derivation!"));
+        let state = get_mocked_state(Some(cfg), Some(provider_builder)).await;
+
+        let instance = K8sAuthInstance {
+            ca_cert: None,
+            disable_local_ca_jwt: false,
+            domain_id: "default".to_string(),
+            enabled: true,
+            host: "http://localhost:6443".to_string(),
+            id: "k8s-unscoped".to_string(),
+            name: None,
+        };
+
+        let mut k8s_backend = MockK8sAuthBackend::new();
+        k8s_backend
+            .expect_get_auth_instance()
+            .returning(move |_, _| Ok(Some(instance.clone())));
+
+        let k8s_service = K8sAuthService {
+            backend_driver: Arc::new(k8s_backend),
+            http_client: Arc::new(MockK8sHttpClientOk),
+        };
+
+        let result = k8s_service
+            .authenticate_by_mapping(
+                &ExecutionContext::internal(&state),
+                &K8sAuthRequest {
+                    auth_instance_id: "k8s-unscoped".to_string(),
+                    jwt: SecretString::from("valid.jwt.token"),
+                    rule_name: None,
+                },
+            )
+            .await
+            .expect("authentication should succeed");
+
+        let authz = result
+            .authorization
+            .expect("authorization should still be set for unscoped");
+
+        assert!(
+            matches!(authz.scope, ScopeInfo::Unscoped),
+            "Expected Unscoped scope, got {:?}",
+            authz.scope
+        );
+
+        assert!(
+            authz.effective_roles().is_none(),
+            "Unscoped should not have roles"
+        );
+    }
+}

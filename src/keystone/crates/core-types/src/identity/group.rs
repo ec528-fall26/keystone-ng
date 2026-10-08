@@ -1,0 +1,114 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use std::collections::HashMap;
+
+use derive_builder::Builder;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::error::BuilderError;
+
+#[derive(Builder, Clone, Debug, Default, Eq, Serialize, PartialEq)]
+#[builder(build_fn(error = "BuilderError"))]
+#[builder(setter(strip_option, into))]
+pub struct Group {
+    /// The description of the group.
+    #[builder(default)]
+    pub description: Option<String>,
+
+    /// The ID of the domain.
+    pub domain_id: String,
+
+    /// Additional user properties.
+    #[builder(default)]
+    pub extra: HashMap<String, Value>,
+
+    /// The ID of the group.
+    pub id: String,
+
+    /// The user name. Must be unique within the owning domain.
+    pub name: String,
+}
+
+/// Short group representation (reference).
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct GroupRef {
+    /// The group domain_id.
+    pub domain_id: Option<String>,
+
+    /// The group ID.
+    pub id: String,
+
+    /// The group name.
+    pub name: Option<String>,
+}
+
+#[derive(Builder, Clone, Debug, Default, PartialEq)]
+#[builder(build_fn(error = "BuilderError"))]
+#[builder(setter(strip_option, into))]
+pub struct GroupListParameters {
+    /// Filter groups by the domain.
+    #[builder(default)]
+    pub domain_id: Option<String>,
+
+    /// Filter groups by the name attribute.
+    #[builder(default)]
+    pub name: Option<String>,
+
+    /// Pagination controls (limit/marker/page_reverse).
+    #[builder(default)]
+    pub pagination: crate::ListPagination,
+}
+
+#[derive(Builder, Clone, Debug, Default, PartialEq)]
+#[builder(build_fn(error = "BuilderError"))]
+#[builder(setter(strip_option, into))]
+pub struct GroupUpdate {
+    /// New description. `None` = unchanged, `Some(None)` = clear.
+    #[builder(default)]
+    pub description: Option<Option<String>>,
+
+    /// Additional group properties. The provider merges this into the
+    /// existing `extra` before persisting; an empty map means unchanged.
+    #[builder(default)]
+    pub extra: HashMap<String, Value>,
+
+    /// New name. `None` = unchanged.
+    #[builder(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Builder, Clone, Debug, Default, PartialEq)]
+#[builder(build_fn(error = "BuilderError"))]
+#[builder(setter(strip_option, into))]
+pub struct GroupCreate {
+    /// The description of the group.
+    #[builder(default)]
+    pub description: Option<String>,
+
+    /// The ID of the domain.
+    pub domain_id: String,
+
+    /// Additional user properties.
+    #[builder(default)]
+    pub extra: HashMap<String, Value>,
+
+    /// The ID of the group.
+    #[builder(default)]
+    pub id: Option<String>,
+
+    /// The user name. Must be unique within the owning domain.
+    pub name: String,
+}

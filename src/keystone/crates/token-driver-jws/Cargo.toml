@@ -1,0 +1,36 @@
+[package]
+name = "openstack-keystone-token-driver-jws"
+description = "OpenStack Keystone JWS token driver"
+version = "0.1.0"
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono = { workspace = true, features = ["now"] }
+inventory.workspace = true
+jsonwebtoken.workspace = true
+openstack-keystone-config.workspace = true
+openstack-keystone-core.workspace = true
+openstack-keystone-core-types.workspace = true
+openstack-keystone-key-repository.workspace = true
+oslo-config.workspace = true
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+rsa = "0.9"
+secrecy.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+config.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

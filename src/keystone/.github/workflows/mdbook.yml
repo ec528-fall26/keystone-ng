@@ -1,0 +1,107 @@
+# Sample workflow for building and deploying a mdBook site to GitHub Pages
+#
+# To get started with mdBook see: https://rust-lang.github.io/mdBook/index.html
+#
+name: Deploy mdBook site to Pages
+
+on:
+  pull_request:
+    branches: ["main" ]
+    paths:
+      - '.github/workflows/mdbook.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'doc/**'
+      - 'crates/**'
+  push:
+    branches: ["main"]
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
+# However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  # Build job
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Mdbook
+        uses: jaxxstorm/action-install-gh-release@25e24d2d23ae098373794ef1d6faecb48ee52da8 # v3.0.0
+        with:
+          repo: rust-lang/mdbook
+          tag: v0.5.1
+          cache: enable
+
+      - name: Install Mdbook-mermaid
+        uses: jaxxstorm/action-install-gh-release@25e24d2d23ae098373794ef1d6faecb48ee52da8 # v3.0.0
+        with:
+          repo: badboy/mdbook-mermaid
+          tag: v0.17.0
+          cache: enable
+
+      #- name: Install mdBook
+      #  run: |
+      #    curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSf -y | sh
+      #    rustup update
+      #    cargo install --version ${MDBOOK_VERSION} mdbook
+      #    cargo install mdbook-mermaid
+
+      - name: Install protobuf-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: openapi-build
+
+      - name: Generate OpenAPI
+        run: cargo run -p openstack-keystone --bin keystone -- --dump-openapi yaml > doc/src/openapi.yaml
+
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Build with mdBook
+        run: mdbook build doc
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ./doc/html
+
+  # Deployment job
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ github.event_name == 'push' }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

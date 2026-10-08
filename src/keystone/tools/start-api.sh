@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="/tmp/nextest/keystone"
+CONFIG_FILE="${STATE_DIR}/etc/keystone.conf"
+CLIENT_HOME="${STATE_DIR}/client-home"
+CLIENT_CONFIG_FILE="${STATE_DIR}/client-config/clouds.yaml"
+AXUM_PID=""
+SPIRE_SOCKET="/tmp/spire-ci-test-harness/agent.sock"
+SPIFFE_ENDPOINT_SOCKET="unix:///${SPIRE_SOCKET}"
+TMP_DIR=$(mktemp -d -t spire-test-XXXXXX)
+
+# 0. Aggressive cleanup of previous iterations
+tools/teardown-api.sh || true
+rm -rf "$STATE_DIR"
+
+mkdir -p "$STATE_DIR"
+mkdir -p "$STATE_DIR/etc/fernet-keys"
+mkdir -p "$CLIENT_HOME"
+mkdir -p "$(dirname "$CLIENT_CONFIG_FILE")"
+
+# API runs bootstrap a fresh database on every invocation. Disable the SDK's
+# persistent token cache so a prior run's admin token cannot be replayed
+# against the new database, and so revocation tests cannot share a cached
+# token with concurrently running tests.
+cat << EOF > "$CLIENT_CONFIG_FILE"
+cache:
+  auth: false
+EOF
+
+# Generate self-signed CA + leaf TLS certificates for distributed storage
+SSL_DIR="$STATE_DIR"
+openssl req -x509 -newkey rsa:4096 -nodes \
+    -keyout "${SSL_DIR}/ca.key" \
+    -out "${SSL_DIR}/ca.crt" \
+    -subj "/CN=Keystone-CA" \
+    -days 30 2>/dev/null
+openssl req -newkey rsa:4096 -nodes \
+    -keyout "${SSL_DIR}/ks.key" \
+    -out "${SSL_DIR}/ks.csr" \
+    -subj "/CN=127.0.0.1" \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
+openssl x509 -req -in "${SSL_DIR}/ks.csr" \
+    -CA "${SSL_DIR}/ca.crt" -CAkey "${SSL_DIR}/ca.key" \
+    -CAcreateserial -out "${SSL_DIR}/ks.pem" \
+    -days 30 -copy_extensions copyall 2>/dev/null
+rm -f "${SSL_DIR}/ks.csr"
+
+# Build the ADR 0025 reference auth-plugin fixture (mapping/route/
+# full_auth entry points) and hash it, so the real server can load it just
+# like a genuine operator-supplied plugin.
+(cd crates/auth-plugin-runtime/tests/fixtures/reference-plugin && \
+    cargo build --release --target wasm32-unknown-unknown)
+PLUGIN_WASM="$(pwd)/crates/auth-plugin-runtime/tests/fixtures/reference-plugin/target/wasm32-unknown-unknown/release/reference_plugin.wasm"
+PLUGIN_SHA256="$(sha256sum "$PLUGIN_WASM" | awk '{print $1}')"
+
+cleanup() {
+  echo "Tearing down SPIRE daemons..." >&2
+  PID_DIR="/tmp/spire-ci-test-harness"
+  if [ -f "$PID_DIR/agent.pid" ]; then kill "$(cat "$PID_DIR/agent.pid")" 2>/dev/null || true; fi
+  if [ -f "$PID_DIR/server.pid" ]; then kill "$(cat "$PID_DIR/server.pid")" 2>/dev/null || true; fi
+  if [ -f "$STATE_DIR/keystone.pid" ]; then kill "$(cat "$STATE_DIR/keystone.pid")" 2>/dev/null || true; fi
+  if [ -n "$AXUM_PID" ]; then kill "$AXUM_PID" 2>/dev/null || true; fi
+}
+
+trap cleanup ERR INT TERM
+
+
+cat << EOF > "$CONFIG_FILE"
+
+[api_policy]
+opa_base_url = unix:///tmp/nextest/keystone/opa.sock
+enable = true
+opa_policies_path = policy
+
+[auth]
+# mapped is the fixed, plugin-name-independent method every mode=mapping
+# dynamic plugin's issued tokens carry (ADR 0025 section 4); a mode=full_auth
+# plugin's issued tokens carry its own configured name instead
+# (hacked_appcred_handler below) - the fernet driver encodes auth_methods
+# into a token as a bitmask over exactly this list
+# (crates/token-driver-fernet/src/lib.rs), so both must be present here or
+# token issuance 500s with "unsupported authentication methods".
+# ec2credential is the method carried by tokens minted at POST /v3/ec2tokens
+# (exercised by the test_api EC2 suite) and needs a bitmask slot just the
+# same.
+methods = password,token,openid,application_credential,x509,mapped,hacked_appcred_handler,ec2credential
+
+[DEFAULT]
+use_stderr = false
+debug = true
+log_dir = ${STATE_DIR}
+
+# Dev/test only: derive the OAuth2 issuer from the Host header instead of
+# pinning [DEFAULT] public_endpoint (OAuth2 OP endpoints 503 without one).
+[oauth2]
+allow_host_header_issuer = true
+
+[database]
+connection = sqlite::memory:
+
+[fernet_receipts]
+key_repository = ${STATE_DIR}/etc/fernet-keys
+[fernet_tokens]
+key_repository = ${STATE_DIR}/etc/fernet-keys
+
+[interface_public]
+tcp_address = 0.0.0.0:8080
+type = "http"
+
+[interface_admin]
+socket_path = ${STATE_DIR}/keystone.sock
+trust_domains=example.org
+admin_svid=spiffe://example.org/keystone
+
+[distributed_storage]
+path = ${STATE_DIR}/raft/db
+node_cluster_addr = https://127.0.0.1:50051
+node_listener_addr = 0.0.0.0:50051
+node_id = 0
+tls_client_ca_file = ${STATE_DIR}/ca.crt
+tls_cert_file = ${STATE_DIR}/ks.pem
+tls_key_file = ${STATE_DIR}/ks.key
+dev_mode = true
+
+[credential]
+key_repository = ${STATE_DIR}/etc/fernet-keys
+
+[webauthn]
+driver = raft
+enabled = true
+relying_party_id = localhost
+relying_party_origin = http://localhost:8080
+
+[mapping]
+cluster_salt = "fbb27433d07ab307cc1fc899d0e174cf197fd398fbcff7285a63fe2f94eec2fe"
+
+[audit]
+spool_dir = ${STATE_DIR}/audit
+node_id = api-test-node
+
+[auth_plugins]
+plugins = mapper,router,hacked_appcred_handler
+
+[auth_plugin.mapper]
+path = ${PLUGIN_WASM}
+sha256 = ${PLUGIN_SHA256}
+mode = mapping
+# The live suite shares one source address; lift the plugin invocation
+# limits so the concurrent suite does not trip 429s.
+invocation_rate_limit_per_source_per_minute = 100000
+invocation_rate_limit_per_minute = 100000
+
+[auth_plugin.router]
+path = ${PLUGIN_WASM}
+sha256 = ${PLUGIN_SHA256}
+mode = route
+inspect_methods = application_credential
+route_targets = hacked_appcred_handler
+# The live suite shares one source address; lift the plugin invocation
+# limits so the concurrent suite does not trip 429s.
+invocation_rate_limit_per_source_per_minute = 100000
+invocation_rate_limit_per_minute = 100000
+
+[auth_plugin.hacked_appcred_handler]
+path = ${PLUGIN_WASM}
+sha256 = ${PLUGIN_SHA256}
+mode = full_auth
+capabilities = provision_user
+provision_domain_id = d
+# The live suite runs concurrently; provisioning through host callbacks can
+# exceed the production default under dev-container load.
+timeout_ms = 5000
+# The live suite shares one source address; lift the plugin invocation
+# limits so the concurrent suite does not trip 429s.
+invocation_rate_limit_per_source_per_minute = 100000
+invocation_rate_limit_per_minute = 100000
+
+EOF
+
+echo "2Rlc-npWYOGqqG1zM-bmfBj2apLacLXhIbBsdyqQ0zg=" > "${STATE_DIR}"/etc/fernet-keys/0
+
+tools/start-spire.sh
+
+# Opt-in OpenTelemetry export (ADR 0040): with KEYSTONE_TEST_OTLP_ENDPOINT set
+# (CI points it at a Jaeger service container) the server is built with the
+# `otel` feature and exports traces to it. Metrics stay on the /metrics scrape.
+OTEL_FEATURES=()
+OTEL_ENV=()
+if [ -n "${KEYSTONE_TEST_OTLP_ENDPOINT:-}" ]; then
+    OTEL_FEATURES=(--features openstack-keystone/otel)
+    OTEL_ENV=(
+        OS_OTEL__ENABLED=true
+        OS_OTEL__METRICS_ENABLED=false
+        OS_OTEL__ENDPOINT="$KEYSTONE_TEST_OTLP_ENDPOINT"
+        OS_OTEL__SAMPLING_RATE=1.0
+    )
+fi
+
+cargo build --bins ${OTEL_FEATURES[@]+"${OTEL_FEATURES[@]}"}
+
+env ${OTEL_ENV[@]+"${OTEL_ENV[@]}"} KEYSTONE_DEV_KEK=4242424242424242424242424242424242424242424242424242424242424242 KEYSTONE_ALLOW_ENV_KEK=1 SPIFFE_ENDPOINT_SOCKET=$SPIFFE_ENDPOINT_SOCKET ./target/debug/keystone --config "$CONFIG_FILE" &
+AXUM_PID=$!
+echo "✅ Keystone server is started and running in the background!"
+
+echo "$AXUM_PID" > "$STATE_DIR/keystone.pid"
+
+# 6. Wait for the local port to become active
+URL="http://127.0.0.1:8080"
+URL_METRICS="http://127.0.0.1:8099"
+for i in {1..60}; do
+    if curl -s "$URL_METRICS/health" > /dev/null; then
+        echo "✅ Keystone health url started responding!"
+        # Wait for the admin socket to appear
+        until [ -S "${STATE_DIR}/keystone.sock" ]; do
+          sleep 0.5
+        done
+        echo "✅ Keystone socket appeared!"
+        KEYSTONE_DEV_KEK=4242424242424242424242424242424242424242424242424242424242424242 KEYSTONE_ALLOW_ENV_KEK=1 SPIFFE_ENDPOINT_SOCKET=${SPIFFE_ENDPOINT_SOCKET} ./target/debug/keystone-manage --config "${CONFIG_FILE}" bootstrap --bootstrap-password password --bootstrap-public-url http://localhost:8080
+
+        echo "✅ Keystone bootstrap completed!"
+
+        # ADR 0026 §3: the `default` domain's OAuth2 signing keys are
+        # provisioned by `Oauth2KeyHook` firing off the generic
+        # fire-and-forget `EventDispatcher` on domain creation, not
+        # synchronously within `bootstrap`'s own request/response cycle (see
+        # `tests/integration/src/oauth2_token_verify.rs`'s comment on the
+        # same race). Poll `/v4/oauth2/default/jwks` until it actually
+        # returns a non-empty key set so oauth2 API tests never race key
+        # provisioning at suite start.
+        for j in {1..30}; do
+            JWKS_KEYS=$(curl -s "$URL/v4/oauth2/default/jwks" | grep -c '"kty"' || true)
+            if [ "$JWKS_KEYS" -gt 0 ]; then
+                echo "✅ OAuth2 default-domain signing keys are provisioned!"
+                break
+            fi
+            sleep 0.5
+        done
+
+        # Export env vars for nextest to inject into test processes
+        echo "KEYSTONE_URL=http://localhost:8080" >> "$NEXTEST_ENV"
+        echo "OS_AUTH_URL=http://localhost:8080" >> "$NEXTEST_ENV"
+        echo "WEBAUTHN_URL=http://localhost:8080" >> "$NEXTEST_ENV"
+        echo "OS_USERNAME=admin" >> "$NEXTEST_ENV"
+        echo "OS_PASSWORD=password" >> "$NEXTEST_ENV"
+        echo "OS_USER_DOMAIN_ID=default" >> "$NEXTEST_ENV"
+        echo "OS_PROJECT_NAME=admin" >> "$NEXTEST_ENV"
+        echo "OS_PROJECT_DOMAIN_ID=default" >> "$NEXTEST_ENV"
+        echo "HOME=${CLIENT_HOME}" >> "$NEXTEST_ENV"
+        echo "OS_CLIENT_CONFIG_PATH=${CLIENT_CONFIG_FILE}" >> "$NEXTEST_ENV"
+        echo "KEYSTONE_DEV_KEK=4242424242424242424242424242424242424242424242424242424242424242" >> "$NEXTEST_ENV"
+        echo "KEYSTONE_ALLOW_ENV_KEK=1" >> "$NEXTEST_ENV"
+        echo "Server started and bootstrapped successfully."
+        exit 0
+    fi
+    sleep 0.2
+done
+
+echo "Server failed to start." >&2
+kill $AXUM_PID 2>/dev/null || true
+exit 1

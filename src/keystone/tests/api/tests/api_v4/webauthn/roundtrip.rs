@@ -1,0 +1,66 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+use std::env;
+use std::sync::Arc;
+
+use eyre::{Result, WrapErr};
+use tracing_test::traced_test;
+use url::Url;
+use uuid::Uuid;
+
+use webauthn_authenticator_rs::WebauthnAuthenticator;
+use webauthn_authenticator_rs::softtoken::SoftToken;
+
+use openstack_keystone_api_types::v3::user::UserCreateBuilder;
+use openstack_sdk::AsyncOpenStack;
+use openstack_sdk::config::CloudConfig;
+
+use test_api::guard::*;
+use test_api::identity::user::*;
+use test_api::webauthn::*;
+
+#[tokio::test]
+#[traced_test]
+async fn test_register_auth() -> Result<()> {
+    let test_client = Arc::new(AsyncOpenStack::new(&CloudConfig::from_env()?).await?);
+
+    let user_create = UserCreateBuilder::default()
+        .name(Uuid::new_v4().simple().to_string())
+        .domain_id("default")
+        .enabled(true)
+        .build()?;
+    let user = create_user(&test_client, user_create).await?;
+
+    let authenticator_backend = SoftToken::new(true)?.0;
+    let mut authenticator = WebauthnAuthenticator::new(authenticator_backend);
+
+    let origin: Url = env::var("WEBAUTHN_URL")
+        .wrap_err("WEBAUTHN_URL must be set. It must be https for non localhost.")?
+        .parse()?;
+
+    register_user_passkey(
+        &test_client,
+        &user.id,
+        origin.clone(),
+        &mut authenticator,
+        Some("softkey"),
+    )
+    .await?;
+
+    let _new_auth =
+        auth_passkey(&test_client, &user.id, origin.clone(), &mut authenticator).await?;
+
+    user.delete().await?;
+    Ok(())
+}

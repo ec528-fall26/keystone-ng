@@ -1,0 +1,44 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+pub mod api_key;
+pub mod asserts;
+pub mod assignment;
+pub mod auth;
+pub mod common;
+pub mod credential;
+pub mod domain_config;
+pub mod endpoint;
+pub mod federation;
+pub mod fixtures;
+pub mod guard;
+pub mod identity;
+pub mod limit;
+pub mod macros;
+pub mod mapping;
+pub mod oauth2;
+pub mod policy;
+pub mod region;
+pub mod resource;
+pub mod role;
+pub mod scim;
+pub mod scim_realm;
+pub mod service;
+pub mod token_restriction;
+pub mod trust;
+pub mod webauthn;
+
+pub mod k8s_auth {
+    pub mod auth;
+    pub mod instance;
+}

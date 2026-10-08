@@ -1,0 +1,873 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # Assignment driver to the OpenStack Keystone for the SQL database.
+
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use sea_orm::{DatabaseConnection, Schema};
+
+use openstack_keystone_core::assignment::{AssignmentProviderError, backend::AssignmentBackend};
+use openstack_keystone_core::db::create_table;
+use openstack_keystone_core::error::DatabaseError;
+use openstack_keystone_core::keystone::ServiceState;
+use openstack_keystone_core::plugin_manager::{
+    BackendRegistration, NamedAssignmentBackendRegistration,
+};
+use openstack_keystone_core::{SqlDriver, SqlDriverRegistration};
+use openstack_keystone_core_types::assignment::*;
+
+use openstack_keystone_core::auth::ExecutionContext;
+
+mod assignment;
+pub mod entity;
+
+#[derive(Default)]
+pub struct SqlBackend {}
+
+/// Linkage anchor — see ADR-0018. Referenced by the `keystone` crate's
+/// `build.rs`-generated `_ANCHORS` static so the linker extracts `.rlib`
+/// members, keeping `inventory::submit!` sections visible at runtime.
+#[allow(dead_code)]
+pub fn anchor() {}
+
+// Submit the plugin to the registry at compile-time
+static PLUGIN: SqlBackend = SqlBackend {};
+inventory::submit! {
+    SqlDriverRegistration { driver: &PLUGIN }
+}
+inventory::submit! {
+    BackendRegistration::<dyn AssignmentBackend> {
+        name: "sql",
+        selected: |_| true,
+        build: |_cfg| Box::pin(async {
+            Ok(Arc::new(SqlBackend::default()) as Arc<dyn AssignmentBackend>)
+        }),
+    }
+}
+
+// A named `sql` instance carries no parameters beyond the global `[database]`,
+// so every block resolves to a plain `SqlBackend` (ADR 0034 §4).
+inventory::submit! {
+    NamedAssignmentBackendRegistration {
+        driver: "sql",
+        build: |_cfg, _name| Box::pin(async {
+            Ok(Arc::new(SqlBackend::default()) as Arc<dyn AssignmentBackend>)
+        }),
+    }
+}
+
+impl SqlBackend {
+    /// Resolve implied roles for a set of assignments.
+    ///
+    /// Walks the imply-rule graph breadth-first, starting only from the
+    /// role IDs present in `assignments` and fetching the direct rules of
+    /// a whole frontier at once via `list_role_imply_rules_by_priors`, instead
+    /// of pulling the entire `implied_role` table. Effective-role sets are
+    /// typically a handful of roles, so this trades one full-table scan for
+    /// one narrow, indexed lookup per level of the graph. Computes transitive
+    /// closure over the resulting (small) subgraph, and generates
+    /// assignment entries for each implied role. Does NOT resolve role
+    /// names (that's the provider's responsibility).
+    ///
+    /// Returns a `Vec<Assignment>` containing both the original assignments
+    /// and any additionally generated implied role assignments.
+    async fn resolve_implied_roles(
+        &self,
+        state: &ServiceState,
+        assignments: Vec<Assignment>,
+    ) -> Result<Vec<Assignment>, AssignmentProviderError> {
+        let exec = ExecutionContext::internal(state);
+        let mut imply_rules: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut frontier: BTreeSet<String> =
+            assignments.iter().map(|a| a.role_id.clone()).collect();
+        while !frontier.is_empty() {
+            let mut next_frontier: BTreeSet<String> = BTreeSet::new();
+            let level: Vec<String> = frontier
+                .into_iter()
+                .filter(|role_id| visited.insert(role_id.clone()))
+                .collect();
+            if level.is_empty() {
+                break;
+            }
+            let level_ids: Vec<&str> = level.iter().map(String::as_str).collect();
+            // One call per level of the graph, not one per role.
+            let rules = state
+                .provider
+                .get_role_provider()
+                .list_role_imply_rules_by_priors(&exec, &level_ids)
+                .await?;
+            for rule in rules {
+                let implied_id = rule.implied_role.id.clone();
+                imply_rules
+                    .entry(rule.prior_role.id.clone())
+                    .or_default()
+                    .insert(implied_id.clone());
+                if !visited.contains(&implied_id) {
+                    next_frontier.insert(implied_id);
+                }
+            }
+            frontier = next_frontier;
+        }
+        // Transitive expansion
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let snapshot: Vec<(String, BTreeSet<String>)> = imply_rules
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (snapshot_role_id, snapshot_implied) in snapshot {
+                let to_add: BTreeSet<String> = snapshot_implied
+                    .iter()
+                    .filter_map(|implied_id| {
+                        imply_rules.get(implied_id).map(|further| {
+                            further
+                                .iter()
+                                .filter(|fid| {
+                                    !imply_rules
+                                        .get(&snapshot_role_id)
+                                        .is_some_and(|s| s.contains(*fid))
+                                })
+                                .cloned()
+                                .collect::<BTreeSet<String>>()
+                        })
+                    })
+                    .flatten()
+                    .collect();
+                if !to_add.is_empty() {
+                    changed = true;
+                    for fid in to_add {
+                        imply_rules
+                            .entry(snapshot_role_id.clone())
+                            .or_default()
+                            .insert(fid);
+                    }
+                }
+            }
+        }
+
+        // Merge and apply role implies
+        let mut result_map: HashSet<Assignment> = HashSet::new();
+
+        for assignment in assignments {
+            result_map.insert(assignment.clone());
+
+            if let Some(implies) = imply_rules.get(&assignment.role_id) {
+                for implied_role_id in implies {
+                    let mut implied_assignment = assignment.clone();
+                    implied_assignment.role_id = implied_role_id.clone();
+                    implied_assignment.implied_via = Some(assignment.role_id.clone());
+                    result_map.insert(implied_assignment);
+                }
+            }
+        }
+
+        Ok(result_map.into_iter().collect())
+    }
+
+    /// List role assignments for multiple actors/targets.
+    ///
+    /// # Parameters
+    ///
+    /// * `state` - The service state.
+    /// * `params` - The list parameters.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing a `Vec` of `Assignment` if successful, or an
+    /// `Error`.
+    async fn list_assignments_for_multiple_actors_and_targets(
+        &self,
+        state: &ServiceState,
+        params: &RoleAssignmentListForMultipleActorTargetParameters,
+    ) -> Result<Vec<Assignment>, AssignmentProviderError> {
+        let assignments =
+            assignment::list_for_multiple_actors_and_targets(&state.db.connection(), params)
+                .await?;
+
+        if params.resolve_implied_roles {
+            self.resolve_implied_roles(state, assignments).await
+        } else {
+            Ok(assignments)
+        }
+    }
+}
+
+#[async_trait]
+impl SqlDriver for SqlBackend {
+    /// Set up the database tables.
+    ///
+    /// # Parameters
+    ///
+    /// * `connection` - The database connection.
+    /// * `schema` - The database schema.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` indicating success or a `DatabaseError`.
+    async fn setup(
+        &self,
+        connection: &DatabaseConnection,
+        schema: &Schema,
+    ) -> Result<(), DatabaseError> {
+        create_table(connection, schema, crate::entity::prelude::Assignment).await?;
+        create_table(connection, schema, crate::entity::prelude::SystemAssignment).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AssignmentBackend for SqlBackend {
+    /// Check assignment grant.
+    ///
+    /// # Parameters
+    ///
+    /// * `state` - The service state.
+    /// * `grant` - The assignment to check.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing a `bool` indicating if the grant exists, or an
+    /// `Error`.
+    #[tracing::instrument(name = "driver.sql.assignment.check_grant", level = "debug", skip_all)]
+    async fn check_grant(
+        &self,
+        state: &ServiceState,
+        grant: &Assignment,
+    ) -> Result<bool, AssignmentProviderError> {
+        Ok(assignment::check(&state.db.connection(), grant).await?)
+    }
+
+    /// Create assignment grant.
+    ///
+    /// # Parameters
+    ///
+    /// * `state` - The service state.
+    /// * `grant` - The assignment to create.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the created `Assignment` if successful, or an
+    /// `Error`.
+    #[tracing::instrument(name = "driver.sql.assignment.create_grant", level = "debug", skip_all)]
+    async fn create_grant(
+        &self,
+        state: &ServiceState,
+        grant: AssignmentCreate,
+    ) -> Result<Assignment, AssignmentProviderError> {
+        Ok(assignment::create(&state.db.connection(), grant).await?)
+    }
+
+    /// List role assignments.
+    ///
+    /// # Parameters
+    ///
+    /// * `state` - The service state.
+    /// * `params` - The list parameters.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing a `Vec` of `Assignment` if successful, or an
+    /// `Error`.
+    #[tracing::instrument(name = "driver.sql.assignment.list_assignments", level = "debug", skip_all, fields(params = ?params))]
+    async fn list_assignments(
+        &self,
+        state: &ServiceState,
+        params: &RoleAssignmentListParameters,
+    ) -> Result<Vec<Assignment>, AssignmentProviderError> {
+        let mut request = RoleAssignmentListForMultipleActorTargetParametersBuilder::default();
+        let mut actors: Vec<String> = Vec::new();
+        let mut targets: Vec<RoleAssignmentTarget> = Vec::new();
+        if let Some(role_id) = &params.role_id {
+            request.role_id(role_id);
+        }
+        if let Some(uid) = &params.user_id {
+            actors.push(uid.into());
+        }
+        if let Some(gid) = &params.group_id {
+            actors.push(gid.into());
+        }
+        if let Some(true) = &params.effective
+            && let Some(uid) = &params.user_id
+        {
+            // Effective assignments mean we need to expand user_id to list of
+            // all groups the user is member of.
+            let users = state
+                .provider
+                .get_identity_provider()
+                .list_groups_of_user(&ExecutionContext::internal(state), uid)
+                .await?;
+            actors.extend(users.into_iter().map(|x| x.id));
+        };
+        if let Some(val) = &params.project_id {
+            targets.push(RoleAssignmentTarget {
+                id: val.clone(),
+                r#type: RoleAssignmentTargetType::Project,
+                inherited: Some(false),
+            });
+            if let Some(parents) = state
+                .provider
+                .get_resource_provider()
+                .get_project_parents(&ExecutionContext::internal(state), val)
+                .await?
+            {
+                // All assignments for parent projects having `inherited=true`
+                // must be included.
+                parents.iter().for_each(|parent_project| {
+                    targets.push(RoleAssignmentTarget {
+                        id: parent_project.id.clone(),
+                        r#type: RoleAssignmentTargetType::Project,
+                        inherited: Some(true),
+                    });
+                });
+            }
+        } else if let Some(val) = &params.domain_id {
+            targets.push(RoleAssignmentTarget {
+                id: val.clone(),
+                r#type: RoleAssignmentTargetType::Domain,
+                inherited: Some(false),
+            });
+        } else if let Some(val) = &params.system_id {
+            targets.push(RoleAssignmentTarget {
+                id: val.clone(),
+                r#type: RoleAssignmentTargetType::System,
+                inherited: Some(false),
+            })
+        }
+
+        // Defensive guard: if any actor-targeting parameter was set, the
+        // `actors` list must be non-empty. A prior bug silently dropped
+        // `group_id`, causing both `actors` and `targets` to be empty,
+        // which translated to a query without a WHERE clause that swept
+        // ALL assignments.
+        if params.user_id.is_some() || params.group_id.is_some() {
+            debug_assert!(
+                !actors.is_empty(),
+                "list_assignments: user_id or group_id was set but actors list is empty \
+                - a parameter mapping branch may be missing (CID: group_id-drop)"
+            );
+        }
+
+        request.targets(targets);
+        request.actors(actors);
+        request.resolve_implied_roles(params.resolve_implied_roles);
+        let mut assignments = self
+            .list_assignments_for_multiple_actors_and_targets(state, &request.build()?)
+            .await?;
+
+        // No SQL cursor is possible here: results are a union of two queries
+        // (regular + system assignments) plus in-memory implied-role
+        // expansion, so pagination is applied post-fetch over the fully
+        // materialized, expanded set - the same in-memory over-fetch pattern
+        // used by the Raft-backed domains, and the same helper the assignment
+        // provider re-applies over its untargeted fan-out union (ADR 0034 §5).
+        paginate_in_memory(&mut assignments, &params.pagination);
+
+        Ok(assignments)
+    }
+
+    /// Revoke assignment grant.
+    ///
+    /// # Parameters
+    ///
+    /// * `state` - The service state.
+    /// * `grant` - The assignment to revoke.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` indicating success or an `Error`.
+    #[tracing::instrument(name = "driver.sql.assignment.revoke_grant", level = "debug", skip_all)]
+    async fn revoke_grant(
+        &self,
+        state: &ServiceState,
+        grant: &Assignment,
+    ) -> Result<(), AssignmentProviderError> {
+        Ok(assignment::delete(&state.db.connection(), grant).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::{DatabaseBackend, DatabaseConnection, MockDatabase};
+    use std::sync::Arc;
+
+    use cadf::AuditDispatcher;
+    use openstack_keystone_config::{Config, ConfigManager};
+    use openstack_keystone_core::keystone::Service;
+    use openstack_keystone_core::policy::MockPolicy;
+    use openstack_keystone_core::provider::Provider;
+    use openstack_keystone_core::role::MockRoleProvider;
+    use openstack_keystone_core_types::role::{RoleImplyBuilder, RoleRef};
+
+    use super::assignment::tests::*;
+    use super::*;
+
+    async fn get_mock_state(db: DatabaseConnection, provider: Provider) -> Arc<Service> {
+        Arc::new(
+            Service::new(
+                ConfigManager::not_watched(Config::default()),
+                db,
+                provider,
+                Arc::new(MockPolicy::default()),
+                AuditDispatcher::noop(),
+                None,
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_list_for_multiple_actor_targets_multiple_actors() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![get_role_assignment_mock("1")]])
+            .append_query_results([vec![get_role_system_assignment_mock("3")]])
+            .into_connection();
+
+        let mut role_mock = MockRoleProvider::default();
+        role_mock
+            .expect_list_role_imply_rules_by_priors()
+            .returning(|_e, ids| {
+                if ids.contains(&"1") {
+                    Ok(vec![
+                        RoleImplyBuilder::default()
+                            .prior_role(RoleRef {
+                                id: "1".into(),
+                                name: Some("r1".into()),
+                                domain_id: None,
+                            })
+                            .implied_role(RoleRef {
+                                id: "2".into(),
+                                name: Some("r2".into()),
+                                domain_id: None,
+                            })
+                            .build()
+                            .unwrap(),
+                    ])
+                } else {
+                    Ok(vec![])
+                }
+            });
+        let provider = Provider::mocked_builder()
+            .mock_role(role_mock)
+            .build()
+            .unwrap();
+
+        let state = get_mock_state(db, provider).await;
+
+        let sot = SqlBackend {};
+        let res = sot
+            .list_assignments_for_multiple_actors_and_targets(
+                &state,
+                &RoleAssignmentListForMultipleActorTargetParameters {
+                    resolve_implied_roles: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(3, res.len(), "{:?}", res);
+        assert!(res.contains(&Assignment {
+            role_id: "1".into(),
+            role_name: None,
+            actor_id: "actor".into(),
+            target_id: "target".into(),
+            r#type: AssignmentType::UserProject,
+            inherited: false,
+            implied_via: None,
+        }));
+        assert!(res.contains(&Assignment {
+            role_id: "2".into(),
+            role_name: None,
+            actor_id: "actor".into(),
+            target_id: "target".into(),
+            r#type: AssignmentType::UserProject,
+            inherited: false,
+            implied_via: Some("1".into()),
+        }));
+        assert!(res.contains(&Assignment {
+            role_id: "3".into(),
+            role_name: None,
+            actor_id: "actor".into(),
+            target_id: "system".into(),
+            r#type: AssignmentType::UserSystem,
+            inherited: false,
+            implied_via: None,
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_list_for_multiple_actor_no_implied_roles() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![get_role_assignment_mock("1")]])
+            .append_query_results([vec![get_role_system_assignment_mock("3")]])
+            .into_connection();
+
+        let provider = Provider::mocked_builder().build().unwrap();
+
+        let state = get_mock_state(db, provider).await;
+
+        let sot = SqlBackend {};
+        let res = sot
+            .list_assignments_for_multiple_actors_and_targets(
+                &state,
+                &RoleAssignmentListForMultipleActorTargetParameters {
+                    resolve_implied_roles: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(2, res.len(), "{:?}", res);
+        assert!(res.contains(&Assignment {
+            role_id: "1".into(),
+            role_name: None,
+            actor_id: "actor".into(),
+            target_id: "target".into(),
+            r#type: AssignmentType::UserProject,
+            inherited: false,
+            implied_via: None,
+        }));
+        assert!(res.contains(&Assignment {
+            role_id: "3".into(),
+            role_name: None,
+            actor_id: "actor".into(),
+            target_id: "system".into(),
+            r#type: AssignmentType::UserSystem,
+            inherited: false,
+            implied_via: None,
+        }));
+        // No implied role (role_id "2") should be present
+        assert!(
+            res.iter().all(|a| a.role_id != "2"),
+            "implied role should not be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_assignments_group_id_filters_actors() {
+        use openstack_keystone_core_types::assignment::RoleAssignmentListParametersBuilder;
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![get_role_assignment_mock("1")]])
+            .append_query_results([vec![] as Vec<entity::system_assignment::Model>])
+            .into_connection();
+
+        let provider = Provider::mocked_builder().build().unwrap();
+        let state = get_mock_state(db, provider).await;
+
+        let sot = SqlBackend {};
+        let _res = sot
+            .list_assignments(
+                &state,
+                &RoleAssignmentListParametersBuilder::default()
+                    .group_id("my-group-id")
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_assignments_group_id_and_user_id_both_in_actors() {
+        use openstack_keystone_core_types::assignment::RoleAssignmentListParametersBuilder;
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![get_role_assignment_mock("1")]])
+            .append_query_results([vec![] as Vec<entity::system_assignment::Model>])
+            .into_connection();
+
+        let provider = Provider::mocked_builder().build().unwrap();
+        let state = get_mock_state(db, provider).await;
+
+        let sot = SqlBackend {};
+        let _res = sot
+            .list_assignments(
+                &state,
+                &RoleAssignmentListParametersBuilder::default()
+                    .user_id("my-user")
+                    .group_id("my-group")
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_assignments_group_id_only_returns_group_assignments() {
+        use crate::entity::assignment as db_assignment;
+        use crate::entity::sea_orm_active_enums::Type as DbType;
+        use crate::entity::system_assignment as db_system_assignment;
+        use openstack_keystone_core_types::assignment::{
+            AssignmentType, RoleAssignmentListParametersBuilder,
+        };
+
+        // Create two regular assignments: one for user "admin", one for group
+        // "scim-group". Only the group's assignment should be returned when
+        // querying by group_id.
+        let group_assignment = db_assignment::Model {
+            role_id: "group-role".into(),
+            actor_id: "scim-group".into(),
+            target_id: "target-project".into(),
+            r#type: DbType::GroupProject,
+            inherited: false,
+        };
+
+        let _user_assignment = db_assignment::Model {
+            role_id: "admin-role".into(),
+            actor_id: "admin-user".into(),
+            target_id: "target-project".into(),
+            r#type: DbType::UserProject,
+            inherited: false,
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![group_assignment]])
+            .append_query_results([vec![] as Vec<db_system_assignment::Model>])
+            .into_connection();
+
+        let provider = Provider::mocked_builder().build().unwrap();
+        let state = get_mock_state(db, provider).await;
+
+        let sot = SqlBackend {};
+        let res = sot
+            .list_assignments(
+                &state,
+                &RoleAssignmentListParametersBuilder::default()
+                    .group_id("scim-group")
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Only 1 assignment returned (the group's), not 0 or 2
+        assert_eq!(
+            1,
+            res.len(),
+            "expected exactly 1 group assignment, got {:?}",
+            res
+        );
+        assert_eq!("scim-group", res[0].actor_id);
+        assert_eq!(AssignmentType::GroupProject, res[0].r#type);
+        assert_eq!("group-role", res[0].role_id);
+    }
+
+    #[tokio::test]
+    async fn test_list_for_multiple_actor_no_target_role_id_collision() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![get_role_assignment_mock("1")]])
+            .append_query_results([vec![get_role_system_assignment_mock("1")]])
+            .into_connection();
+
+        let mut role_mock = MockRoleProvider::default();
+        role_mock
+            .expect_list_role_imply_rules_by_priors()
+            .returning(|_e, ids| {
+                if ids.contains(&"1") {
+                    Ok(vec![
+                        RoleImplyBuilder::default()
+                            .prior_role(RoleRef {
+                                id: "1".into(),
+                                name: Some("r1".into()),
+                                domain_id: None,
+                            })
+                            .implied_role(RoleRef {
+                                id: "2".into(),
+                                name: Some("r2".into()),
+                                domain_id: None,
+                            })
+                            .build()
+                            .unwrap(),
+                    ])
+                } else {
+                    Ok(vec![])
+                }
+            });
+        let provider = Provider::mocked_builder()
+            .mock_role(role_mock)
+            .build()
+            .unwrap();
+
+        let state = get_mock_state(db, provider).await;
+
+        let sot = SqlBackend {};
+        let params = RoleAssignmentListForMultipleActorTargetParameters {
+            actors: vec!["uid1".into()],
+            resolve_implied_roles: true,
+            ..Default::default()
+        };
+        let res = sot
+            .list_assignments_for_multiple_actors_and_targets(&state, &params)
+            .await
+            .unwrap();
+
+        assert_eq!(4, res.len());
+
+        assert!(
+            res.contains(&Assignment {
+                role_id: "1".into(),
+                role_name: None,
+                actor_id: "actor".into(),
+                target_id: "target".into(),
+                r#type: AssignmentType::UserProject,
+                inherited: false,
+                implied_via: None,
+            }),
+            "in {:?}",
+            res
+        );
+        assert!(
+            res.contains(&Assignment {
+                role_id: "2".into(),
+                role_name: None,
+                actor_id: "actor".into(),
+                target_id: "target".into(),
+                r#type: AssignmentType::UserProject,
+                inherited: false,
+                implied_via: Some("1".into()),
+            }),
+            "in {:?}",
+            res
+        );
+        assert!(
+            res.contains(&Assignment {
+                role_id: "1".into(),
+                role_name: None,
+                actor_id: "actor".into(),
+                target_id: "system".into(),
+                r#type: AssignmentType::UserSystem,
+                inherited: false,
+                implied_via: None,
+            }),
+            "in {:?}",
+            res
+        );
+        assert!(
+            res.contains(&Assignment {
+                role_id: "2".into(),
+                role_name: None,
+                actor_id: "actor".into(),
+                target_id: "system".into(),
+                r#type: AssignmentType::UserSystem,
+                inherited: false,
+                implied_via: Some("1".into()),
+            }),
+            "in {:?}",
+            res
+        );
+    }
+
+    /// `list_assignments` cannot push a cursor into SQL (union of two
+    /// queries + in-memory implied-role expansion), so pagination is applied
+    /// post-fetch: sorted by the composite marker, over-fetching by one row
+    /// to let the caller detect a next page without a false positive.
+    #[tokio::test]
+    async fn test_list_assignments_pagination_over_fetches_and_uses_marker() {
+        use openstack_keystone_core_types::ListPagination;
+        use openstack_keystone_core_types::assignment::RoleAssignmentListParametersBuilder;
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![
+                get_role_assignment_mock("1"),
+                get_role_assignment_mock("2"),
+                get_role_assignment_mock("3"),
+            ]])
+            .append_query_results([vec![] as Vec<entity::system_assignment::Model>])
+            .into_connection();
+
+        let provider = Provider::mocked_builder().build().unwrap();
+        let state = get_mock_state(db, provider).await;
+
+        let sot = SqlBackend {};
+        let res = sot
+            .list_assignments(
+                &state,
+                &RoleAssignmentListParametersBuilder::default()
+                    .group_id("scim-group")
+                    .pagination(ListPagination {
+                        limit: Some(1),
+                        marker: None,
+                        page_reverse: false,
+                    })
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Over-fetched by one (limit + 1): role "1" then "2", role "3" trimmed.
+        assert_eq!(2, res.len(), "{:?}", res);
+        assert_eq!("1", res[0].role_id);
+        assert_eq!("2", res[1].role_id);
+    }
+
+    #[tokio::test]
+    async fn test_list_assignments_pagination_marker_filters_prior_page() {
+        use openstack_keystone_core_types::ListPagination;
+        use openstack_keystone_core_types::assignment::RoleAssignmentListParametersBuilder;
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![
+                get_role_assignment_mock("1"),
+                get_role_assignment_mock("2"),
+                get_role_assignment_mock("3"),
+            ]])
+            .append_query_results([vec![] as Vec<entity::system_assignment::Model>])
+            .into_connection();
+
+        let provider = Provider::mocked_builder().build().unwrap();
+        let state = get_mock_state(db, provider).await;
+
+        let marker = Assignment {
+            role_id: "1".into(),
+            role_name: None,
+            actor_id: "actor".into(),
+            target_id: "target".into(),
+            r#type: AssignmentType::UserProject,
+            inherited: false,
+            implied_via: None,
+        }
+        .pagination_marker();
+
+        let sot = SqlBackend {};
+        let res = sot
+            .list_assignments(
+                &state,
+                &RoleAssignmentListParametersBuilder::default()
+                    .group_id("scim-group")
+                    .pagination(ListPagination {
+                        limit: Some(5),
+                        marker: Some(marker),
+                        page_reverse: false,
+                    })
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Only rows sorting strictly after the marker's role "1" remain.
+        assert_eq!(2, res.len(), "{:?}", res);
+        assert_eq!("2", res[0].role_id);
+        assert_eq!("3", res[1].role_id);
+    }
+}

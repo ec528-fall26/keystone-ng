@@ -1,0 +1,346 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # OpenStack Keystone SQL driver for the resource provider
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use sea_orm::{DatabaseConnection, Schema};
+
+use openstack_keystone_core::keystone::ServiceState;
+use openstack_keystone_core::plugin_manager::BackendRegistration;
+use openstack_keystone_core::resource::{ResourceProviderError, backend::ResourceBackend};
+use openstack_keystone_core::{
+    SqlDriver, SqlDriverRegistration, db::create_table, error::DatabaseError,
+};
+use openstack_keystone_core_types::resource::*;
+
+mod domain;
+pub mod entity;
+mod project;
+mod project_option;
+
+#[derive(Default)]
+pub struct SqlBackend {}
+
+/// Linkage anchor — see ADR-0018. Referenced by the `keystone` crate's
+/// `build.rs`-generated `_ANCHORS` static so the linker extracts `.rlib`
+/// members, keeping `inventory::submit!` sections visible at runtime.
+#[allow(dead_code)]
+pub fn anchor() {}
+
+// Submit the plugin to the registry at compile-time
+static PLUGIN: SqlBackend = SqlBackend {};
+inventory::submit! {
+    SqlDriverRegistration { driver: &PLUGIN }
+}
+inventory::submit! {
+    BackendRegistration::<dyn ResourceBackend> {
+        name: "sql",
+        selected: |_| true,
+        build: |_cfg| Box::pin(async {
+            Ok(Arc::new(SqlBackend::default()) as Arc<dyn ResourceBackend>)
+        }),
+    }
+}
+
+#[async_trait]
+impl ResourceBackend for SqlBackend {
+    /// Get `enabled` property of a domain.
+    ///
+    /// # Parameters
+    /// - `state`: Service state containing the database connection.
+    /// - `domain_id`: ID of the domain.
+    ///
+    /// # Returns
+    /// A `bool` indicating if the domain is enabled.
+    #[tracing::instrument(name = "driver.sql.resource.get_domain_enabled", level = "debug", skip_all, fields(domain_id = %domain_id))]
+    async fn get_domain_enabled<'a>(
+        &self,
+        state: &ServiceState,
+        domain_id: &'a str,
+    ) -> Result<bool, ResourceProviderError> {
+        Ok(domain::get_domain_enabled(&state.db.connection(), domain_id).await?)
+    }
+
+    /// Create new domain.
+    ///
+    /// # Parameters
+    /// - `state`: Service state containing the database connection.
+    /// - `domain`: Domain creation parameters.
+    ///
+    /// # Returns
+    /// The created `Domain`.
+    #[tracing::instrument(name = "driver.sql.resource.create_domain", level = "debug", skip_all)]
+    async fn create_domain(
+        &self,
+        state: &ServiceState,
+        domain: DomainCreate,
+    ) -> Result<Domain, ResourceProviderError> {
+        Ok(domain::create(&state.db.connection(), domain).await?)
+    }
+
+    /// Create new project.
+    ///
+    /// # Parameters
+    /// - `state`: Service state containing the database connection.
+    /// - `project`: Project creation parameters.
+    ///
+    /// # Returns
+    /// The created `Project`.
+    #[tracing::instrument(name = "driver.sql.resource.create_project", level = "debug", skip_all)]
+    async fn create_project(
+        &self,
+        state: &ServiceState,
+        project: ProjectCreate,
+    ) -> Result<Project, ResourceProviderError> {
+        Ok(project::create(&state.db.connection(), project).await?)
+    }
+
+    /// Update domain.
+    ///
+    /// # Parameters
+    /// - `state`: Service state containing the database connection.
+    /// - `domain_id`: ID of the domain to update.
+    /// - `domain`: The fields to change.
+    ///
+    /// # Returns
+    /// The updated `Domain`.
+    #[tracing::instrument(name = "driver.sql.resource.update_domain", level = "debug", skip_all, fields(domain_id = %domain_id))]
+    async fn update_domain<'a>(
+        &self,
+        state: &ServiceState,
+        domain_id: &'a str,
+        domain: DomainUpdate,
+    ) -> Result<Domain, ResourceProviderError> {
+        Ok(domain::update(&state.db.connection(), domain_id, domain).await?)
+    }
+
+    /// Update a project.
+    ///
+    /// # Parameters
+    /// - `state`: Service state containing the database connection.
+    /// - `project_id`: ID of the project to update.
+    /// - `project`: The fields to change.
+    ///
+    /// # Returns
+    /// The updated `Project`.
+    #[tracing::instrument(name = "driver.sql.resource.update_project", level = "debug", skip_all, fields(project_id = %project_id))]
+    async fn update_project<'a>(
+        &self,
+        state: &ServiceState,
+        project_id: &'a str,
+        project: ProjectUpdate,
+    ) -> Result<Project, ResourceProviderError> {
+        Ok(project::update(&state.db.connection(), project_id, project).await?)
+    }
+
+    /// Delete domain by the ID.
+    ///
+    /// # Parameters
+    /// - `state`: Service state containing the database connection.
+    /// - `id`: ID of the domain to delete.
+    #[tracing::instrument(name = "driver.sql.resource.delete_domain", level = "debug", skip_all, fields(domain_id = %id))]
+    async fn delete_domain<'a>(
+        &self,
+        state: &ServiceState,
+        id: &'a str,
+    ) -> Result<(), ResourceProviderError> {
+        Ok(domain::delete(&state.db.connection(), id).await?)
+    }
+
+    /// Delete project by the ID.
+    ///
+    /// # Parameters
+    /// - `state`: Service state containing the database connection.
+    /// - `id`: ID of the project to delete.
+    #[tracing::instrument(name = "driver.sql.resource.delete_project", level = "debug", skip_all, fields(project_id = %id))]
+    async fn delete_project<'a>(
+        &self,
+        state: &ServiceState,
+        id: &'a str,
+    ) -> Result<(), ResourceProviderError> {
+        Ok(project::delete(&state.db.connection(), id).await?)
+    }
+
+    /// Get single domain by ID.
+    ///
+    /// # Parameters
+    /// - `state`: Service state containing the database connection.
+    /// - `domain_id`: ID of the domain.
+    ///
+    /// # Returns
+    /// A `Result` containing an `Option` with the `Domain` if found, or an
+    /// `Error`.
+    #[tracing::instrument(name = "driver.sql.resource.get_domain", level = "debug", skip_all, fields(domain_id = %domain_id))]
+    async fn get_domain<'a>(
+        &self,
+        state: &ServiceState,
+        domain_id: &'a str,
+    ) -> Result<Option<Domain>, ResourceProviderError> {
+        Ok(domain::get_domain_by_id(&state.db.connection(), domain_id).await?)
+    }
+
+    /// Get single domain by Name.
+    ///
+    /// # Parameters
+    /// - `state`: Service state containing the database connection.
+    /// - `domain_name`: Name of the domain.
+    ///
+    /// # Returns
+    /// A `Result` containing an `Option` with the `Domain` if found, or an
+    /// `Error`.
+    #[tracing::instrument(
+        name = "driver.sql.resource.get_domain_by_name",
+        level = "debug",
+        skip_all
+    )]
+    async fn get_domain_by_name<'a>(
+        &self,
+        state: &ServiceState,
+        domain_name: &'a str,
+    ) -> Result<Option<Domain>, ResourceProviderError> {
+        Ok(domain::get_domain_by_name(&state.db.connection(), domain_name).await?)
+    }
+
+    /// Get single project by ID.
+    ///
+    /// # Parameters
+    /// - `state`: Service state containing the database connection.
+    /// - `project_id`: ID of the project.
+    ///
+    /// # Returns
+    /// A `Result` containing an `Option` with the `Project` if found, or an
+    /// `Error`.
+    #[tracing::instrument(name = "driver.sql.resource.get_project", level = "debug", skip_all, fields(project_id = %project_id))]
+    async fn get_project<'a>(
+        &self,
+        state: &ServiceState,
+        project_id: &'a str,
+    ) -> Result<Option<Project>, ResourceProviderError> {
+        Ok(project::get_project(&state.db.connection(), project_id).await?)
+    }
+
+    /// Get single project by Name and Domain ID.
+    ///
+    /// # Parameters
+    /// - `state`: Service state containing the database connection.
+    /// - `name`: Name of the project.
+    /// - `domain_id`: ID of the domain.
+    ///
+    /// # Returns
+    /// A `Result` containing an `Option` with the `Project` if found, or an
+    /// `Error`.
+    #[tracing::instrument(name = "driver.sql.resource.get_project_by_name", level = "debug", skip_all, fields(name = %name, domain_id = %domain_id))]
+    async fn get_project_by_name<'a>(
+        &self,
+        state: &ServiceState,
+        name: &'a str,
+        domain_id: &'a str,
+    ) -> Result<Option<Project>, ResourceProviderError> {
+        Ok(project::get_project_by_name(&state.db.connection(), name, domain_id).await?)
+    }
+
+    /// Get project parents.
+    ///
+    /// # Parameters
+    /// - `state`: Service state containing the database connection.
+    /// - `project_id`: ID of the project.
+    ///
+    /// # Returns
+    /// A `Result` containing an `Option` with the `Vec<Project>` if found, or
+    /// an `Error`.
+    #[tracing::instrument(name = "driver.sql.resource.get_project_parents", level = "debug", skip_all, fields(project_id = %project_id))]
+    async fn get_project_parents<'a>(
+        &self,
+        state: &ServiceState,
+        project_id: &'a str,
+    ) -> Result<Option<Vec<Project>>, ResourceProviderError> {
+        Ok(project::get_project_parents(&state.db.connection(), project_id).await?)
+    }
+
+    /// List domains.
+    ///
+    /// # Parameters
+    /// - `state`: Service state containing the database connection.
+    /// - `params`: List parameters for domains.
+    ///
+    /// # Returns
+    /// A `Vec<Domain>`.
+    #[tracing::instrument(name = "driver.sql.resource.list_domains", level = "debug", skip_all, fields(params = ?params))]
+    async fn list_domains(
+        &self,
+        state: &ServiceState,
+        params: &DomainListParameters,
+    ) -> Result<Vec<Domain>, ResourceProviderError> {
+        Ok(domain::list(&state.db.connection(), params).await?)
+    }
+
+    /// List projects.
+    ///
+    /// # Parameters
+    /// - `state`: Service state containing the database connection.
+    /// - `params`: List parameters for projects.
+    ///
+    /// # Returns
+    /// A `Vec<Project>`.
+    #[tracing::instrument(name = "driver.sql.resource.list_projects", level = "debug", skip_all, fields(params = ?params))]
+    async fn list_projects(
+        &self,
+        state: &ServiceState,
+        params: &ProjectListParameters,
+    ) -> Result<Vec<Project>, ResourceProviderError> {
+        Ok(project::list(&state.db.connection(), params).await?)
+    }
+}
+
+#[async_trait]
+impl SqlDriver for SqlBackend {
+    async fn setup(
+        &self,
+        connection: &DatabaseConnection,
+        schema: &Schema,
+    ) -> Result<(), DatabaseError> {
+        create_table(connection, schema, crate::entity::prelude::Project).await?;
+        create_table(connection, schema, crate::entity::prelude::ProjectOption).await?;
+        create_table(connection, schema, crate::entity::prelude::ProjectTag).await?;
+
+        if domain::get_domain_by_id(connection, domain::NULL_DOMAIN_ID)
+            .await
+            .map_err(|e| DatabaseError::Sql {
+                message: e.to_string(),
+                context: "checking for null domain during setup".to_string(),
+            })?
+            .is_none()
+        {
+            domain::create(
+                connection,
+                DomainCreate {
+                    description: None,
+                    extra: std::collections::HashMap::new(),
+                    enabled: false,
+                    id: Some(domain::NULL_DOMAIN_ID.into()),
+                    name: domain::NULL_DOMAIN_ID.into(),
+                    options: None,
+                },
+            )
+            .await
+            .map_err(|e| DatabaseError::Sql {
+                message: e.to_string(),
+                context: "creating null domain during setup".to_string(),
+            })?;
+        }
+        Ok(())
+    }
+}

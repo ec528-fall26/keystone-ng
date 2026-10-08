@@ -1,0 +1,35 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # K8s Auth configuration types.
+
+use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
+
+/// K8s authentication request.
+///
+/// Identity and authorization are resolved by the unified mapping engine.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "validate", derive(validator::Validate))]
+pub struct K8sAuthRequest {
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    #[serde(serialize_with = "crate::common::serialize_secret_string")]
+    /// JWT service account token.
+    pub jwt: SecretString,
+
+    /// Optional rule name hint for the mapping-engine path. When set, the
+    /// mapping engine evaluates the named rule first.
+    #[cfg_attr(feature = "validate", validate(length(max = 255)))]
+    pub rule_name: Option<String>,
+}

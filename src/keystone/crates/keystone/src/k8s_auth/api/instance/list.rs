@@ -1,0 +1,509 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! K8s auth: list auth instances.
+use axum::{
+    Json,
+    extract::{OriginalUri, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use serde_json::json;
+use validator::Validate;
+
+use openstack_keystone_core::auth::ExecutionContext;
+
+use openstack_keystone_api_types::PaginationQuery;
+use openstack_keystone_api_types::k8s_auth::*;
+use openstack_keystone_core_types::ListPagination;
+use openstack_keystone_core_types::k8s_auth as provider_types;
+
+use crate::api::common::paginate_bidirectional;
+use crate::api::{KeystoneApiError, auth::Auth};
+use crate::keystone::ServiceState;
+
+/// List K8s auth instances
+#[utoipa::path(
+    get,
+    path = "/",
+    operation_id = "/k8s_auth/instance:list",
+    params(K8sAuthInstanceListParameters, PaginationQuery),
+    responses(
+        (status = OK, description = "List of instances", body = K8sAuthInstanceList),
+        (status = 500, description = "Internal error", example = json!(KeystoneApiError::InternalError(String::from("id = 1"))))
+    ),
+    security(("x-auth" = [])),
+    tag="k8s_auth_instance"
+)]
+#[tracing::instrument(
+    name = "api::v4::k8s_auth::instance::list",
+    level = "debug",
+    skip(state, user_auth),
+    err(Debug)
+)]
+pub(super) async fn list(
+    Auth(user_auth): Auth,
+    OriginalUri(original_url): OriginalUri,
+    Query(query): Query<K8sAuthInstanceListParameters>,
+    Query(pagination): Query<PaginationQuery>,
+    State(state): State<ServiceState>,
+) -> Result<impl IntoResponse, KeystoneApiError> {
+    query.validate()?;
+    let res = state
+        .policy_enforcer
+        .enforce(
+            "identity/k8s_auth/instance/list",
+            &user_auth,
+            json!({"instance": query}),
+            None,
+        )
+        .await?;
+
+    let domain_id = if query.domain_id.as_ref().is_none() {
+        if !res.can_see_other_domain_resources.is_some_and(|x| x) {
+            user_auth.principal().domain_id()
+        } else {
+            // User can see other domain's resources and query is empty - leave
+            // it empty
+            None
+        }
+    } else {
+        // The policy is expected to verify whether the user is allowed to see
+        // into that other domain
+        query.domain_id.clone()
+    };
+    let config = state.config_manager.config.read().await;
+    let mut list_params = provider_types::K8sAuthInstanceListParameters::from(query.clone());
+    list_params.domain_id = domain_id;
+    list_params.pagination = ListPagination {
+        limit: config.resolve_list_limit(&config.k8s_auth.list_limit, pagination.limit),
+        marker: pagination.marker.clone(),
+        page_reverse: pagination.page_reverse,
+    };
+
+    let instances: Vec<K8sAuthInstance> = state
+        .provider
+        .get_k8s_auth_provider()
+        .list_auth_instances(
+            &ExecutionContext::from_auth(&state, &user_auth),
+            &list_params,
+        )
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+
+    let (instances, links) = paginate_bidirectional(
+        &config,
+        &config.k8s_auth.list_limit,
+        instances,
+        &pagination,
+        &original_url,
+    )?;
+    Ok((
+        StatusCode::OK,
+        Json(K8sAuthInstanceList { instances, links }),
+    )
+        .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use http_body_util::BodyExt; // for `collect`
+    use tower::ServiceExt; // for `call`, `oneshot`, and `ready`
+    use tower_http::trace::TraceLayer;
+    use tracing_test::traced_test;
+
+    use openstack_keystone_core_types::k8s_auth as provider_types;
+
+    use super::{super::openapi_router, *};
+    use crate::api::tests::{get_mocked_state, test_fixture_scoped};
+    use crate::k8s_auth::MockK8sAuthProvider;
+    use crate::provider::Provider;
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_list() {
+        let mut provider = Provider::mocked_builder();
+        let mut mock = MockK8sAuthProvider::default();
+        mock.expect_list_auth_instances()
+            .withf(|_, _: &provider_types::K8sAuthInstanceListParameters| true)
+            .returning(|_, _| {
+                Ok(vec![provider_types::K8sAuthInstance {
+                    ca_cert: Some("cert".into()),
+                    disable_local_ca_jwt: false,
+                    domain_id: "did".into(),
+                    enabled: true,
+                    host: "http://host:post".into(),
+                    id: "id".into(),
+                    name: Some("name".into()),
+                }])
+            });
+        provider = provider.mock_k8s_auth(mock);
+        let vsc = test_fixture_scoped();
+
+        // skip_default_token_provider=true since we inject VSC via extension
+        let state = get_mocked_state(provider, true, None).await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let res: K8sAuthInstanceList = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            vec![K8sAuthInstance {
+                ca_cert: Some("cert".into()),
+                disable_local_ca_jwt: false,
+                domain_id: "did".into(),
+                enabled: true,
+                host: "http://host:post".into(),
+                id: "id".into(),
+                name: Some("name".into()),
+            }],
+            res.instances
+        );
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_list_qp() {
+        let mut provider = Provider::mocked_builder();
+        let mut mock = MockK8sAuthProvider::default();
+        mock.expect_list_auth_instances()
+            .withf(|_, qp: &provider_types::K8sAuthInstanceListParameters| {
+                qp.name == Some("name".into()) && qp.domain_id == Some("did".into())
+            })
+            .returning(|_, _| {
+                Ok(vec![provider_types::K8sAuthInstance {
+                    ca_cert: Some("cert".into()),
+                    disable_local_ca_jwt: false,
+                    domain_id: "did".into(),
+                    enabled: true,
+                    host: "http://host:post".into(),
+                    id: "id".into(),
+                    name: Some("name".into()),
+                }])
+            });
+
+        provider = provider.mock_k8s_auth(mock);
+        let vsc = test_fixture_scoped();
+
+        // skip_default_token_provider=true since we inject VSC via extension
+        let state = get_mocked_state(provider, true, None).await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/?name=name&domain_id=did&limit=1&marker=marker")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let _res: K8sAuthInstanceList = serde_json::from_slice(&body).unwrap();
+    }
+
+    /// Backend over-fetched (returned `limit + 1 == 2` rows), not the first
+    /// page (`marker` set): both `next` and `previous` links are produced,
+    /// and the extra row is trimmed from the response body.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_list_pagination_bidirectional_links() {
+        let mut provider = Provider::mocked_builder();
+        let mut mock = MockK8sAuthProvider::default();
+        mock.expect_list_auth_instances()
+            .withf(|_, qp: &provider_types::K8sAuthInstanceListParameters| {
+                qp.pagination.limit == Some(1) && qp.pagination.marker == Some("m".into())
+            })
+            .returning(|_, _| {
+                Ok(vec![
+                    provider_types::K8sAuthInstance {
+                        ca_cert: None,
+                        disable_local_ca_jwt: false,
+                        domain_id: "did".into(),
+                        enabled: true,
+                        host: "http://host:post".into(),
+                        id: "1".into(),
+                        name: Some("a".into()),
+                    },
+                    provider_types::K8sAuthInstance {
+                        ca_cert: None,
+                        disable_local_ca_jwt: false,
+                        domain_id: "did".into(),
+                        enabled: true,
+                        host: "http://host:post".into(),
+                        id: "2".into(),
+                        name: Some("b".into()),
+                    },
+                ])
+            });
+        provider = provider.mock_k8s_auth(mock);
+        let vsc = test_fixture_scoped();
+
+        let state = get_mocked_state(provider, true, None).await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/?limit=1&marker=m")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let res: K8sAuthInstanceList = serde_json::from_slice(&body).unwrap();
+        assert_eq!(res.instances.len(), 1);
+        assert_eq!(res.instances[0].id, "1");
+        let links = res.links.expect("expected next+previous links");
+        assert!(links.iter().any(|l| l.rel == "next"));
+        assert!(links.iter().any(|l| l.rel == "previous"));
+    }
+
+    /// Backend returned exactly `limit` rows (no over-fetched extra row): no
+    /// `next` link should be produced.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_list_pagination_no_false_positive_next() {
+        let mut provider = Provider::mocked_builder();
+        let mut mock = MockK8sAuthProvider::default();
+        mock.expect_list_auth_instances()
+            .withf(|_, qp: &provider_types::K8sAuthInstanceListParameters| {
+                qp.pagination.limit == Some(1)
+            })
+            .returning(|_, _| {
+                Ok(vec![provider_types::K8sAuthInstance {
+                    ca_cert: None,
+                    disable_local_ca_jwt: false,
+                    domain_id: "did".into(),
+                    enabled: true,
+                    host: "http://host:post".into(),
+                    id: "1".into(),
+                    name: Some("a".into()),
+                }])
+            });
+        provider = provider.mock_k8s_auth(mock);
+        let vsc = test_fixture_scoped();
+
+        let state = get_mocked_state(provider, true, None).await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/?limit=1")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let res: K8sAuthInstanceList = serde_json::from_slice(&body).unwrap();
+        assert_eq!(res.instances.len(), 1);
+        assert_eq!(res.links, None);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_list_forbidden() {
+        let provider = Provider::mocked_builder();
+        let vsc = test_fixture_scoped();
+        // skip_default_token_provider=true since we inject VSC via extension
+        let state = get_mocked_state(provider, false, None).await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_list_unauthorized() {
+        let provider = Provider::mocked_builder();
+
+        let state = get_mocked_state(provider, true, None).await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_list_own_not_specified() {
+        let mut provider = Provider::mocked_builder();
+        let mut mock = MockK8sAuthProvider::default();
+        mock.expect_list_auth_instances()
+            .withf(|_, qp: &provider_types::K8sAuthInstanceListParameters| {
+                qp.name == Some("name".into()) && qp.domain_id == Some("domain_id".into())
+            })
+            .returning(|_, _| {
+                Ok(vec![provider_types::K8sAuthInstance {
+                    ca_cert: Some("cert".into()),
+                    disable_local_ca_jwt: false,
+                    domain_id: "did".into(),
+                    enabled: true,
+                    host: "http://host:post".into(),
+                    id: "id".into(),
+                    name: Some("name".into()),
+                }])
+            });
+
+        provider = provider.mock_k8s_auth(mock);
+        let vsc = test_fixture_scoped();
+
+        // skip_default_token_provider=true since we inject VSC via extension
+        let state = get_mocked_state(provider, true, None).await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/?name=name")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let _res: K8sAuthInstanceList = serde_json::from_slice(&body).unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_list_all() {
+        // Test listing ALL configs when the user does not specify the domain_id
+        // and is allowed to see configs of other domains (admin)
+        let mut provider = Provider::mocked_builder();
+        let mut mock = MockK8sAuthProvider::default();
+        mock.expect_list_auth_instances()
+            .withf(|_, qp: &provider_types::K8sAuthInstanceListParameters| {
+                qp.name == Some("name".into()) && qp.domain_id.is_none()
+            })
+            .returning(|_, _| {
+                Ok(vec![provider_types::K8sAuthInstance {
+                    ca_cert: Some("cert".into()),
+                    disable_local_ca_jwt: false,
+                    domain_id: "did".into(),
+                    enabled: true,
+                    host: "http://host:post".into(),
+                    id: "id".into(),
+                    name: Some("name".into()),
+                }])
+            });
+
+        provider = provider.mock_k8s_auth(mock);
+        let vsc = test_fixture_scoped();
+
+        // skip_default_token_provider=true since we inject VSC via extension
+        let state = get_mocked_state(provider, true, Some(true)).await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/?name=name")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let _res: K8sAuthInstanceList = serde_json::from_slice(&body).unwrap();
+    }
+}

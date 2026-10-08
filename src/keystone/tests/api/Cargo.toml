@@ -1,0 +1,82 @@
+[package]
+name = "test_api"
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[package.metadata.dist]
+dist = false
+
+[lib]
+name = "test_api"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+cadf.workspace = true
+chrono = { workspace = true, features = ["serde", "now"] }
+eyre.workspace = true
+derive_builder.workspace = true
+hmac.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+openstack-keystone-api-types = { workspace = true, features = ["builder"] }
+openstack-keystone-distributed-storage = { workspace = true }
+openidconnect = { workspace = true }
+openstack_sdk = { version = "0.22", default-features = false, features = ["async", "identity" ] }
+reqwest = { workspace = true, features = ["json", "http2", "multipart", "gzip", "deflate", "cookies"] }
+rustls.workspace = true
+secrecy = { workspace = true, features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded.workspace = true
+sha2.workspace = true
+spiffe = { workspace = true, features = ["x509-source"] }
+spiffe-rustls.workspace = true
+spiffe-rustls-tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tokio = { workspace = true, features = ["fs", "rt-multi-thread", "macros"] }
+tokio-rustls.workspace = true
+tonic = { workspace = true, features = ["tls-aws-lc"] }
+tracing-test.workspace = true
+webauthn-authenticator-rs = { workspace = true, features = ["softtoken"] }
+x509-parser.workspace = true
+url = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+[[test]]
+name = "integration_api_v3"
+path = "tests/api_v3.rs"
+test = false
+
+[[test]]
+name = "integration_api_v4"
+path = "tests/api_v4.rs"
+test = false
+
+[[test]]
+name = "internal_spiffe_rest"
+path = "tests/internal_spiffe_rest.rs"
+test = false
+
+[[test]]
+name = "k8s_auth"
+path = "tests/k8s_auth.rs"
+test = false
+
+[[test]]
+name = "raft_spiffe"
+path = "tests/raft_spiffe.rs"
+test = false
+
+[[test]]
+name = "scim_v2"
+path = "tests/scim_v2.rs"
+test = false

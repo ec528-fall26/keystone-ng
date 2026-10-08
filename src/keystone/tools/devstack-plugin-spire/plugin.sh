@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# devstack plugin dispatcher for SPIRE (SPIFFE workload identity).
+#
+# Standard devstack plugin phase hooks, mirroring devstack/plugin.sh's
+# shape. This plugin is independent of the "key-rs" plugin in devstack/ -
+# it only stands up a SPIRE server + agent, distributes the trust bundle,
+# and pre-registers the well-known SPIFFE identities later phases
+# (keystone-rs's internal SPIFFE mTLS listener, the vendor-data JWT API)
+# authenticate against. See doc/plans/spire-integration.md, Phase 1.
+#
+# See lib/spire for the actual install/configure/init/start functions.
+
+SPIRE_PLUGIN_DIR=$(dirname "${BASH_SOURCE[0]}")
+
+source "$SPIRE_PLUGIN_DIR/lib/spire"
+
+if is_service_enabled spire; then
+    # spire-server, spire-agent, and the per-service spiffe-helper-*
+    # instances are the internal run_process units the start/stop
+    # functions target, not user-facing toggles - devstack's run_process
+    # silently no-ops for any service name that isn't enabled, so they
+    # must be enabled here (mirroring key-rs's key-rs-opa). "spire" remains
+    # the single toggle operators use in local.conf; each spiffe-helper-*
+    # instance is itself only started (lib/spire's start_spire) when its
+    # corresponding OpenStack service (n-api/c-api/g-api/q-svc) is enabled.
+    enable_service spire-server spire-agent
+    enable_service spiffe-helper-nova spiffe-helper-cinder spiffe-helper-glance spiffe-helper-neutron
+
+    if [[ "$1" == "stack" && "$2" == "install" ]]; then
+        install_spire
+        install_spiffe_helper
+    elif [[ "$1" == "stack" && "$2" == "post-config" ]]; then
+        configure_spire
+        # Start the SPIRE stack in post-config (before devstack starts the
+        # OpenStack services), not in the later "extra" phase: Phase 1.6's
+        # keystonemiddleware SPIFFE transport builds its session when
+        # n-api's WSGI app loads during the services-start phase, where a
+        # missing spire-agent socket fails the app init (every request
+        # 500s). stack.sh's create_flavors async wait then hits those
+        # 500s and aborts the run before "extra" is ever reached - so
+        # starting SPIRE there is a chicken-and-egg that can never win.
+        init_spire
+        start_spire
+    fi
+
+    if [[ "$1" == "unstack" ]]; then
+        stop_spire
+    fi
+
+    if [[ "$1" == "clean" ]]; then
+        cleanup_spire
+    fi
+fi

@@ -1,0 +1,1529 @@
+# SPIRE Integration Plan: Keystone-rs + OpenStack Workload Identity
+
+**Status:** Draft
+
+This document outlines the implementation plan for integrating SPIRE workload
+identity into an OpenStack control plane running keystone-rs. The plan is broken
+into independently-mergeable phases, each building on preceding work.
+
+The core idea: Nova injects a keystone-rs signed JWT into a VM's vendor_data.
+The VM uses a custom SPIRE node attestor plugin to auto-attest (no
+pre-registered entries), receiving a project-scoped SPIFFE SVID. OpenStack API
+services use SPIFFE mTLS for the keystonemiddleware back-channel to keystone-rs,
+and eventually transition to offline JWT validation.
+
+## External Dependencies
+
+This plan spans three repositories:
+
+| Repo                                                                     | What It Contributes                                                                 |
+| ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| `openstack-experimental/keystone` (keystone-rs)                          | Vendor data JWT API, internal SPIFFE interface, mapping rules                       |
+| `openstack/python-keystonemiddleware` (Gerrit, **two separate changes**) | Change #1: `auth_token` filter SPIFFE mTLS transport. Change #2: JWT offline filter |
+| New Go repo: `spire-jwt-keystone-plugins`                                | Custom SPIRE node attestor plugins (agent + server)                                 |
+
+Two supporting DevStack plugins are also needed:
+
+| Plugin                             | Purpose                                                           |
+| ---------------------------------- | ----------------------------------------------------------------- |
+| `devstack-plugin-spire`            | Install and configure SPIRE server + agents                       |
+| keystone-rs `devstack/` (existing) | Already handles keystone-rs + OPA; extended for SPIRE integration |
+
+## Architecture Overview
+
+Services connect to keystone-rs via two interfaces:
+
+- **`[interface:public]`** (port 8080) — plaintext HTTP, behind reverse proxy
+  (Apache). Serves /v3, /v4, and JWKS to unauthenticated clients — two
+  separate JWKS documents as of Phase 2: `/v4/oauth2/{domain}/jwks` (OAuth2
+  access-token signing key) and `/v4/spiffe/{domain}/jwks` (VM attestation
+  signing key), independently keyed and rotated (see Phase 2 "Attestation key
+  isolation").
+- **`[interface:internal]`** (port 8444) — SPIFFE mTLS. Used by OpenStack
+  services (nova-api, neutron) for the keystonemiddleware back-channel.
+
+```mermaid
+c4Diagram
+    Person(devops, "DevOps Operator", "Manages infrastructure")
+    System(openstack, "OpenStack Services", "nova-api, neutron API")
+    System(apache, "Reverse Proxy", "Apache / nginx")
+    System(keystone, "Keystone-rs", "Authentication and authorization")
+    System(nova_compute, "Nova-Compute", "Runs VMs on compute nodes")
+    System(spire_srv, "SPIRE Server", "Workload identity management")
+    System_VM(vm, "VM Guest", "Linux VM running spire-agent")
+    Boundary(ks_boundary, "Keystone-rs") {
+        System_Pub(pub, "[interface:public]", "Port 8080\n/v3, /v4, /jwks")
+        System_Int(int, "[interface:internal]", "Port 8444 SPIFFE mTLS\n/v3/OS-TOKENS, /v4")
+    }
+    Boundary(sp_boundary, "SPIRE Server") {
+        Component(jp, "jwt_keystone node attestor", "Serves JWT attestation")
+    }
+    Rel(openstack, pub, "HTTP")
+    Rel(apache, pub, "HTTP")
+    Rel(openstack, int, "SPIFFE mTLS")
+    Rel(pub, jp, "JWKS fetch (HTTP)")
+    Rel(nova_compute, int, "POST /v4/vendordata\nSPIFFE mTLS")
+    Rel(vm, jp, "JWT attestation")
+    Rel(jp, pub, "GET /v4/spiffe/domain/jwks")
+```
+
+**VM attestation flow:**
+
+```mermaid
+sequenceDiagram
+    participant N as Nova-Compute
+    participant NA as Nova API
+    participant K as Keystone-rs
+    participant VM as cloud-init (VM)
+    participant SA as spire-agent (VM)
+    participant P as SPIRE Server
+    Note over N,P: VM provisioning with SPIFFE identity
+    N->>K: POST /v4/vendordata (project_id, instance_id)
+    Note over N,K: Nova-Compute presents per-host SPIFFE SVID
+    K->>NA: verify server.tenant_id + hypervisor_hostname (verify_placement)
+    NA-->>K: ownership confirmed (else 403)
+    K-->>N: signed JWT in vendor_data response
+    N->>VM: inject JWT into /vendor_data.json
+    VM->>SA: read JWT from vendor_data.json
+    SA->>P: JWT attestation stream
+    P->>K: GET /v4/spiffe/domain/jwks (dedicated attestation JWKS)
+    K-->>P: attestation JWKS public keys
+    P->>P: verify JWT signature + aud + exp
+    P->>P: check consumed-jti cache; supersede stale entry if fresh re-attestation
+    P-->>SA: X.509 SVID
+    Note over SA: SVID: spiffe://domain/project/{p}/instance/{i}
+```
+
+**Control plane data flow:**
+
+```mermaid
+flowchart LR
+    subgraph api["Control Plane API"]
+        svc["OpenStack Services\n(nova-api, neutron)"]
+        proxy["Reverse Proxy\n(Apache)"]
+    end
+    subgraph keystone["Keystone-rs"]
+        pub["[interface:public]\nport 8080\n/v3, /v4, /jwks"]
+        int["[interface:internal]\nport 8444 SPIFFE mTLS\n/v3/OS-TOKENS, /v4"]
+    end
+    subgraph compute["Nova-Compute Host"]
+        nc["Nova-Compute\nper-host SPIFFE SVID"]
+        vm["VM Guest"]
+        sp["spire-agent (VM)"]
+        ci["cloud-init"]
+    end
+    subgraph spire["SPIRE Server"]
+        jp["jwt_keystone\nnode attestor"]
+    end
+    svc -->|HTTP| proxy
+    proxy -->|HTTP| pub
+    svc -->|SPIFFE mTLS| int
+    pub -->|JWKS fetch| jp
+    nc -->|POST /v4/vendordata\nSPIFFE mTLS:8444| int
+    int -->|JWT| ci
+    ci -->|reads /vendor_data.json| sp
+    sp -->|JWT attestation| jp
+    jp -->|GET /jwks| pub
+    jp -->|return SVID| sp
+```
+
+## Phases
+
+### Phase 1: SPIRE DevStack Plugin
+
+**Goal:** SPIRE server and agents running in devstack, with trust domain, CA
+bundle distribution, and pre-registered service entries.
+
+**Prerequisites:** None.
+
+**New files:**
+
+| File                                                    | Purpose                                |
+| ------------------------------------------------------- | -------------------------------------- |
+| `tools/devstack-plugin-spire/plugin.sh`                 | DevStack plugin hooks                  |
+| `tools/devstack-plugin-spire/lib/spire`                 | Install/configure/start/stop functions |
+| `tools/devstack-plugin-spire/settings`                  | `enable_service spire` declaration     |
+| `tools/devstack-plugin-spire/etc/spire-server.conf.tpl` | Server config template                 |
+| `tools/devstack-plugin-spire/etc/spire-agent.conf.tpl`  | Agent config template                  |
+
+**Details:**
+
+The plugin follows the same pattern as the existing `devstack/plugin.sh` —
+`setup_start_spire` (install binaries from SPIRE releases, generate config),
+`stop_spire`, `do_cleanup`.
+
+Server config uses `join_token` node attestor for single-node devstack
+(development only; production would use `x509pop`, `k8s_sat`, etc.). The agent
+uses join token for insecure bootstrap, same as `tools/start-spire.sh`.
+
+The plugin pre-registers service entries for keystone-rs, nova-api, and
+neutron, mapping each to a well-known, per-service SPIFFE ID. Nova-compute is
+**not** registered as a single shared identity — see "Per-host nova-compute
+registration" below.
+
+| Service      | SPIFFE ID                                            |
+| ------------ | ----------------------------------------------------- |
+| Keystone-rs  | `spiffe://{trust_domain}/service/keystone`             |
+| Nova API     | `spiffe://{trust_domain}/service/nova-api`             |
+| Neutron      | `spiffe://{trust_domain}/service/neutron`              |
+
+**Per-host nova-compute registration (ownership binding):** Because
+`/v4/vendordata` (Phase 2) signs an attestation JWT scoped to a specific
+`project_id`/`instance_id`, keystone-rs needs to know *which compute host* is
+asking — a flat, shared nova-compute identity gives every compute host the
+same SPIFFE ID and no way to bind a request to the host that actually owns
+the instance. A compromised or malicious compute host could otherwise request
+(and receive) a signed attestation for any project/instance pair, not just
+instances it runs.
+
+Instead, each compute host gets its own per-host SPIFFE ID:
+
+```
+spiffe://{trust_domain}/service/nova-compute/host/{hostname}
+```
+
+Registration is per-host rather than a single pre-registered entry:
+
+- **Production-style option:** `x509pop` node attestation, with each compute
+  host provisioned an individual x509 identity certificate (e.g. from an
+  existing PKI or per-host bootstrap secret) whose registration entry's
+  SPIFFE ID is templated with the host's `hostname` selector.
+- **DevStack option:** the plugin's join-token bootstrap flow is extended to
+  register the entry dynamically at agent-join time, keyed to the joining
+  agent's `hostname` (rather than pre-registering one shared entry for
+  "nova-compute" up front). **This does not give the same host-identity
+  guarantee as `x509pop`, and should be labeled as such** (same caveat this
+  plan already applies to `join_token` elsewhere: development/test only). A
+  join token, by itself, only proves possession of the token — not which
+  host is joining. If the join token is shared across all compute hosts (the
+  typical devstack single-node-or-shared-token setup), any host holding it
+  can register itself under *any* hostname it claims, which defeats the
+  purpose of Fix 1's ownership check in that deployment mode: the whole
+  point of per-host identity is that a compute host can't claim to be
+  another one. Treat the devstack path as sufficient for exercising the
+  Phase 2/5 code paths in CI, not as a security-equivalent stand-in for
+  `x509pop` in any assessment of whether Fix 1 actually holds.
+
+Phase 2 uses this per-host identity to cross-check ownership before signing
+(see "Ownership verification" in Phase 2 below).
+
+**Per-host entry cleanup:** this table addresses issuing per-host identities,
+not retiring them. A compute host that's decommissioned leaves its
+`.../nova-compute/host/{hostname}` registration entry in place indefinitely —
+the same class of orphaned-entry problem Phase 6a solves for VM instances,
+just on the host side. Not addressed by this plan; operators should extend
+whatever host-decommissioning process they already run (e.g. `nova service
+delete`) to also remove the corresponding SPIRE entry.
+
+The SPIRE server CA bundle is copied to `$KEYSTONE_CONF_DIR/spiffe/ca.crt` so
+keystone-rs and Python services can reference it.
+
+**Configuration added to `local.conf`:**
+
+```ini
+[[local|localrc]]
+enable_plugin spire https://github.com/openstack-experimental/keystone \
+                 --branch <branch> \
+                 --subdirectory tools/devstack-plugin-spire
+enable_service spire
+SPIRE_TRUST_DOMAIN=cloud.trust.domain
+```
+
+**Verification:**
+
+```bash
+# After stack.sh completes:
+spire-server entry show -socketPath /tmp/spire-ci-test-harness/server.sock
+# Should show pre-registered entries for nova-api, neutron, plus one
+# per-host entry for each joined nova-compute host (host/{hostname})
+
+# Verify agent health:
+spire-agent healthcheck -socketPath /tmp/spire-ci-test-harness/agent.sock
+```
+
+---
+
+### Phase 1.5: Full DevStack Service Set (Standard Auth) + spiffe-helper Cert Sidecars
+
+**Goal:** exercise SPIRE against a realistic multi-service OpenStack control
+plane before Phase 4/5's keystonemiddleware cutover exists — bring up
+Nova/Cinder/Glance/Neutron in the devstack CI job (previously keystone-only)
+using today's standard, unmodified keystone password/token auth, and add a
+`spiffe-helper` sidecar per service so each starts getting real X.509 SVIDs
+written to disk. The certs are issued but **not consumed** by any service in
+this phase — that consumption step belongs to Phase 4/5, once the patched
+keystonemiddleware exists to actually authenticate with them.
+
+**Prerequisites:** Phase 1 (SPIRE devstack plugin).
+
+**New/changed files:**
+
+| File                                                          | Purpose                                              |
+| --------------------------------------------------------------- | --------------------------------------------------- |
+| `tools/devstack-plugin-spire/etc/spiffe-helper.conf.tpl`        | spiffe-helper config template (done)                 |
+| `tools/devstack-plugin-spire/lib/spire`                         | `install_spiffe_helper`, `_spire_start_helper`, extended `_spire_register_static_entries` (cinder/glance), wiring into `start_spire`/`stop_spire`/`cleanup_spire` (done) |
+| `tools/devstack-plugin-spire/plugin.sh`                         | `enable_service spiffe-helper-{nova,cinder,glance,neutron}` run_process units (done) |
+| `.github/workflows/devstack.yml`                                | New `devstack-full` job: Nova/Cinder/Glance/Neutron enabled, `continue-on-error: true` (non-blocking until proven stable) (done) |
+
+**Details:**
+
+`spiffe-helper` (github.com/spiffe/spiffe-helper) connects to the SPIRE
+agent's Workload API and writes an SVID/key/CA bundle to disk per workload,
+refreshing them on rotation — the same tool and config shape already used in
+the k8s deployment (`tools/k8s/keystone/base/statefulset-rs.yaml`,
+`tools/k8s/keystone/base/conf/helper.conf`), reimplemented here for devstack
+via `run_process` (one instance per service) instead of a k8s sidecar
+container. Registration entries extend Phase 1's table with Cinder and
+Glance, using the same `unix:uid:$uid` selector pattern (and the same
+single-node-shared-user caveat Phase 1 already documents for nova-compute):
+
+| Service | SPIFFE ID |
+| ------- | --------- |
+| Cinder  | `spiffe://{trust_domain}/service/cinder` |
+| Glance  | `spiffe://{trust_domain}/service/glance` |
+
+In single-user devstack every entry's `unix:uid` selector matches every
+helper (they all run as `$STACK_USER`), so the agent hands each helper ALL
+registered SVIDs. spiffe-helper without a pin writes the "default" SVID (the
+first in the list — arbitrary, e.g. the nova-compute/host entry), so each
+entry is created with a `hint` equal to its SPIFFE ID and each helper's
+config sets the matching `hint`, pinning it to its own service's SVID.
+
+**Unlike SPIRE's own releases** (which publish a `_sha256sum.txt` per
+asset), spiffe-helper's release workflow uploads only the tarballs with no
+companion checksum file — `install_spiffe_helper` pins the sha256 of the
+downloaded tarball inline instead (computed from the published release
+asset at implementation time), rather than skipping verification.
+
+The new `devstack-full` CI job is deliberately separate from the existing
+keystone-only `devstack` job (a full nova/cinder/glance/neutron stack is
+materially heavier — image download, instance boot, extra services — and
+shouldn't slow every PR's feedback loop) and runs with `continue-on-error:
+true` until proven stable across several runs. Its approach to the
+classic "does nova-compute work without `/dev/kvm` on a GitHub-hosted
+runner" question follows a validated precedent
+(`gophercloud/devstack-action`, which runs stock devstack defaults
+including `n-cpu` on plain `ubuntu-24.04`/`22.04` runners across several
+OpenStack releases with no `NOVA_USE_QEMU`/`LIBVIRT_TYPE` override) rather
+than forcing software emulation proactively — devstack's own
+compute-driver detection is expected to handle the no-KVM case itself. That
+same project's workflow is also the source of the apt-level package
+workarounds the new job applies (RabbitMQ/erlang version conflict, a
+runner-image `/etc/hosts` bug, stray postgresql/docker.io packages).
+
+**Explicitly out of scope:** changing any service's actual keystone auth
+transport to SPIFFE/mTLS (Phase 4, not started); per-instance `compute-vm`
+ephemeral SPIFFE entries or mapping rulesets (Phase 6); any wiring of the
+emitted certs into a Nova/Cinder/Glance/Neutron config file.
+
+**Verification:**
+
+```bash
+# After stack.sh completes:
+openstack compute service list
+openstack volume service list
+openstack network agent list
+
+spire-server entry show -socketPath /opt/stack/data/spire/server.sock
+# Should show service/cinder and service/glance alongside Phase 1's entries
+
+for pair in nova:nova-api cinder:cinder glance:glance neutron:neutron; do
+  svc=${pair%%:*}
+  systemctl is-active "devstack@spiffe-helper-$svc"
+  # The SPIFFE ID is in the URI SAN, not the Subject (C=US, O=SPIRE):
+  openssl x509 -in /opt/stack/data/spire/certs/$svc/tls.crt -noout -checkend 0
+  openssl x509 -in /opt/stack/data/spire/certs/$svc/tls.crt -noout -text \
+    | grep -q "URI:spiffe://{trust_domain}/service/${pair#*:}"
+done
+```
+
+---
+
+### Phase 1.6: Pilot keystonemiddleware's SPIFFE mTLS Transport (Gerrit 1005601, WIP)
+
+**Goal:** exercise Phase 3's already-merged keystone-rs internal SPIFFE
+listener end-to-end against a real client, ahead of Phase 4 landing for
+real. Pilots Phase 4's "Change 4.1" (SPIFFE mTLS transport for
+`auth_token`) as an explicitly WIP, unmerged Gerrit patch
+(https://review.opendev.org/c/openstack/keystonemiddleware/+/1005601,
+change 1005601 — the patch's own commit message frames it as "a POC
+demonstrating integration in devstack"), against **Nova only**, in the
+`devstack-full` CI job from Phase 1.5.
+
+**Prerequisites:** Phase 1 (SPIRE devstack plugin), Phase 1.5 (`devstack-full`
+job), Phase 3 (keystone-rs's internal SPIFFE listener — already merged, no
+`crates/` changes needed for this phase).
+
+**Changes (`devstack-full` job only — the plain keystone-only `devstack` job
+is untouched):**
+
+| File                            | Purpose                                                                                                    |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `devstack/lib/keystone-rs`       | `KEYSTONE_RS_SPIFFE_INTERNAL`/`KEYSTONE_RS_INTERNAL_PORT` tunables (default off); gated `pip_install spiffe protobuf` in `install_keystone_rs` (the WIP patch's `spiffe` extra — LIBS_FROM_GIT's editable install doesn't select extras, current devstack master no longer reads `PYTHON_PACKAGES`, and the only constraint-resolvable spiffe release, 0.1.4, omits `protobuf` from its install_requires); gated `[interface_internal]` iniset in `configure_keystone_rs`; gated `SPIFFE_ENDPOINT_SOCKET=unix://...` export in `start_keystone_rs`'s wrapper; gated `[mapping] cluster_salt` iniset, randomly generated per CI run; gated single-node `[distributed_storage]` iniset (node_id 0 self-bootstrap, loopback raft gRPC, dev_mode + env KEK, SPIFFE mTLS via `trust_domains` — raft gRPC has no plaintext mode) — the mapping provider is raft-only, so without it every `/v4/mappings` call 501s (done) |
+| `tools/devstack-plugin-spire/lib/spire` | `keystone/storage/node` entry (unix:uid selector) — the SVID the raft gRPC interceptor expects for storage peers (path prefix `/keystone/storage/`) (done) |
+| `.github/workflows/devstack.yml` | `devstack-full`: `KEYSTONE_RS_SPIFFE_INTERNAL=True`, `LIBS_FROM_GIT+=keystonemiddleware` pinned to the Gerrit patchset ref, `GLANCE_ENABLE_QUOTAS=False` (key-rs lacks the unified limits API — see "Known gaps"), `[[post-config\|$NOVA_CONF]]` block, n-api restart, mTLS verification steps, global `is_system` SPIFFE ruleset mapping nova-api's own SVID to the `service` role, positive (200) + negative (401) mapped-identity checks (done) |
+| `crates/api-types/src/error_conv.rs` | `MappingProviderError::NoMatchingRule`/`DisabledRuleset` now convert to `KeystoneApiError::UnauthorizedNoContext` (401) instead of falling into the non-exhaustive catch-all 500 — an SVID (or any mapping-authenticated caller) absent from a ruleset is an auth failure, not a server error (done) |
+
+**Why Nova only, why pinned to an exact patchset:** both sides of this wiring
+are unproven — the keystonemiddleware patch is WIP and may be reworked before
+merging. `KEYSTONEMIDDLEWARE_BRANCH=refs/changes/01/1005601/3` pins
+the exact patchset; bump it by hand if a newer patchset needs picking up.
+Keeping this to one service and one CI job (rather than a third job) limits
+blast radius while it's this unproven, and rides on `devstack-full`'s
+existing `continue-on-error: true`.
+
+**Wiring:**
+
+```ini
+# keystone-rs.conf (via KEYSTONE_RS_SPIFFE_INTERNAL=True)
+[interface_internal]
+tcp_address = 0.0.0.0:8081
+type = spiffe
+trust_domains = cloud.trust.domain
+```
+
+```ini
+# nova.conf, via local.conf's [[post-config|$NOVA_CONF]]
+[keystone_authtoken]
+spiffe_agent_socket = unix:///opt/stack/data/spire/agent.sock
+auth_url = https://127.0.0.1:8081
+```
+
+`www_authenticate_uri` is left pointing at the public `/identity` URL —
+only the back-channel `auth_url` moves to the internal mTLS listener. No
+`cafile` is set: the patch's `SpiffeHTTPAdapter` fetches the trust bundle
+from the same Workload API source as the client cert.
+
+**Authorization, not just transport.** An SVID authenticating at TLS carries
+no authorization meaning by itself — `authenticate_by_mapping` needs
+`mapping.cluster_salt` configured and a matching ruleset, or it fails closed
+(`NoMatchingRule`/`HmacDerivationFailed`). The CI job now configures both:
+
+```ini
+# keystone-rs.conf (via KEYSTONE_RS_SPIFFE_INTERNAL=True)
+[mapping]
+cluster_salt = <openssl rand -hex 32, generated fresh per CI run>
+
+# The mapping provider is raft-only (mapping-driver-raft reads
+# state.storage; without it every /v4/mappings call 501s with "mapping
+# provider requires distributed storage (raft)"), so the plugin also
+# brings up a single-node raft store: node_id 0 self-bootstraps,
+# loopback-only gRPC listener, dev_mode + env KEK. Raft gRPC has no
+# plaintext mode, so the section selects the SPIFFE mTLS variant
+# (SPIRE is running in this job, and the process already talks to the
+# agent for the internal listener): the raft interceptor accepts peer
+# SVIDs from the trust domain whose path starts with /keystone/storage/
+# or /ns/, and the spire plugin registers keystone/storage/node for
+# that. In a one-member cluster no gRPC traffic actually flows (commits
+# are local), but this is the shape a real cluster would use.
+[distributed_storage]
+dev_mode = true
+kek_provider = env
+node_id = 0
+node_cluster_addr = "http://127.0.0.1:8300"
+node_listener_addr = "127.0.0.1:8300"
+trust_domains = "cloud.trust.domain"
+path = "$DATA_DIR/keystone-rs/raft"
+```
+
+The node pins the SVID it presents for raft mTLS (`PathSvidPicker`): the
+first `allowed_peer_svids` entry's path when that list is set — a
+homogeneous cluster's nodes must each present an identity their peers
+allow, which is the cluster's shared storage identity (the k8s/skaffold
+deployment pins the shared `ns/default/sa/keystone` SVID this way) — or,
+when the list is empty, the registration convention
+`<spiffe_path_prefix>node` (what the devstack SPIRE entry above provides).
+Without the pin, a process matching several SPIRE entries would present
+whichever SVID the Workload API returned first, and a wrong pick fails
+peer validation; worse, the spiffe-rs crate retries a picker rejection
+silently forever (`NoSuitableSvid` is never logged), so an unregistered
+identity hangs storage init with no error. The SPIFFE API/admin listeners
+take the same pin via an explicit optional `svid_path` config key (devstack
+sets `/service/keystone`); when unset they present the Workload API's
+default SVID, which is what the k8s deployment relies on.
+
+```json
+// POST /v4/mappings/rulesets (admin token), after stack.sh
+{
+  "mapping": {
+    "mapping_id": "ci-spiffe-control-plane",
+    "domain_id": null,
+    "source": {"type": "spiffe", "trust_domain": "cloud.trust.domain"},
+    "domain_resolution_mode": {"type": "fixed"},
+    "enabled": true,
+    "rules": [{
+      "name": "nova-api-control-plane",
+      "match": {"all_of": [{"type": "condition", "equals": {
+        "claim": "spiffe.id",
+        "value": "spiffe://cloud.trust.domain/service/nova-api"
+      }}]},
+      "identity": {"user_name": "svid-nova-api", "is_system": true},
+      "authorizations": [{
+        "type": "system", "system_id": "all",
+        "roles": [{"id": "<service role id>", "name": "service"}]
+      }],
+      "groups": []
+    }]
+  }
+}
+```
+
+No `crates/` change was needed to make `is_system` actually take effect:
+`ValidatedSecurityContext::new_for_scope`'s `AuthenticationContext::Mapping`
+arm (`crates/core/src/auth.rs`) already upgrades an `is_system` rule's
+`Unscoped` scope to `System("all")` generically, for any mapping-authenticated
+source (SPIFFE included) — this is pre-existing, general infrastructure, not
+something added here. The role granted is `service` (least privilege — the
+same role `policy/auth/token/show.rego` already grants dedicated
+token-introspection access to), not `admin`.
+
+**Verification (devstack-full CI):**
+
+```bash
+# Internal listener actually started in SPIFFE mode:
+journalctl -u devstack@key-rs --no-pager | grep -q "SPIFFE mTLS"
+
+# Rejects unauthenticated clients:
+! curl -sf -k https://127.0.0.1:8081/v3
+
+# Accepts a real SVID (positive control). Must run as the devstack user,
+# NOT via sudo: the entries are pinned to its uid (unix:uid selector) and
+# the agent's "unix" workload attestor reads the caller's uid, so a root
+# fetch (uid 0) matches no entry and fails with "No identity issued ...
+# registered=false". A SPIFFE SVID carries its identity in a URI SAN, so
+# a hostname/IP check against 127.0.0.1 can never succeed (curl rejects a
+# perfectly valid SVID); the check verifies the server chain against the
+# trust bundle and skips only the hostname assertion, the same way the
+# ksm transport does. The fetch returns the workload's whole SVID set in
+# arbitrary order (svid.0.pem can be any entry), so select by URI SAN:
+spire-agent api fetch x509 -socketPath /opt/stack/data/spire/agent.sock -write /tmp/svid
+svid=""; for f in /tmp/svid/svid*.pem; do
+    if openssl x509 -in "$f" -noout -ext subjectAltName \
+        | grep -q "URI:spiffe://cloud.trust.domain/service/keystone"; then
+        svid="${f%.pem}"; break
+    fi
+done
+python3 -c '
+import ssl, sys, urllib.request
+ctx = ssl.create_default_context(cafile="/tmp/svid/bundle.0.pem")
+ctx.check_hostname = False
+ctx.load_cert_chain("'"$svid"'.pem", "'"$svid"'.key")
+opener = urllib.request.build_opener(
+    urllib.request.HTTPSHandler(context=ctx))
+sys.stdout.buffer.write(opener.open("https://127.0.0.1:8081/v3", timeout=10).read())
+'
+
+# nova-api's own auth_token back-channel actually uses it end-to-end:
+openstack compute service list
+
+# Mapped SVID identity actually gets real authz, not just transport:
+# nova-api's own SVID + a subject token -> 200 from the internal listener's
+# GET /v3/auth/tokens (service role, system scope, per the ruleset above).
+# cinder's SVID (unmapped) -> 401 (NoMatchingRule -> UnauthorizedNoContext),
+# proving the ruleset gatekeeps rather than mapping every workload to
+# system scope.
+```
+
+**Known gaps / workarounds (revisit in Phase 4):**
+
+- **Hostname assertion disabled in the ksm transport.** The WIP patch's
+  `SpiffeHTTPAdapter` sets `conn.assert_hostname = False` so the handshake
+  succeeds against an SVID (URI SAN only); the server chain is still
+  verified against the trust bundle fetched from the agent. Verifying the
+  *server's* SPIFFE ID (peer-cert URI SAN) against an expected value is
+  deliberate follow-up hardening, not part of the POC.
+- **Glance keystone quotas disabled in the job
+  (`GLANCE_ENABLE_QUOTAS=False`).** glance's keystone-quota path
+  (oslo.limit's `Enforcer`) queries Keystone's unified limits API
+  (`GET /v3/limits/model`) on every image upload; key-rs does not
+  implement that API yet, and with the Apache `/identity` proxy pointed
+  at key-rs the missing endpoint 500s the upload and aborts stack.sh.
+  Until key-rs implements unified limits, the job keeps glance on its
+  local quota tables.
+
+---
+
+### Phase 2: Vendor Data JWT API (keystone-rs)
+
+**Goal:** keystone-rs exposes a new endpoint that signs a JWT per VM instance.
+The JWT is signed with a dedicated attestation signing key, wholly separate
+from the domain OAuth2 signing key and served from its own JWKS endpoint (see
+"Attestation key isolation" below), and contains instance-scoped claims
+suitable for SPIFFE SVID construction.
+
+**Prerequisites:** Phase 1 (SPIRE available for integration testing), and
+Phase 3 — this endpoint lives on the internal SPIFFE interface (Phase 3's
+REST-routing work) and its ownership check relies on Phase 3's extended SVID
+claim flattening (`spiffe.host`, see Phase 3). The original phase ordering in
+this plan listed Phase 3 after Phase 2; in practice Phase 3's REST-wiring and
+claim-derivation work needs to land first, or at minimum land together with
+Phase 2 rather than strictly after it.
+
+**New external dependency:** this phase introduces a new keystone-rs →
+nova-api back-channel call (see "Ownership verification" under "Key design
+decisions" below) — keystone-rs did not previously call any OpenStack service
+API, and has no existing outbound-client or self-credential machinery to
+build this on (the closest precedents, `k8s_auth_client.rs` and
+`auth_plugin_http_client.rs`, are both reqwest-based HTTP clients but neither
+talks to an OpenStack service or holds a keystone-rs-as-caller credential —
+both the client and the credential are new). The call happens once per VM
+boot (on the `/v4/vendordata` request), so the added load is negligible, but
+it is a new runtime dependency with two consequences:
+
+- `/v4/vendordata` cannot verify placement if nova-api is unreachable from
+  keystone-rs (mitigated by `vendordata.verify_placement`, see below, which
+  lets operators disable the check and accept a weaker trust posture
+  instead). On a Nova-side error or timeout (as opposed to an explicit
+  ownership mismatch), the handler **fails closed** — it returns `503
+  Service Unavailable`, not a signed JWT — so a Nova outage degrades to "no
+  new SPIFFE identities issued," never to "identities issued without the
+  ownership check." Failing open here would silently reopen the exact gap
+  this fix closes.
+- **Auth deadlock prevention:** keystone-rs calls nova-api, which may itself
+  be calling back to keystone-rs via keystonemiddleware (Mode B) to validate
+  tokens. Under burst concurrent boot requests, this creates a circular
+  dependency risk: keystone workers blocked waiting on Nova while Nova workers
+  blocked waiting on keystone. The `nova_client` must use a **dedicated
+  tokio worker pool** with a **tight timeout** (default 2s, configurable),
+  and **connection pool limits** (max 10 concurrent, idle timeout 30s) to
+  prevent unbounded growth. The credential used should be a system-scoped
+  service token cached at startup to minimize Nova-side auth latency.
+- `server.hypervisor_hostname` is not visible to ordinary Nova API callers
+  (it's gated behind `os-extended-server-attributes`, normally admin-only),
+  so the credential keystone-rs authenticates to Nova with needs
+  admin/system-scoped Nova access. That credential can read cross-project
+  placement data for every instance in the cloud and should be treated with
+  the same operational rigor as the signing keys below — see the Security
+  Considerations table.
+
+**Changes to keystone-rs:**
+
+| File                                              | Purpose                                                                                                                                    |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/keystone/src/api/v4/vendordata.rs`        | Handler: `POST /v4/vendordata`                                                                                                             |
+| `crates/keystone/src/api/v4/spiffe_jwks.rs`       | Handler: `GET /v4/spiffe/{domain_id}/jwks` — dedicated attestation-key JWKS endpoint (new, see "Attestation key isolation")                |
+| `crates/keystone/src/api/v4/mod.rs`               | Module wiring into `/v4` router                                                                                                            |
+| `crates/core-types/src/vendordata.rs`             | Request/response types                                                                                                                     |
+| `crates/core/src/api/auth.rs`                     | JWT signing method using the dedicated attestation key                                                                                    |
+| `crates/core/src/oauth2_key.rs`                   | Existing OAuth2 signing-key rotation logic (Primary/Previous/Pending) — unchanged                                                          |
+| `crates/key-repository/src/asymmetric/*.rs`       | New, independent `KeyRole`/`ActiveKeys` instance for the attestation-key purpose — a **second key of the same generic shape**, not a new field on the existing one (see "Attestation key isolation") |
+| `crates/core/src/nova_client.rs`                  | New Nova API client + new keystone-rs-as-caller credential for ownership verification (Fix 1) — no prior OpenStack-service-client infrastructure exists to build on |
+| `policy/vendordata/create.rego`                   | OPA policy rule                                                                                                                             |
+| `doc/src/adr/0033-vendor-data-jwt.md`             | ADR for the endpoint design                                                                                                                 |
+
+**Endpoint contract:**
+
+**`POST /v4/vendordata`**
+
+Auth: Nova-compute presents its SPIFFE SVID. Keystone-rs authenticates and
+authorizes the request. Nova's `vendor_data_url` makes a POST request with
+instance metadata in the body (`project_id`, `instance_id`).
+
+Request body (sent by Nova, per `vendor_data_url` spec). Nova includes
+project_id and instance_id in the POST body:
+
+```json
+{
+  "project_id": "a1b2c3d4",
+  "instance_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+Response body (`201 Created`):
+
+```json
+{
+  "spiffe_jwt": {
+    "algorithm": "ES256",
+    "jti": "7f9c9e0a-3b1d-4c2e-9a5f-1e2d3c4b5a6f",
+    "token": "<JWT string>",
+    "expires_at": "2026-08-12T10:30:00Z"
+  }
+}
+```
+
+The JWT payload (after base64url decoding):
+
+```json
+{
+  "iss": "https://keystone:8444/v4/spiffe/default",
+  "aud": "spiffe-attestation",
+  "exp": 1723456800,
+  "iat": 1723456500,
+  "jti": "7f9c9e0a-3b1d-4c2e-9a5f-1e2d3c4b5a6f",
+  "sub": "vm:550e8400-e29b-41d4-a716-446655440000",
+  "openstack": {
+    "project_id": "a1b2c3d4",
+    "instance_id": "550e8400-e29b-41d4-a716-446655440000",
+    "spiffe_role": "compute-vm"
+  }
+}
+```
+
+**Key design decisions:**
+
+- **Attestation key isolation:** the signing key used here is *not* the same
+  key used for OAuth2 access tokens, and is not merely tagged differently
+  within the same JWKS document. keystone-rs's existing OAuth2 key management
+  (`crates/core/src/oauth2_key.rs`, ADR 0026) models exactly one signing
+  purpose with two rotation slots (current + previous, for overlap during
+  rotation) — it has no notion of two *concurrently active* keys for two
+  *different* purposes. An earlier draft of this fix proposed publishing a
+  second key in the same JWKS set tagged with a custom `"use": "spiffe-attest"`
+  value; that was dropped for two reasons: (1) it still requires generalizing
+  the key-repository's rotation model to a second purpose — it is not the
+  drop-in reuse it sounds like — and (2) it would make a JWK metadata field
+  (`use`, which per RFC 7517 is meant to distinguish signature vs. encryption
+  keys, not application-level purpose) the actual security boundary
+  separating "can forge API tokens" from "can mint VM identities," which is a
+  fragile place to put that boundary — a validator that ignores or
+  mis-handles `use` would silently accept the wrong key.
+
+  Instead, the attestation key is a **second, independent per-domain key**
+  (its own generation/rotation lifecycle, reusing the same generic
+  Primary/Previous/Pending rotation shape as the OAuth2 key, just as a
+  separate instance) served from its **own dedicated endpoint**,
+  `GET /v4/spiffe/{domain_id}/jwks`, wholly distinct from
+  `/v4/oauth2/{domain_id}/jwks`. Trust separation then comes from endpoint
+  separation, not from a metadata flag: the SPIRE server plugin (Phase 5)
+  only ever fetches the attestation JWKS URL and never sees, and therefore
+  can never be tricked into trusting, the OAuth2 signing key. A single key
+  compromise no longer grants both API-token forgery and the ability to mint
+  arbitrary VM node identities — see the Security Considerations table for
+  further discussion of this blast-radius separation.
+- Fixed `aud: "spiffe-attestation"` prevents JWT misuse for any other purpose.
+- **Ownership verification (compute-host ↔ instance binding):** Nova-compute's
+  SPIFFE SVID now carries a per-host identity
+  (`spiffe://{trust_domain}/service/nova-compute/host/{hostname}`, Phase 1).
+  Before signing, the handler reads the `spiffe.host` claim (derived from the
+  `{hostname}` path segment by Phase 3's extended claim flattening — see
+  Phase 3 for why this has to be a derived claim rather than something read
+  live off the SVID: SPIRE selectors are a server-side attestation concept
+  and are never present in the issued X.509 SVID itself, so there is no
+  "selector" to read off the wire here, only the URI path string). Having
+  the hostname, the OPA policy check (already required to authorize the
+  request at all) runs first — cheap and local — and only if
+  that passes does the handler call Nova, using keystone-rs's own service
+  credentials (admin/system-scoped — `server.hypervisor_hostname` is gated
+  behind `os-extended-server-attributes` and not visible to ordinary
+  callers), to confirm `server.tenant_id == project_id` and
+  `server.hypervisor_hostname == caller_host` for the requested `instance_id`.
+  A mismatch is rejected with `403 Forbidden`; a Nova-side error or timeout is
+  rejected with `503 Service Unavailable` (fail closed — see "New external
+  dependency" above). Without this check, any compute host's shared SVID
+  could request (and receive) a signed attestation for an instance it
+  doesn't run, since Phase 1's SPIFFE ID alone doesn't bind the caller to a
+  specific host/instance pairing. This is controlled by a new config flag,
+  `vendordata.verify_placement` (default `true`). Operators can set this to
+  `false` to skip the Nova call, but doing so accepts a materially weaker
+  trust posture: compute-host claims about `project_id`/`instance_id` are
+  then trusted unverified, and a compromised compute host can request
+  attestation for arbitrary instances.
+- Short TTL range (`ttl_seconds`, accepted range 60–600, default 300). 60
+  seconds is too tight for cold VM boot (Nova calls API → metadata publishes →
+  VM boots → cloud-init reads → spire-agent runs). The SPIRE server plugin
+  enforces expiry during attestation regardless. Cap at
+  `[oauth2] access_token_lifetime_minutes` (15 min default) as a safety bound.
+- `jti` is a **freshly generated random identifier per issued JWT**, distinct
+  from `instance_id` (previous drafts of this plan set `jti = instance_id`,
+  but that collides with legitimate re-attestation — see Phase 5/Phase 6
+  "Re-attestation" below: two vendordata calls for the same instance, e.g.
+  original boot and a later rebuild, must produce *different* `jti` values so
+  the SPIRE server plugin's replay check can tell a fresh, legitimate
+  re-attestation apart from a true replay of the same token).
+  `instance_id`/`project_id` remain in the `openstack` claims for identity
+  construction; `jti` is purely an anti-replay token identifier.
+- The `expires_at` field in the HTTP response is the human-readable ISO 8601
+  equivalent of the JWT `exp` claim. The actual expiry validation uses the unix
+  timestamp in the JWT payload itself.
+- The endpoint lives on the **internal interface** (port 8444, SPIFFE mTLS)
+  since Nova-compute authenticates with its SPIFFE SVID. Nova's
+  `vendor_data_url` call path uses keystonemiddleware for the HTTP call, which
+  attaches the SVID.
+- `project_id` and `instance_id` come from Nova's POST body — no Nova API lookup
+  needed. Keystone-rs simply uses these to construct the JWT claims.
+
+**Unit tests (minimum 3 per handler convention from AGENTS.md):**
+
+1. Valid Nova-compute SVID + positive policy → `201 Created`, JWT returned
+2. Valid SVID + negative policy (wrong scope) → `403 Forbidden`
+3. Invalid/missing SVID → `401 Unauthorized`
+4. Valid SVID, correct signature, but hostname/project_id mismatch against
+   the Nova record → `403 Forbidden` (ownership verification, Fix 1; only
+   exercised when `vendordata.verify_placement` is enabled)
+
+**Verification:**
+
+```bash
+# From a SPIRE-attested nova-compute workload:
+curl -X POST --cert /tmp/spiffe/tls.crt \
+     --key /tmp/spiffe/tls.key \
+     --cacert /etc/spire/conf/server/ca.crt \
+     https://localhost:8444/v4/vendordata \
+     -H "Content-Type: application/json" \
+     -d '{"project_id": "default", "instance_id": "test-123"}'
+# The response `expires_at` is the human-readable ISO 8601 echo of the
+# unix-timestamp `exp` claim inside the JWT. Verification uses the JWT payload `exp`.
+```
+
+---
+
+### Phase 3: keystone-rs Internal SPIFFE Listener Configuration
+
+**Goal:** OpenStack services connect to keystone-rs via the internal SPIFFE mTLS
+interface, presenting SPIFFE x509 SVIDs. Services are mapped to Keystone
+identities through the ADR 0020 `SpiffeTrustResource` mapping engine.
+
+**Prerequisites:** Phase 1 (SPIRE trust domain available).
+
+**Changes to keystone-rs:**
+
+| File                                  | Purpose                                                                                        |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `crates/core/src/common/spiffe_id.rs` | `SpiffeId::path_claims()` — strict path-segment parser producing `SpiffePathMatch` (done)      |
+| `crates/core/src/api/auth.rs`         | SVID extraction → `SpiffeTrustResource` → mapping engine; claim flattening derives path-segment claims via `path_claims()` (done) |
+| `crates/keystone/src/api/v4/vendordata.rs` | Refactored to delegate its own host-parsing helper to `SpiffeId::path_claims()` (done)     |
+
+**Current state (updated once Phase 2's merge and this phase's own work
+landed):** The internal SPIFFE listener already serves the REST API router
+— `spawn_internal_listener` in `crates/keystone/src/bin/keystone.rs` reuses
+the same axum `Router` built for the public/admin listeners and calls
+`spiffe_tls::start_axum_app(...)` with `Interface::Internal`. This was not
+gRPC-only as an earlier draft of this plan assumed; **no listener-wiring
+work was needed for this phase**. SPIFFE TLS infrastructure for REST is in
+`spiffe_tls.rs` (`start_axum_app`), trust domain validation is in
+`spiffe_common.rs`. Config support (`crates/config/src/interface.rs`,
+`listener.rs`) for `interface_internal`'s `type = "spiffe"` /
+`trust_domains` also already existed, with a real deployment example at
+`tools/k8s/keystone/base/conf/keystone.conf` (note: that config uses port
+`8215`, not the `8444` used illustratively below and elsewhere in this
+plan — an existing inconsistency between the plan doc and the k8s overlay,
+left unreconciled since devstack's own `local.conf` wiring is Phase 6).
+
+What this phase actually delivered was the claim-derivation work: SVID
+authentication (`crates/core/src/api/auth.rs`'s `flat_spiffe_claims`)
+previously only ever produced `spiffe.id`/`spiffe.trust_domain`. It now
+additionally derives `spiffe.host` (from
+`.../service/nova-compute/host/{hostname}`) and
+`spiffe.project_id`/`spiffe.instance_id` (from
+`.../project/{pid}/instance/{iid}`) via `SpiffeId::path_claims()`
+(`crates/core/src/common/spiffe_id.rs`), rejecting a malformed instance of
+either pattern as an authentication failure (401) rather than silently
+emitting an empty claim. `crates/keystone/src/api/v4/vendordata.rs`'s
+narrower, pre-existing one-off host parser (added in Phase 2, ahead of this
+work) now delegates to the same shared parser instead of duplicating it.
+
+**Listener configuration (`[interface_internal]` section, actual syntax —
+this plan's illustrative `[interface:internal]`/`bind_host`/`bind_port`
+snippet below predates and doesn't match the real TOML section/field
+names):**
+
+```ini
+[interface_internal]
+tcp_address = 0.0.0.0:8444
+type = "spiffe"
+trust_domains = "cloud.trust.domain"
+```
+
+The keystone-rs process itself presents a SPIFFE SVID (fetched from the local
+SPIRE agent during startup, via `spiffe-rustls`). Incoming connections present
+their SVID. The server validates:
+
+1. SVID was issued by a CA within the trust domain (via `spiffe-rustls`
+   authorizer)
+2. SVID is not expired
+3. Authorization is decided by the mapping engine, not listener-level filtering
+
+Authentication context is extracted from the SVID URI:
+
+- `spiffe://cloud.trust.domain/service/nova-api` → control-plane service identity
+- `spiffe://cloud.trust.domain/service/nova-compute/host/{hostname}` → per-host
+  compute service identity (see Phase 1 "Per-host nova-compute registration")
+- `spiffe://cloud.trust.domain/project/{pid}/instance/{iid}` → VM workload
+
+These are fed through the ADR 0020 mapping engine with claim source `spiffe`.
+Today that's just `spiffe.id` (full SPIFFE URI) and `spiffe.trust_domain`
+(derived from the URI by the existing claim-flattening code). The mapping
+engine itself only supports regex *matching*, not capturing a substring out
+of a matched claim for use in a binding (`crates/core/src/mapping/engine.rs`'s
+`extract_claim_values` only expands a whole `${claims.<key>}` token) — so any
+value a binding needs out of the SPIFFE ID path (a VM's `project_id`, or
+Fix 1's compute-host `hostname`) has to be a claim keystone-rs derives
+*itself* at extraction time, the same way `spiffe.trust_domain` already is,
+not something a mapping rule can pull out of `spiffe.id` on the fly. Phase 2
+and Phase 6 both rely on this: extending `auth.rs`'s claim flattening to also
+emit `spiffe.project_id`, `spiffe.instance_id` (from the
+`.../project/{pid}/instance/{iid}` VM-workload path), and `spiffe.host` (from
+the `.../nova-compute/host/{hostname}` path) is in scope for this phase, not
+something Phase 2/6 can assume already exists. The path extractor must use
+**strict path-segment matching**, not simple string splitting or unanchored
+regexes: it should validate the URI scheme and trust domain prefix, handle
+URL-encoded path segments correctly, and **reject malformed URIs** (trailing
+slashes, unexpected extra segments, mismatched prefixes). A malformed
+`spiffe.id` that doesn't match any known pattern should result in
+authentication failure (401), not an empty claim value — this prevents OPA/Rego
+rules from silently matching on absent claims.
+
+**Verification:**
+
+```bash
+# Verify the keystone-rs internal SPIFFE listener serves REST API:
+curl --cert /tmp/spiffe/tls.crt \
+     --key /tmp/spiffe/tls.key \
+     --cacert /etc/spire/conf/server/ca.crt \
+     https://localhost:8444/v3/users
+# keystone-rs logs should show:
+# "SpiffeTlsAccepted(spiffe://cloud.trust.domain/...)"
+```
+
+---
+
+### Phase 4: Patched keystonemiddleware (Gerrit, External)
+
+**Goal:** OpenStack Python services use SPIFFE mTLS for the keystonemiddleware
+back-channel to keystone-rs. JWT access tokens can be validated offline without
+a back-channel call.
+
+**Prerequisites:** Phase 1 (SPIRE), Phase 3 (keystone-rs mTLS interface).
+
+**Target repo:** `openstack/python-keystonemiddleware` on Gerrit.
+
+**Two separate Gerrit changes.** These are orthogonal and landed independently:
+
+#### Change 4.1: SPIFFE mTLS transport (auth_token)
+
+**Piloted (WIP, unmerged) in Phase 1.6**, against Nova only, in the
+`devstack-full` CI job — see that section for the actual Gerrit ref pinned,
+the real devstack wiring, and CI verification. This subsection remains the
+aspirational/illustrative description of the change; Phase 1.6 is the
+concrete, currently-implemented CI exercise of it.
+
+| File                                      | Purpose                                 |
+| ----------------------------------------- | --------------------------------------- |
+| `keystonemiddleware/_spiffe_transport.py` | SPIFFE SVID fetcher + HTTP transport    |
+| `keystonemiddleware/auth_token.py`        | New `spiffe_agent_socket` config option |
+
+**Behavior:**
+
+1. On startup, keystonemiddleware connects to the SPIRE agent socket
+2. Fetches a workload X.509 SVID (short-lived, SPIRE-managed rotation)
+3. Wraps `requests.Session` with `urllib3` TLS config using SVID as client cert
+4. All back-channel calls (`/v3/OS-TOKENS`, user info, project info) go over
+   mTLS
+
+#### Change 4.2: JWT offline validation filter (independent Paste filter)
+
+| File                                           | Purpose                                   |
+| ---------------------------------------------- | ----------------------------------------- |
+| `keystonemiddleware/jwt_offline.py`            | ADR 0026 §6 `KeystoneNativeJwtMiddleware` |
+| `setup.cfg`                                    | Paste filter entry point                  |
+| `doc/source/conf/configuration/auth_token.rst` | Documentation                             |
+
+**Behavior:**
+
+The `KeystoneNativeJwtMiddleware` is a separate Paste filter that sits **in
+front of** `keystonemiddleware.auth_token`. It intercepts
+`Authorization: Bearer {JWT}` requests:
+
+1. Fetches JWKS from `keystone_jwks_url` (cached with 300s TTL)
+2. Verifies JWT signature (ES256/RS256)
+3. Checks `aud` matches `expected_audience`
+4. Checks `iss` against `expected_issuers` allowlist
+5. Checks `exp` and `nbf`
+6. If valid: injects `openstack_context` into WSGI environment, short-circuits
+   past `auth_token`
+7. If not a JWT: falls through to the standard `auth_token` filter (Fernet
+   validation)
+
+Note what this filter does **not** do: it does not check `jti` against any
+revocation list. Mode C (see "Token Validation Migration Path" below) is
+explicitly a fully offline validation path — the filter never calls back to
+keystone-rs except to refresh its cached JWKS — so there is no live source to
+check a `jti` against without reintroducing a back-channel call and
+contradicting that design goal. Compromised or misused access tokens are
+instead handled by relying on **short TTL only**
+(`access_token_lifetime_minutes`, 15 min default per ADR 0026): a
+compromised token is only usable for the remainder of its (short) lifetime.
+There is no real-time revocation in Mode C. For immediate revocation needs,
+use Mode B (SPIFFE mTLS + Fernet, which does hit keystone-rs per request)
+rather than Mode C.
+
+**New keystonemiddleware configuration (`keystone_authtoken` section):**
+
+```ini
+[keystone_authtoken]
+www_authenticate_uri = https://keystone:8444/v3
+auth_url = https://keystone:8444/v3
+
+# --- NEW: SPIFFE mTLS transport (Change 4.1) ---
+spiffe_agent_socket = /tmp/spire-ci-test-harness/agent.sock
+
+# --- NEW: JWT offline validation (Change 4.2) ---
+keystone_jwks_url = http://keystone:8080/v4/oauth2/default/jwks
+keystone_signing_algorithm = ES256
+keystone_expected_audience = openstack-apis:default
+keystone_expected_issuers = https://keystone:8444/v4/oauth2/default
+```
+
+**Paste Deploy wiring (`api-paste.ini`):**
+
+```ini
+[pipeline:osapi_compute]
+pipeline = keystonemiddleware_jwt_offline authtoken keystonecontext oscomputeapp
+
+[filter:keystonemiddleware_jwt_offline]
+paste.filter_factory = keystonemiddleware.jwt_offline:filter_factory
+jwks_url = http://keystone:8080/v4/oauth2/default/jwks
+signing_algorithm = ES256
+expected_audience = openstack-apis:default
+```
+
+**Verification in devstack:**
+
+Add to `local.conf`:
+
+```ini
+python_keystonemiddleware_git = https://github.com/<user>/python-keystonemiddleware
+python_keystonemiddleware_branch = spiffe-mtls-transport
+# For JWT offline filter:
+python_keystonemiddleware_git = https://github.com/<user>/python-keystonemiddleware
+python_keystonemiddleware_branch = jwt-offline-validation
+```
+
+After `stack.sh`:
+
+```bash
+# Check nova-api logs for SVID loading:
+grep -i "SVID loaded from" /var/log/nova/nova-api.log
+# Should show SVID fetch and mTLS connections
+
+# Verify JWT offline validation works:
+# Get a JWT from keystone-rs OAuth2 /token endpoint, then:
+curl -H "Authorization: Bearer <JWT>" http://localhost:8774/v2.1/servers/detail
+# Should succeed without keystone-rs receiving the validation request
+```
+
+---
+
+### Phase 5: SPIRE JWT Node Attestor Plugins (External Go Repo)
+
+**Goal:** VMs boot with a keystone-rs JWT in vendor_data, auto-attest to SPIRE
+server, and receive a project-scoped SPIFFE SVID.
+
+**Prerequisites:** Phase 1 (SPIRE), Phase 2 (vendor data JWT + JWKS).
+
+**Target repo:** New Go repository `spire-jwt-keystone-plugins`.
+
+**Plugin architecture:**
+
+SPIRE's node attestor interface requires both a server plugin (verifies
+attestation data, constructs identity) and an agent plugin (reads credential,
+streams to server).
+
+**Server plugin (`jwt_keystone_attestor`):**
+
+| File                                | Purpose                                                    |
+| ----------------------------------- | ---------------------------------------------------------- |
+| `server/jwt_keystone/main.go`       | `NodeAttestor` interface implementation                    |
+| `server/jwt_keystone/jwks_cache.go` | JWKS fetcher + validator (HTTP GET, 300s cache, ES256)     |
+| `server/jwt_keystone/config.go`     | SPIFFE config for SPIRE plugin (`Config`, `New`, `Attest`) |
+| `server/jwt_keystone/jti_cache.go`  | Short-lived consumed-`jti` cache (replay protection)       |
+
+Config:
+
+```json
+{
+  "jwks_url": "http://keystone:8080/v4/spiffe/default/jwks",
+  "audience": "spiffe-attestation",
+  "trust_domain": "cloud.trust.domain",
+  "spiffe_path_prefix": "/project",
+  "tls": {
+    "ca_file": "/etc/spire/conf/server/ca.crt"
+  }
+}
+```
+
+`jwks_url` points at the **dedicated attestation JWKS endpoint**
+(`/v4/spiffe/{domain}/jwks`, see Phase 2's "Attestation key isolation"), not
+the general OAuth2 JWKS endpoint. The plugin never fetches or sees the OAuth2
+signing key at all, so there is no metadata flag to check and nothing to get
+wrong: a JWT signed with the OAuth2 key simply has no matching `kid` in the
+JWKS document this plugin ever loads. This replaces an earlier `use`-tag-based
+design (see Phase 2) that would have needed the plugin to actively check a
+`use` field on a shared JWKS — endpoint separation removes that failure mode
+entirely.
+
+`Attest` flow:
+
+1. Receive raw JWT bytes from attestation stream
+2. Parse JWT, extract `kid`
+3. Fetch the attestation JWKS from keystone-rs's dedicated endpoint (300s
+   cache, same cache discipline as ADR 0026 §3's OAuth2 JWKS)
+4. Verify signature (ES256, matching keystone-rs `signing_algorithm`) against
+   the matching `kid` in that JWKS — reject if no match
+5. Verify `aud == "spiffe-attestation"`, verify `exp`
+6. **Replay/re-attestation handling** (see Phase 6a "Re-attestation and
+   garbage collection" for the full rationale): check the JWT's `jti` against
+   a short-lived consumed-`jti` cache, self-expiring at the JWT's own `exp`
+   (bounded by the JWT's max 600s TTL, so the cache never needs entries older
+   than that). **This cache must be backed by SPIRE's shared registration
+   datastore (the same store backing the registration entries below), not
+   per-process memory** — SPIRE servers are commonly run with multiple HA
+   replicas behind one datastore, and an in-memory cache would let the same
+   JWT be replayed against a different server node within its TTL window,
+   silently defeating this check.
+   - If `jti` is already present in the cache → **reject** (true replay: the
+     exact same token was already used to attest).
+   - Otherwise, record `jti` in the cache and continue. Note this cache is
+     about token reuse, not SPIFFE-ID reuse — a *different*, freshly-minted
+     JWT for the same instance (e.g. after a rebuild) has a different `jti`
+     and is not blocked here.
+    - Construct the target SPIFFE ID
+      (`spiffe://cloud.trust.domain/project/{project_id}/instance/{instance_id}`)
+      and query the registration DB for an existing entry.
+      - No existing entry → create it (first attestation for this instance).
+      - An existing entry, but this JWT's `jti` was unconsumed (fresh,
+        valid token) → treat as **legitimate re-attestation**: delete the
+        stale entry (revoking the old SVID for that identity) and create a
+        new one — i.e. *supersede* rather than reject. This covers Nova
+        lifecycle events that reuse the same `instance_id` (rebuild, evacuate,
+        cold migration), each of which triggers a fresh `vendor_data_url` call
+        and a new JWT with a new `jti`.
+      - **Race condition mitigation:** the query-delete-create sequence above
+        must be wrapped in a **single database transaction** (or distributed
+        lock) scoped to the `spiffe_id` key. Without this, two simultaneous
+        attestation requests for the same instance hitting different SPIRE
+        Server replicas (e.g., network retry + original request) can both pass
+        the initial existence check, attempt separate deletes, and diverge —
+        producing duplicate entries, lost-writes, or a stale entry surviving
+        the supersede. The transaction ensures the supersede is an atomic
+        per-`spiffe_id` operation regardless of replica fan-out.
+7. Construct SPIFFE ID:
+   `spiffe://cloud.trust.domain/project/{project_id}/instance/{instance_id}`
+8. Return selectors:
+   - `jwt_ks:project:{project_id}`
+   - `jwt_ks:instance:{instance_id}`
+   - `jwt_ks:role:{spiffe_role}`
+
+These selectors are stored on the SPIRE registration entry and are
+SPIRE-internal metadata (available to SPIRE-side entry queries/policy, and
+to the `x509pop`/registration tooling in this plan) — they do **not** flow
+through to the issued SVID or become visible to keystone-rs's mapping engine
+over mTLS. Phase 6's mapping rules derive `project_id` independently, by
+parsing the SPIFFE ID path itself (see Phase 3 and Phase 6 below), not from
+these selectors.
+
+This design still depends on Fix 1 (compute-host ↔ instance ownership
+verification in Phase 2) to prevent unauthorized minting in the first place —
+the supersede logic here only governs what SPIRE does with a JWT it has
+already decided is validly signed and correctly scoped. Without Fix 1, an
+attacker with a compute-host SVID could get a JWT minted for an
+instance/project it doesn't own and use the same supersede path to pre-empt
+(overwrite) that instance's legitimate SPIFFE identity.
+
+**Agent plugin (`jwt_keystone_attestor`):**
+
+| File                           | Purpose                                 |
+| ------------------------------ | --------------------------------------- |
+| `agent/jwt_keystone/main.go`   | `NodeAttestor` interface implementation |
+| `agent/jwt_keystone/config.go` | SPIFFE plugin config                    |
+
+Config:
+
+```json
+{
+  "jwt_path": "/var/run/nova/vendor_data.json",
+  "jwt_key": "spiffe_jwt.token"
+}
+```
+
+The `jwt_path` is the vendor_data.json file injected by nova-compute. On the
+compute host, `/var/run/nova/vendor_data.json` is the standard location. The
+`jwt_key` is a dotted path into nested JSON: the plugin reads
+`response["spiffe_jwt"]["token"]`. The key name matches the
+`vendor_data_key_name` config in Nova.
+
+`Attest` flow:
+
+1. Read `jwt_path` (vendor_data.json injected by nova-compute)
+2. Extract JWT string from the JSON key `jwt_key`
+3. Return raw JWT bytes as attestation data
+4. SPIRE agent streams it to the server via the node attestor channel
+
+**Build:**
+
+```makefile
+# Makefile
+# SPIRE plugins are standalone gRPC executables using HashiCorp go-plugin,
+# not CGO .so shared libraries. The .so approach requires identical Go
+# compiler/toolchain versions between plugin and SPIRE server, causing
+# hard-to-debug load panics on SPIRE upgrades.
+server-plugin:
+	go build -o dist/jwt_keystone_server nodeattestor \
+		server/jwt_keystone/main.go
+
+agent-plugin:
+	go build -o dist/jwt_keystone_agent nodeattestor \
+		agent/jwt_keystone/main.go
+```
+
+**Verification:**
+
+```bash
+# Boot a VM with vendor_data containing a JWT from Phase 2 endpoint
+# SPIRE server should log:
+# "NodeAttestor (jwt_keystone): Successfully attested node
+#   spiffe://cloud.trust.domain/project/{pid}/instance/{iid}"
+
+# Inside the VM, verify SVID:
+curl --unix-socket /tmp/spire-ci-test-harness/agent.sock \
+  -H 'Content-Type: application/json' \
+  -d '{"spiffe_id": "spiffe://cloud.trust.domain/test"}' \
+  http://localhost/WorkloadAPI/FetchX509Certificate
+# SVID SAN should be: spiffe://cloud.trust.domain/project/.../instance/...
+```
+
+---
+
+### Phase 6: Integration, Policy Mapping, and DevStack Full Stack
+
+**Goal:** End-to-end working deployment in devstack. Nova-compute injects JWT
+into vendor_data, VM attests to SPIRE, gets SVID, calls OpenStack APIs.
+
+**Endpoint location:** The `/v4/vendordata` endpoint lives on the **internal
+interface** (port 8444, SPIFFE mTLS) so Nova-compute authenticates with its
+SPIFFE SVID. Nova's POST body includes `project_id` and `instance_id` — no Nova
+API lookup needed.
+
+**keystone-rs SPIFFE mapping rules (ADR 0020 configuration):**
+
+A mapping ruleset that handles the two categories of incoming SPIFFE identities:
+
+**Service accounts (static mapping):**
+
+```json
+POST /v4/rbac/mapping/rulesets
+{
+  "ruleset": {
+    "name": "openstack-service-accounts",
+    "priority": 100,
+    "rules": [
+      {
+        "name": "nova-api",
+        "matches": {
+          "all": [
+            {"claim": "spiffe.id", "match": "exact",
+             "value": "spiffe://cloud.trust.domain/service/nova-api"}
+          ]
+        },
+        "binding": {
+          "identity_mode": "local",
+          "user_id": "svc-nova-api",
+          "user_name": "nova-api",
+          "roles": ["service"]
+        }
+      },
+      {
+        "name": "neutron",
+        "matches": {
+          "all": [
+            {"claim": "spiffe.id", "match": "exact",
+             "value": "spiffe://cloud.trust.domain/service/neutron"}
+          ]
+        },
+        "binding": {
+          "identity_mode": "local",
+          "user_id": "svc-neutron",
+          "user_name": "neutron",
+          "roles": ["service"]
+        }
+      }
+    ]
+  }
+}
+```
+
+**VM instance accounts (dynamic/ephemeral mapping):**
+
+The `compute-vm` role is assigned to ephemeral VM identities. It grants VMs
+limited API access scoped to their project. The SPIFFE ID contains the project
+and instance scope, so the mapping engine can extract these from the URI.
+
+```json
+{
+  "ruleset": {
+    "name": "nova-vm-instances",
+    "priority": 200,
+    "rules": [
+      {
+        "name": "vm-instance",
+        "matches": {
+          "all": [
+            {
+              "claim": "spiffe.id",
+              "match": "prefix",
+              "value": "spiffe://cloud.trust.domain/project/"
+            }
+          ]
+        },
+        "binding": {
+          "identity_mode": "ephemeral",
+          "user_name": "${claims.spiffe.id}",
+          "project_id": "${claims.spiffe.project_id}",
+          "roles": ["compute-vm"]
+        }
+      }
+    ]
+  }
+}
+```
+
+The `roles`: `[\"compute-vm\"]` assignment grants VMs a default
+limited-privilege role scoped to their project. The `spiffe.id` claim in the
+binding resolves to the full SPIFFE URI, which is extracted into user_name.
+`spiffe.project_id` is **not** a SPIRE selector reaching the mapping engine —
+selectors live only in SPIRE's registration entries and are never present on
+the issued SVID. It's a claim keystone-rs derives itself by parsing the
+`{project_id}` path segment out of the `spiffe.id` URI at extraction time
+(see Phase 3's extended claim flattening), the same mechanism Fix 1 uses to
+get `spiffe.host` for compute-host ownership verification.
+
+**Full `local.conf` for end-to-end devstack deployment:**
+
+```ini
+[[local|localrc]]
+ADMIN_PASSWORD=password
+DATABASE_PASSWORD=password
+RABBIT_PASSWORD=password
+SERVICE_PASSWORD=$ADMIN_PASSWORD
+
+# Core OpenStack services
+enable_service mysql,rabbit,key,n-api,n-crt,n-sch,c-sch,c-api,neutron-server
+disable_service q-svc
+disable_service horizon
+
+# Keystone-rs (replaces python keystone)
+enable_plugin key-rs https://github.com/openstack-experimental/keystone
+enable_service key-rs
+
+# SPIRE
+enable_plugin spire https://github.com/openstack-experimental/keystone \
+                 --branch main \
+                 --subdirectory tools/devstack-plugin-spire
+enable_service spire
+SPIRE_TRUST_DOMAIN=cloud.trust.domain
+
+# Nova: fetch vendor_data JWT from keystone-rs per-instance
+nova_conductor_config += [[nova_conductor]]
+nova_conductor_config += vendor_data_url = https://keystone:8444/v4/vendordata
+nova_conductor_config += vendor_data_key_name = spiffe_jwt
+keystone_rss_internal_config += [keystone]
+
+# Patched keystonemiddleware (two separate Gerrit changes)
+python_keystonemiddleware_git=https://github.com/<user>/python-keystonemiddleware
+python_keystonemiddleware_branch=spiffe-mtls-transport
+# After landing the JWT offline filter, update to that branch:
+# python_keystonemiddleware_branch=jwt-offline-validation
+```
+
+The `vendor_data_url` option causes Nova-compute to POST the instance metadata
+(`project_id`, `instance_id`) to the configured URL. The response body becomes
+the content of `/vendor_data.json` in the VM guest. The response JSON must match
+the key expected by Nova's `vendor_data_key_name` (default `spiffe_jwt`). No
+Nova code changes required.
+
+**Integration test scenarios:**
+
+| #   | Scenario                               | Expected Outcome                                                      |
+| --- | -------------------------------------- | --------------------------------------------------------------------- |
+| T1  | Boot VM, check vendor_data has JWT     | JWT present, decodes, claims match                                    |
+| T2  | VM spire-agent attests using JWT       | SVID issued: `spiffe://domain/project/{pid}/instance/{iid}`           |
+| T3  | VM workload calls nova-api with SVID   | 200, SVID mapped to ephemeral identity                                |
+| T4  | Nova-api talks to keystone-rs via mTLS | Back-channel encrypted + mTLS authenticated                           |
+| T5  | JWT-bearing request to nova-api        | Validated offline by keystonemiddleware_jwt_offline, no keystone call |
+| T6  | Fernet token request to nova-api       | Falls through to standard auth_token, back-channel over mTLS          |
+| T7  | Re-attest same instance_uuid           | Re-attesting with the *same* JWT (same `jti`) is rejected as replay by the consumed-`jti` cache. Re-attesting with a *newly minted* JWT (new `jti`, e.g. after rebuild) succeeds and supersedes the prior registration entry. |
+
+---
+
+### Phase 6a: Registration Entry Garbage Collection
+
+**Goal:** prevent orphaned SPIRE registration entries from accumulating for
+instances that are deleted and never re-attest. Phase 5's supersede logic
+(step 6 of the `Attest` flow) cleans up an entry when the *same* instance
+re-attests, but a deleted instance never calls back in, so nothing removes
+its stale entry on its own — left unaddressed, the SPIRE registration DB
+grows unboundedly over the life of a cloud.
+
+**Prerequisites:** Phase 5 (SPIRE server plugin, registration entries keyed
+by SPIFFE ID).
+
+**Approach:** a lightweight Nova notification listener, using
+`oslo.messaging`, subscribed to `instance.delete.end` notifications on the
+Nova notification bus. On each notification, it extracts `instance_id` (and
+`project_id`) from the payload, constructs the corresponding SPIFFE ID
+(`spiffe://{trust_domain}/project/{project_id}/instance/{instance_id}`), and
+calls the SPIRE server admin API to delete that registration entry (if one
+exists — a VM that never attested has none, which is a no-op).
+
+This can be lightweight tooling shipped alongside the devstack plugin (e.g.
+`tools/devstack-plugin-spire/lib/gc-listener` or a small standalone daemon
+started by the plugin) rather than a new repository — it has no dependency on
+the SPIRE plugin internals beyond the admin API, and no dependency on
+keystone-rs internals beyond the SPIFFE ID construction convention already
+documented in this plan.
+
+**Two gaps the event-only design above doesn't cover, and how to close them:**
+
+- **Delivery isn't guaranteed.** `oslo.messaging` notifications are
+  best-effort — a message-bus outage or listener downtime at the wrong
+  moment drops the notification silently, and nothing re-delivers it. An
+  event-driven-only listener will leak orphaned entries over time with no
+  visible failure. Pair the listener with a **periodic reconciliation
+  sweep** (e.g. hourly): list live instances from Nova, list VM-scoped
+  entries from the SPIRE registration DB, and delete any entry whose
+  instance no longer exists in Nova. The event listener keeps steady-state
+  cleanup prompt; the sweep is the backstop that makes "eventually
+  consistent" actually true instead of "consistent unless a message got
+  dropped."
+- **The listener is a new, unguarded trust boundary into the identity
+  system.** It acts on the SPIRE server admin API — the same privilege
+  level used to create/delete any registration entry — based purely on the
+  content of a bus message. If the message bus isn't tightly scoped (RBAC on
+  who can publish notifications), anyone who can put a forged
+  `instance.delete.end` message on the bus can get a *running, legitimate*
+  VM's SPIFFE identity revoked out from under it — a new identity-disruption
+  / DoS vector this plan introduces that has no equivalent before Phase 6a.
+  Mitigate by having the listener **re-verify against Nova's live state
+  before deleting** (confirm the instance is actually gone, don't act on the
+  notification payload alone) rather than treating notification receipt as
+  sufficient evidence, and by scoping message-bus ACLs the same way any
+  other identity-affecting control channel would be scoped. See the Security
+  Considerations table.
+
+**Verification:**
+
+```bash
+# Delete an attested instance, then confirm the entry is gone:
+openstack server delete <instance_id>
+# after the instance.delete.end notification is processed:
+spire-server entry show -socketPath /tmp/spire-ci-test-harness/server.sock \
+  -spiffeID spiffe://cloud.trust.domain/project/<project_id>/instance/<instance_id>
+# Should return no matching entry
+```
+
+---
+
+## Token Validation Migration Path
+
+The architecture supports three coexisting token validation modes. Services can
+migrate independently:
+
+### Mode A — Legacy (current devstack default)
+
+```
+Service ──plaintext HTTP──▶ keystone-rs /v3/OS-TOKENS
+keystone-rs validates Fernet token
+```
+
+No SPIRE. No mTLS. Standard keystonemiddleware behavior.
+
+### Mode B — SPIFFE mTLS + Fernet (interim phase, after Phase 3-4)
+
+```
+Service ──SPIFFE mTLS──▶ keystone-rs [interface:internal] /v3/OS-TOKENS
+(transport encrypted, caller authenticated via SVID)
+keystone-rs validates Fernet token, returns metadata
+```
+
+keystonemiddleware still calls keystone-rs on every request, but the channel is
+mTLS through the internal SPIFFE interface. Phase 4.1 landed on Gerrit, services
+gradually enable `spiffe_agent_socket`.
+
+### Mode C — JWT offline validation (final state, after Phase 4.2)
+
+```
+┌────────────────────────────────────────────┐
+│ Service                                    │
+│ keystonemiddleware_jwt_offline:            │
+│  1. Verify JWT signature from cached JWKS  │
+│  2. Check aud, iss, exp, nbf              │
+│  3. Inject context, serve request          │
+│                                            │
+│ No call to keystone-rs needed.             │
+└────────────────────────────────────────────┘
+```
+
+keystone-rs issues stateless JWT access tokens (ADR 0026). Token validation is
+done in-memory. keystone-rs is only contacted for JWKS cache refresh (300s TTL).
+This is the **final state** for data-path token validation.
+
+**Tradeoff:** Mode C trades instant revocation for zero back-channel calls,
+consistent with standard offline-JWT validation patterns — a compromised or
+misused token is bounded by its short expiry rather than caught by a live
+revocation check. This is a deliberate design choice, not an oversight: if
+instant revocation later becomes a requirement, a possible future
+enhancement (not part of this plan) would be a compact signed revocation
+delta feed published alongside JWKS at
+`/v4/oauth2/{domain}/revocations`, polled on a shorter cache interval (e.g.
+30-60s) than JWKS (300s) — still without a per-request callback to
+keystone-rs. Until/unless that is built, services that need immediate
+revocation should stay on Mode B.
+
+**Transition timeline:**
+
+| Step | Action                                                                   |
+| ---- | ------------------------------------------------------------------------ |
+| 1    | Deploy Phase 1-3: SPIRE + keystone-rs internal SPIFFE interface          |
+| 2    | Land Phase 4.1: keystonemiddleware SPIFFE mTLS transport change          |
+| 3    | Gradually enable `spiffe_agent_socket` per service → Mode B              |
+| 4    | Land Phase 4.2: keystonemiddleware JWT offline filter change             |
+| 5    | Enable ADR 0026 OAuth2 JWT tokens on keystone-rs                         |
+| 6    | Enable `keystone_jwks_url` per service → Mode C for JWT-bearing requests |
+| 7    | (Optional) Remove Fernet validation → Mode C only                        |
+
+---
+
+## Security Considerations
+
+| Threat                                                     | Mitigation                                                                                                                                                                                                                                                                        |
+| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **JWT replay for VM attestation**                          | Short TTL (300s default, max 600s), fixed `aud: spiffe-attestation`, short-lived consumed-`jti` cache in the SPIRE server plugin rejects reuse of the exact same token (Fix 2). This is a token-replay check, not a SPIFFE-ID-reuse check — see "Duplicate/re-attestation" below. |
+| **keystone-rs JWKS key compromise**                        | Domain-isolated keys (ADR 0026), multi-generational key publishing bridges rotation. No live revocation list is relied on (see Mode C tradeoff below) — compromised tokens are bounded by short TTL.                                                                            |
+| **Attestation/OAuth2 key blast-radius coupling**           | Attestation JWTs are signed by a wholly separate key served from its own dedicated JWKS endpoint (`/v4/spiffe/{domain}/jwks`), not a shared JWKS distinguished by a metadata flag — the SPIRE server plugin never fetches or trusts the OAuth2 key at all (Fix 3). Compromise of one key no longer grants both API-token forgery and VM identity minting. Independent rotation cadence is possible, but note a forged attestation JWT is not inherently "lower value" than a forged access token — with `vendordata.verify_placement=false` it grants unverified VM identity minting outright, so the attestation key warrants the same operational care as the OAuth2 key, not less. |
+| **Downstream service impersonation**                       | SPIFFE mTLS — only workloads that hold a valid SVID for their identity can authenticate as that service                                                                                                                                                                          |
+| **Compute-host impersonation / unauthorized attestation minting** | Per-host nova-compute SPIFFE identity (`.../service/nova-compute/host/{hostname}`) plus `vendordata.verify_placement` cross-checks the caller's host and the request's `project_id`/`instance_id` against the Nova record before signing, default-on (Fix 1). Disabling it accepts unverified compute-host claims. Note this guarantee only holds for `x509pop`-attested hosts — the devstack join-token registration path does not itself prove host identity (see Phase 1 "Per-host nova-compute registration").  |
+| **Plaintext token validation (pre-Phase 3)**               | Phase 3 enables SPIFFE mTLS internally; Phase 4.1 rolls out keystonemiddleware mTLS transport; Phase 4.2 eliminates back-channel calls for JWT tokens                                                                                                                            |
+| **SPIRE CA exposure**                                      | SPIFFE CA is ephemeral, auto-rotates with SPIRE CA rotation, not persisted at rest                                                                                                                                                                                                |
+| **Duplicate/re-attestation for the same instance**         | Legitimate re-attestation (rebuild, evacuate, cold migration — new `jti`) supersedes the prior registration entry rather than being permanently rejected; only same-`jti` replay is rejected (Fix 2). The consumed-`jti` cache must be backed by SPIRE's shared datastore, not per-node memory, or replay protection doesn't hold across HA replicas. This alone does not stop an attacker who can get a JWT minted in the first place from pre-empting a legitimate VM's identity — that depends on Fix 1's ownership verification. |
+| **GC listener notification spoofing (Phase 6a)**           | The Nova-notification-driven registration cleanup acts on SPIRE's admin API based on bus message content. A forged `instance.delete.end` message could revoke a running VM's identity. Mitigation: the listener re-verifies against Nova's live instance state before deleting rather than trusting the notification payload alone, plus standard message-bus RBAC. A periodic reconciliation sweep is the backstop for notifications that are dropped rather than forged. |
+
+---
+
+## Risk Register
+
+| Risk                                                     | Likelihood | Impact | Mitigation                                                                                                                                                                                                             |
+| -------------------------------------------------------- | ---------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SPIRE agent plugin fails to load in VM                   | Medium     | High   | Fallback: standard SPIRE node attestor + manual entry creation. The custom plugin doesn't block other VMs.                                                                                                             |
+| keystone-rs internal SPIFFE listener breaks API services | Low        | High   | SPIFFE listener runs on the internal interface (separate port from public). Legacy HTTP services continue using public interface (5000/8080). Internal interface can be enabled independently of the public interface. |
+| keystonemiddleware Gerrit change rejected                | Medium     | High   | The JWT offline validation filter can work as a standalone pip-installable package outside keystonemiddleware, keeping the mTLS transport as a separate concern.                                                       |
+| JWKS cache stale during key rotation                     | Low        | Medium | 300s cache max, matches JWKS Cache-Control. ADR 0026 multi-generational key publishing (active + previous) bridges the gap.                                                                                            |
+| Nova vendordata injection fails                          | Low        | High   | VM falls back to non-SPIRE mode. The JWT API is called early in VM boot; if it fails, the VM can still function without SPIRE identity (graceful degradation).                                                         |
+| keystone-rs → nova-api ownership check (Fix 1) unavailable | Low       | Medium | `/v4/vendordata` fails closed (`503`) rather than skipping the check, so it degrades to "no new SPIFFE identities issued" during a Nova outage, not to "identities issued unverified." `vendordata.verify_placement=false` is available as an explicit, documented opt-out for operators who'd rather accept weaker trust than an availability hit, but that is not the default. |
+| GC listener (Phase 6a) acts on unverified notification content | Low   | Medium | Listener re-verifies against Nova's live state before deleting a SPIRE entry, rather than trusting the notification payload alone; periodic reconciliation sweep catches anything the event path misses either way.    |
+
+---
+
+## Deliverables
+
+| #   | Deliverable                                     | Repo                                     | Files                                                                                                             |
+| --- | ----------------------------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| D1  | SPIRE DevStack plugin                           | keystone-rs                              | `tools/devstack-plugin-spire/`                                                                                    |
+| D2  | Vendor data JWT API + dedicated attestation JWKS | keystone-rs                             | `crates/keystone/.../vendordata.rs`, `.../spiffe_jwks.rs`, `crates/key-repository/...` (new attestation key purpose), `crates/core/src/nova_client.rs`, `policy/`, ADR |
+| D3  | keystone-rs internal SPIFFE interface           | keystone-rs                              | `crates/keystone/src/server/listener/spiffe_tls.rs`, `crates/keystone/src/bin/keystone.rs` (config documentation) |
+| D4  | Patched keystonemiddleware — mTLS transport     | python-keystonemiddleware (Gerrit)       | `_spiffe_transport.py`, `auth_token.py`                                                                           |
+| D4b | Patched keystonemiddleware — JWT offline filter | python-keystonemiddleware (Gerrit)       | `jwt_offline.py`, `setup.cfg`                                                                                     |
+| D5  | SPIRE JWT node attestor plugins                 | spire-jwt-keystone-plugins (new Go repo) | `server/jwt_keystone/`, `agent/jwt_keystone/`                                                                     |
+| D6  | SPIFFE identity mapping rules                   | keystone-rs doc                          | Configuration examples, ADR 0020 mapping rulesets                                                                 |
+| D7  | Full devstack `local.conf` + install guide      | keystone-rs doc                          | `doc/src/install/index.md` update                                                                                 |
+| D8  | Registration entry GC listener + reconciliation sweep (Phase 6a) | keystone-rs             | `tools/devstack-plugin-spire/lib/gc-listener` (or standalone daemon)                                              |

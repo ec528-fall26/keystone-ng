@@ -1,0 +1,68 @@
+[package]
+name = "openstack-keystone-webauthn"
+description = "OpenStack Keystone WebAuthN service"
+version = "0.1.0"
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axum = { workspace = true, features = ["macros"] }
+base64.workspace = true
+chrono.workspace = true
+derive_builder.workspace = true
+eyre.workspace = true
+inventory.workspace = true
+openstack-keystone-api-types = { workspace = true, features = ["openapi", "validate", "conv"] }
+openstack-keystone-core = { workspace = true, features = ["api"] }
+openstack-keystone-core-types.workspace = true
+openstack-keystone-distributed-storage = { workspace = true, features = ["mock"] }
+rmp-serde.workspace = true
+sea-orm = { workspace = true, features = ["default"] }
+secrecy.workspace = true
+sea-orm-migration = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "signal"] }
+tokio-util.workspace = true
+tracing.workspace = true
+utoipa.workspace = true
+utoipa-axum.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+validator.workspace = true
+webauthn-rs = { workspace = true, features = ["danger-allow-state-serialisation"] }
+webauthn-rs-proto.workspace = true
+
+[dev-dependencies]
+axum = { workspace = true, features = ["http2", "tokio"] }
+cadf = { workspace = true, features = ["testing"] }
+base64urlsafedata.workspace = true
+mockall.workspace = true
+openstack-keystone-config.workspace = true
+openstack-keystone-core = { workspace = true, features = ["mock"] }
+openstack-keystone-token-driver-fernet.workspace = true
+rcgen.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+reserve-port = "2.5"
+sea-orm = { workspace = true, features = ["mock", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "runtime-tokio" ]}
+serde_json.workspace = true
+tempfile.workspace = true
+tower.workspace = true
+tower-http = { workspace = true, features = ["trace"] }
+tracing.workspace = true
+tracing-test = { workspace = true, features = ["no-env-filter"] }
+url.workspace = true
+webauthn-authenticator-rs = { workspace = true, features = ["softtoken"] }
+webauthn-rs = { workspace = true, features = ["danger-credential-internals"] }
+webauthn-rs-proto.workspace = true
+
+[features]
+default = []
+bench_internals = []
+
+[lints]
+workspace = true

@@ -1,0 +1,319 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'merge_group' && github.run_id || github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_RETRIES: 3
+  KEYSTONE_DEV_KEK: 4242424242424242424242424242424242424242424242424242424242424242
+  KEYSTONE_ALLOW_ENV_KEK: "1"
+  SPIRE_VERSION: "1.15.1"
+  RUST_LOG: "info,reqwest=off,h2=off,hyper=off"
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    # Required checks must always report a status, so the workflow triggers
+    # unconditionally; this job decides whether the real work is needed.
+    outputs:
+      code: ${{ github.event_name != 'pull_request' || steps.filter.outputs.code == 'true' }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: filter
+        with:
+          filters: |
+            code:
+              - '.github/workflows/ci*.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'benches/**'
+              - 'crates/**'
+              - 'tests/**'
+              - 'tools/setup-db.sh'
+              - 'tools/docker-compose.test.yaml'
+
+  test:
+    needs: changes
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    name: Test (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+
+    # Receives the OTLP export of the server that tools/start-api.sh starts for
+    # the REST API tests (tests/api/tests/api_v4/observability.rs).
+    services:
+      jaeger:
+        image: jaegertracing/jaeger:2.9.0
+        ports:
+          - 4318:4318
+          - 16686:16686
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # protobuf-compiler: build dependency. libtss2-dev + pkg-config: build-time
+      # dependency of the `tpm` feature (`storage-crypto-tpm`'s `tss-esapi`
+      # needs them to compile at all, even without a real or virtual TPM;
+      # `cargo nextest run --all-features` below builds it). No TPM device is
+      # required in CI: per ADR 0016-v2 §2.5.2's test/sample scope,
+      # `storage-crypto-tpm` has no CI-gated tests, only the example built in
+      # "Build TPM KEK example" below.
+      # softhsm2: run-time dependency of the `pkcs11` feature's SoftHSM2-backed
+      # integration tests (`storage-crypto-pkcs11/tests/softhsm.rs`,
+      # `storage/tests/test_pkcs11_cluster.rs`). Each test provisions its own
+      # isolated token via `SOFTHSM2_CONF`, so only the module itself
+      # (`libsofthsm2.so`) needs to be present. Tests skip themselves (rather
+      # than fail) if it isn't.
+      - name: Install system packages
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libtss2-dev pkg-config softhsm2
+
+      - name: Install Rust
+        if: needs.changes.outputs.code == 'true'
+        uses: dtolnay/rust-toolchain@6d653acede28d24f02e3cd41383119e8b1b35921 # stable
+        with:
+          toolchain: stable
+          targets: "${{ matrix.target }},wasm32-unknown-unknown"
+
+      - name: Install cargo-nextest
+        if: needs.changes.outputs.code == 'true'
+        uses: taiki-e/install-action@50414676f9f5d50a65992c6dd2ed02641263226c # v2.82.10
+        with:
+          tool: cargo-nextest
+
+      - name: Install SPIRE server
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          wget https://github.com/spiffe/spire/releases/download/v${SPIRE_VERSION}/spire-${SPIRE_VERSION}-linux-amd64-musl.tar.gz
+          tar -xvf spire-${SPIRE_VERSION}-linux-amd64-musl.tar.gz
+          # Move binaries to a standard directory and add to PATH
+          sudo cp spire-${SPIRE_VERSION}/bin/spire-server /usr/local/bin/
+          sudo cp spire-${SPIRE_VERSION}/bin/spire-agent /usr/local/bin/
+
+      - name: Setup OPA
+        if: needs.changes.outputs.code == 'true'
+        uses: open-policy-agent/setup-opa@b2b258e089860efaadaaf71bf6e3aecb4a3eeff1 # v2.4.0
+        with:
+          version: latest
+
+      # Runs here unconditionally (not only in policy-container.yml, which is
+      # gated on `paths: policy/**`) so a Rust-only PR that changes which
+      # policy_name a handler enforces, or reshapes the Credentials
+      # projection, is also gated by the Rego test suite. See security review
+      # V3 / Gate A (doc/src/contributor/security-review.md).
+      - name: Test OPA policies
+        if: needs.changes.outputs.code == 'true'
+        run: opa test policy
+
+      - name: Rust Cache
+        if: needs.changes.outputs.code == 'true'
+        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Set up Python for cross-verification tests
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.x'
+
+      - name: Install Python Keystone for cross-verification tests
+        if: needs.changes.outputs.code == 'true'
+        run: pip install keystone
+
+      - name: Run tests (unit)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo nextest run --all-features --profile ci
+
+      - name: Install slapd for LDAP tests
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y slapd ldap-utils
+          # Debian/Ubuntu's stock AppArmor profile for /usr/sbin/slapd only
+          # grants rwk on /var/lib/ldap and rw (no lock) on /var/tmp, so the
+          # mdb backend's throwaway test database under /var/tmp fails to
+          # open (mdb_db_open: Permission denied) when the profile is
+          # enforced. Unload it for this disposable local test instance.
+          if command -v apparmor_parser >/dev/null 2>&1 && [ -e /etc/apparmor.d/usr.sbin.slapd ]; then
+            sudo mkdir -p /etc/apparmor.d/disable
+            sudo ln -sf /etc/apparmor.d/usr.sbin.slapd /etc/apparmor.d/disable/
+            sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.slapd
+          fi
+
+      - name: Run LDAP tests
+        if: needs.changes.outputs.code == 'true'
+        run: cargo nextest run -p openstack-keystone-identity-driver-ldap --profile ci-ldap
+
+      - name: Run cross-backend (SQL+LDAP) domain config tests
+        if: needs.changes.outputs.code == 'true'
+        run: cargo nextest run -p test_integration --profile ci-ldap --test integration -- domain_config::cross_backend
+
+      # Compile-only: catches rot in the TPM sample without requiring a
+      # real/virtual TPM in CI (ADR 0016-v2 §2.5.2 test/sample scope decision
+      # — real/virtual TPM availability in CI runners isn't reliable enough
+      # to gate merges on, so `swtpm` is intentionally not installed here).
+      - name: Build TPM KEK example
+        if: needs.changes.outputs.code == 'true'
+        run: cargo build -p openstack-keystone-storage-crypto-tpm --example tpm_kek_demo
+
+      - name: Run integration tests (sqlite)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo nextest run -p test_integration --profile ci
+
+      - name: Run integration tests (mysql)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo nextest run -p test_integration --profile ci-mysql
+
+      - name: Run integration tests for postgres
+        if: needs.changes.outputs.code == 'true'
+        run: cargo nextest run -p test_integration --profile ci-postgres
+
+      - name: Run integration tests for raft drivers
+        if: needs.changes.outputs.code == 'true'
+        run: cargo nextest run -p test_integration --profile ci-raft
+
+      - name: Run REST API tests
+        if: needs.changes.outputs.code == 'true'
+        env:
+          KEYSTONE_TEST_OTLP_ENDPOINT: http://127.0.0.1:4318
+          JAEGER_QUERY_URL: http://127.0.0.1:16686
+        run: cargo nextest run -p test_api --profile ci-api --test integration_api_v3 --test integration_api_v4
+
+      - name: Invalidate eventual openstack_sdk cache
+        if: needs.changes.outputs.code == 'true'
+        run: rm -rf $HOME/.osc
+
+      - name: Run REST API SCIMv2 tests
+        if: needs.changes.outputs.code == 'true'
+        run: cargo nextest run -p test_api --profile ci-api --test scim_v2
+
+      - name: Run Doc tests
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test --doc
+
+      - name: Dump docker state
+        if: failure()
+        run: docker ps -a
+
+      - name: Upload state dir as artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: failure()
+        with:
+          name: nextest
+          path: /tmp/nextest/keystone
+
+      # Convert JUnit XML into an interactive GitHub Step Summary
+      - name: Publish Test Report
+        uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 # v3.0.0
+        if: needs.changes.outputs.code == 'true' && (success() || failure()) # Run even if tests fail
+        with:
+          name: Cargo Nextest Results
+          path: target/nextest/*/junit.xml
+          reporter: java-junit
+
+  # Gate B1 (security review V3 / issue #977): runs unconditionally, not
+  # gated on path filters, so it catches a Rust change that renames/drops an
+  # enforce() call, or a policy change that leaves a handler's enforce()
+  # target dangling, no matter which side of the split it touches.
+  policy-handler-coverage:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Check policy<->handler existence (Gate B1)
+        run: python3 tools/check_policy_handler_coverage.py
+
+      # Gate E (security review V3 / issue #985): security.md I2's
+      # undefined-argument footgun -- a delegation-boundary helper called
+      # with a bare dotted path instead of object.get(..., null).
+      - name: Check Rego undefined-argument footgun (Gate E)
+        run: python3 tools/check_rego_undefined_argument_footgun.py
+
+      # Gate J (security review V1/V2 / issue #986): the mechanically
+      # checkable subset of the security.md §7 reviewer checklist.
+      - name: Check security.md §7 checklist SAST (Gate J)
+        run: python3 tools/check_security_checklist_sast.py
+
+      # Gate I companion (security review V9 / issue #987): EventPayload
+      # (the ADR 0023 audit-trail projection) must never grow a
+      # secret-shaped field; crates/core/src/policy.rs and the
+      # credential/os_ec2 policy-input helpers carry the equivalent
+      # assertion as Rust unit tests (cargo test already gates those).
+      - name: Check EventPayload has no secret fields (Gate I)
+        run: python3 tools/check_event_payload_no_secret_fields.py
+
+      # Gate C (security review V1/V2 / issue #982): every
+      # delegation-sensitive policy's test suite must carry a scope-drift
+      # negative case (security.md I3), not just a wrong-project case.
+      - name: Check delegated-policy scope-drift test presence (Gate C)
+        run: python3 tools/check_delegated_policy_scope_drift_tests.py
+
+  openapi:
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6d653acede28d24f02e3cd41383119e8b1b35921 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install protobuf-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libtss2-dev pkg-config
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: openapi-build
+
+      - name: Generate OpenAPI
+        run: cargo run -p openstack-keystone --bin keystone -- --dump-openapi yaml > openapi.yaml
+
+      - name: Upload OpenAPI spec
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: openapi.spec
+          path: openapi.yaml

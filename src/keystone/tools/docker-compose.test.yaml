@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: docker.io/postgres:16-alpine
+    container_name: tools_postgres
+    environment:
+      POSTGRES_PASSWORD: password
+    tmpfs: /var/lib/postgresql/data
+    ports:
+      - "15432:5432"
+
+  mysql:
+    image: docker.io/mysql:8.0
+    container_name: tools_mysql
+    environment:
+      MYSQL_DATABASE: test_db
+      MYSQL_ROOT_PASSWORD: password
+    tmpfs: /var/lib/mysql
+    ports:
+      - "13306:3306"

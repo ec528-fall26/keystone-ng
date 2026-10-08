@@ -1,0 +1,39 @@
+[package]
+name = "openstack-keystone-storage-crypto"
+description = "Cryptographic primitives for Keystone distributed storage (AES-256-GCM, HKDF, KEK/DEK hierarchy)."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+exclude.workspace = true
+
+# This crate intentionally does NOT inherit workspace lints so that it can set
+# `unsafe_code = "deny"` (rather than "forbid") for the mlock.rs module, which
+# requires unsafe for posix_memalign, mlock/munlock, and raw-pointer access.
+# All other workspace crates use `unsafe_code = "forbid"` via the workspace
+# default.  All other lint settings below mirror the workspace lints exactly.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+enum_glob_use = "deny"
+expect_used = "deny"
+print_stdout = "deny"
+unwrap_used = "deny"
+doc_paragraphs_missing_punctuation = "warn"
+
+[dependencies]
+aes-gcm.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+hybrid-array = "0.4"
+sha2.workspace = true
+typenum = "1.20"
+nix = { workspace = true, features = ["mman", "feature"] }
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zeroize = "1"

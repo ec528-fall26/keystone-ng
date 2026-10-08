@@ -1,0 +1,164 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+//! # Create role API
+use axum::{
+    extract::{Json, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use serde_json::json;
+use validator::Validate;
+
+use super::types::{RoleCreateRequest, RoleResponse};
+use crate::api::auth::Auth;
+use crate::api::error::KeystoneApiError;
+use crate::keystone::ServiceState;
+use openstack_keystone_core::auth::ExecutionContext;
+
+/// Create a new Role.
+#[utoipa::path(
+    post,
+    path = "/",
+    responses(
+        (status = CREATED, description = "Role created", body = RoleResponse),
+        (status = 400, description = "Invalid input"),
+        (status = 500, description = "Internal error")
+    ),
+    tag="roles"
+)]
+#[tracing::instrument(name = "api::v3::role_create", level = "debug", skip(state))]
+pub(super) async fn create(
+    Auth(user_auth): Auth,
+    State(state): State<ServiceState>,
+    Json(payload): Json<RoleCreateRequest>,
+) -> Result<impl IntoResponse, KeystoneApiError> {
+    // Validate the request
+    payload.validate()?;
+
+    state
+        .policy_enforcer
+        .enforce(
+            "identity/role/create",
+            &user_auth,
+            json!({"role": payload.role}),
+            None,
+        )
+        .await?;
+    // Create the role
+    let created_role = state
+        .provider
+        .get_role_provider()
+        .create_role(
+            &ExecutionContext::from_auth(&state, &user_auth),
+            payload.into(),
+        )
+        .await?;
+
+    // Return response with 201 Created status
+    Ok((
+        StatusCode::CREATED,
+        Json(RoleResponse {
+            role: created_role.into(),
+        }),
+    )
+        .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use http_body_util::BodyExt; // for `collect`
+    use tower::ServiceExt; // for `call`, `oneshot`, and `ready`
+    use tower_http::trace::TraceLayer;
+
+    use openstack_keystone_core_types::role::{RoleBuilder, RoleCreate};
+
+    use super::super::openapi_router;
+    use crate::api::tests::{get_mocked_state, test_fixture_scoped};
+    use crate::api::v3::role::types::{Role as ApiRole, RoleResponse};
+    use crate::provider::Provider;
+    use crate::role::MockRoleProvider;
+
+    #[tokio::test]
+    async fn test_create() {
+        let mut role_mock = MockRoleProvider::default();
+        role_mock
+            .expect_create_role()
+            .withf(|_, role_create: &RoleCreate| {
+                role_create.name == "new_role"
+                    && role_create.domain_id.as_deref() == Some("domain1")
+                    && role_create.description.as_deref() == Some("A new role")
+                    && role_create.id.is_none()
+            })
+            .returning(|_, _| {
+                Ok(RoleBuilder::default()
+                    .id("new_role_id")
+                    .name("new_role")
+                    .domain_id("domain1")
+                    .description("A new role")
+                    .build()
+                    .unwrap())
+            });
+
+        let vsc = test_fixture_scoped();
+        let state =
+            get_mocked_state(Provider::mocked_builder().mock_role(role_mock), true, None).await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state.clone());
+
+        let req = crate::api::v3::role::types::RoleCreateRequest {
+            role: crate::api::v3::role::types::RoleCreateBuilder::default()
+                .name("new_role")
+                .domain_id("domain1")
+                .description("A new role")
+                .build()
+                .unwrap(),
+        };
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .extension(vsc)
+                    .header("Content-Type", "application/json")
+                    .method("POST")
+                    .body(Body::from(serde_json::to_string(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let res: RoleResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            ApiRole {
+                id: "new_role_id".into(),
+                name: "new_role".into(),
+                domain_id: Some("domain1".into()),
+                description: Some("A new role".into()),
+                extra: std::collections::HashMap::new(),
+                options: Default::default(),
+            },
+            res.role,
+        );
+    }
+}

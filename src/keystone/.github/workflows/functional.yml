@@ -1,0 +1,446 @@
+---
+name: Functional and interoperability testing
+
+on:
+  workflow_dispatch:
+  pull_request:
+  merge_group:
+env:
+  DATABASE_URL: postgresql://keystone:1234@127.0.0.1:5432/keystone
+  KEYSTONE_URL: http://localhost:8080
+  KEYSTONE_DEV_KEK: 4242424242424242424242424242424242424242424242424242424242424242
+  KEYSTONE_ALLOW_ENV_KEK: "1"
+  OPA_URL: http://localhost:8181
+  OS_KEYSTONE_CONFIG_DIR: ${{ github.workspace }}/etc
+  REGISTRY: ghcr.io
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'merge_group' && github.run_id || github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    # Required checks must always report a status, so the workflow triggers
+    # unconditionally; this job decides whether the real work is needed.
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ github.event_name != 'pull_request' || steps.filter.outputs.code == 'true' }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/functional.yml'
+              - 'skaffold.yaml'
+              - 'tests/**'
+              - 'loadtest/**'
+              - 'crates/**'
+              - 'policy/**'
+              - 'tools/Dockerfile.skaffold'
+              - 'tools/Dockerfile.tempest'
+              - 'tools/tempest/**'
+
+  # `build` and `interop` are not required checks; skip them in the merge
+  # queue to keep runner pressure (and queue wait) down.
+  build:
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Enable cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cargo
+          key: ${{ runner.os }}-integration
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6d653acede28d24f02e3cd41383119e8b1b35921 # stable
+        with:
+          toolchain: stable
+
+      - name: Install protobuf-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libtss2-dev pkg-config
+
+      - name: Build Keystone
+        run: cargo build --release
+
+      - name: Move artifacts to the root
+        run: mv target/release/keystone* ./
+
+      - name: Setup OPA
+        uses: open-policy-agent/setup-opa@b2b258e089860efaadaaf71bf6e3aecb4a3eeff1 # v2.4.0
+        with:
+          version: latest
+
+      - name: Upload built binaries
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: keystone
+          path: |
+            keystone
+            keystone-manage
+
+  interop:
+    runs-on: ubuntu-latest
+    needs:
+      - build
+    env:
+      OS_AUTH_URL: http://localhost:8080
+      OS_USERNAME: admin
+      OS_PASSWORD: password
+      OS_USER_DOMAIN_ID: default
+      OS_PROJECT_NAME: admin
+      OS_PROJECT_DOMAIN_ID: default
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: keystone
+          POSTGRES_PASSWORD: '1234'
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./.github/actions/deploy_keystone
+
+      - name: Wait for py-keystone to bootstrap
+        run: sleep 5
+
+      - name: Test python keystone availability
+        run: curl http://localhost:5001/v3
+
+      - name: Test rust keystone availability
+        run: curl http://localhost:8080/v3
+
+      - name: Basic test using token validation
+        run: |
+          TOKEN1=$(osc --os-cloud admin auth login)
+          TOKEN2=$(osc --os-cloud admin-rust auth login)
+
+          echo "Use rust Keystone token against both Keystones"
+          curl http://localhost:5001/v3/auth/tokens -H "X-Auth-Token: ${TOKEN1}" -H "X-Subject-Token: ${TOKEN1}" | jq
+          curl http://localhost:5001/v3/auth/tokens -H "X-Auth-Token: ${TOKEN1}" -H "X-Subject-Token: ${TOKEN2}" | jq
+          curl http://localhost:5001/v3/auth/tokens -H "X-Auth-Token: ${TOKEN2}" -H "X-Subject-Token: ${TOKEN1}" | jq
+          curl http://localhost:5001/v3/auth/tokens -H "X-Auth-Token: ${TOKEN2}" -H "X-Subject-Token: ${TOKEN2}" | jq
+
+          echo "Use python Keystone token against both Keystones"
+          curl http://localhost:8080/v3/auth/tokens -H "X-Auth-Token: ${TOKEN1}" -H "X-Subject-Token: ${TOKEN1}" | jq
+          curl http://localhost:8080/v3/auth/tokens -H "X-Auth-Token: ${TOKEN1}" -H "X-Subject-Token: ${TOKEN2}" | jq
+          curl http://localhost:8080/v3/auth/tokens -H "X-Auth-Token: ${TOKEN2}" -H "X-Subject-Token: ${TOKEN1}" | jq
+          curl http://localhost:8080/v3/auth/tokens -H "X-Auth-Token: ${TOKEN2}" -H "X-Subject-Token: ${TOKEN2}" | jq
+
+      - name: Run api tests
+        env:
+          RUST_LOG: "info,reqwest=off,h2=off,hyper=off"
+        run: cargo test --test api
+
+      # - name: Run interop tests
+      #   run: cargo test --test interop
+
+      - name: Dump py-keystone logs
+        if: failure()
+        run: docker logs keystone
+
+      - name: Dump rust keystone log
+        if: failure()
+        run: cat rust.log
+
+      - name: Dump OPA log
+        if: failure()
+        run: docker logs opa
+
+  k3s-test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # Required to push to GHCR
+      id-token: write # Required for GitHub OIDC JWT (github federation test)
+    steps:
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Start Local Registry
+        run: |
+          docker run -d -p 5000:5000 --restart always --name registry registry:2
+
+      - name: Set up Docker Insecure Registry
+        run: |
+          # Configure Docker to trust the local registry without HTTPS
+          echo '{"insecure-registries":["localhost:5000"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+
+      - name: Install K3s
+        run: |
+          # Install k3s without the heavy default components (Traefik/ServiceLB)
+          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --disable servicelb --write-kubeconfig-mode 644" sh -s -
+
+          # Export KUBECONFIG for the next steps
+          echo "KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> $GITHUB_ENV
+
+      - name: Install Skaffold
+        run: |
+          curl -Lo skaffold https://storage.googleapis.com/skaffold/builds/latest/skaffold-linux-amd64 && \
+          sudo install skaffold /usr/local/bin/
+
+      - name: Verify Registry is Reachable
+        run: curl -v http://localhost:5000/v2/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver: docker-container
+
+      # Registry cache for the keystone image layers (see
+      # tools/ci-build-image.sh). Fork pull requests have no write access to
+      # GHCR, so they import the cache only.
+      - name: Log in to GHCR for the build cache
+        if: github.event.pull_request.head.repo.fork != true
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Wait for Cluster Ready
+        run: |
+          # Wait up to 60 seconds for the node to be ready
+          timeout 60s bash -c 'until kubectl get nodes | grep -w "Ready"; do sleep 2; done'
+          kubectl get nodes
+
+      - name: Deploy the development stack
+        env:
+          BUILDKIT_STEP_LOG_MAX_SIZE: 10485760
+          # Layer cache (incl. compiled cargo dependencies) shared between runs
+          BUILDCACHE_REF: ${{ env.REGISTRY }}/${{ github.repository }}-buildcache:skaffold
+          BUILDCACHE_PUSH: ${{ github.event.pull_request.head.repo.fork != true }}
+        run: |
+          export BUILDX_NO_DEFAULT_ATTESTATIONS=1
+          # first build artifacts preparing metadata file
+          skaffold deploy -m infra
+          skaffold build --profile github-ci --default-repo localhost:5000 --file-output build.artifacts
+          # deploy built artifacts
+          skaffold deploy -a build.artifacts --status-check
+
+      - name: Write GitHub OIDC env file
+        run: |
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN=${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" >> github-oidc.env
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL=${ACTIONS_ID_TOKEN_REQUEST_URL}" >> github-oidc.env
+
+      - name: Run tests
+        run: |
+          skaffold verify --profile github-ci -m keystone --env-file github-oidc.env -a build.artifacts -v debug
+
+      - name: Install Rust and build loadtest binary
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          source "$HOME/.cargo/env"
+          (cd tests/loadtest && cargo build --release)
+
+      - name: Run loadtest against keystone-rs
+        env:
+          HOME: /tmp/loadtest-home
+          OS_AUTH_URL: http://localhost:8080/v3
+          OS_USERNAME: admin
+          OS_PASSWORD: password
+          OS_USER_DOMAIN_ID: default
+          OS_PROJECT_NAME: admin
+          OS_PROJECT_DOMAIN_ID: default
+        run: |
+          # Port-forward to keystone-rs and wait for readiness
+          kubectl port-forward svc/keystone-rs 8080:8080 > /dev/null 2>&1 &
+          PORT_FORWARD_PID=$!
+          for i in $(seq 1 60); do
+            if curl -s http://localhost:8080/health/ > /dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+
+          mkdir -p tests/loadtest/reports
+          (cd tests/loadtest && ./target/release/load_test \
+              --host http://localhost:8080 \
+              --hatch-rate 2 \
+              --run-time 30s \
+              --report-file reports/loadtest-report-rust.html \
+              --report-file reports/loadtest-report-rust.md)
+
+          kill $PORT_FORWARD_PID 2>/dev/null || true
+
+      - name: Upload loadtest report
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: loadtest-report
+          path: tests/loadtest/reports/
+
+      - name: Run tempest identity compatibility tests
+        id: tempest_verify
+        continue-on-error: true
+        run: |
+          skaffold verify --profile github-ci -m tempest -a build.artifacts -v debug 2>&1 | tee tempest-results.log
+
+      - name: Summarize tempest identity compatibility results
+        if: always() && steps.tempest_verify.outcome != 'skipped'
+        run: |
+          {
+            echo "### Tempest identity compatibility (advisory, non-blocking)"
+            echo
+            if [ "${{ steps.tempest_verify.outcome }}" = "success" ]; then
+              echo "All selected tempest identity tests passed."
+            else
+              echo "Some tempest identity tests failed - see failed test IDs below."
+              echo
+              echo '```'
+              awk '/FAILED TESTS \(target=/{show=1} show{print} /END FAILED TESTS \(target=/{show=0}' tempest-results.log \
+                | sed -E 's/^\[tempest-identity-[a-z]+\] ?//' || echo "(unable to parse failures from log)"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload tempest results log
+        if: always() && steps.tempest_verify.outcome != 'skipped'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: tempest-identity-results
+          path: tempest-results.log
+
+      - name: Dump K8 pods
+        if: failure()
+        run: kubectl get pods
+
+      - name: Dump K8 pods - extended
+        if: failure()
+        run: kubectl get pods -o custom-columns="NAMESPACE:.metadata.namespace,POD:.metadata.name,STATUS:.status.phase,CONTAINER:.spec.containers[*].name,IMAGE:.spec.containers[*].image"
+
+      - name: Dump skaffold images
+        if: failure()
+        run: cat build.artifacts
+
+      - name: Dump keystone-rs logs
+        if: failure()
+        run: kubectl logs statefulset/keystone-rs -c keystone
+
+      - name: Dump bootstrap job
+        if: failure()
+        run: kubectl get job keystone-bootstrap -o yaml
+
+      - name: Dump events
+        if: failure()
+        run: kubectl get events
+
+  loadtest-track:
+    if: "success() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'openstack-experimental-release-plz'"
+    runs-on: ubuntu-latest
+    needs:
+      - k3s-test
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Fetch pre-built artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v5.0.0
+        with:
+          name: loadtest-report
+
+      - name: Extract report
+        id: metrics
+        run: |
+          SUMMARY=$(cat loadtest-report-rust.md || echo "No summary found")
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          echo "$SUMMARY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Post Loadtest results to PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        with:
+          header: loadtest
+          message: |
+            🦢 **Load Test Results**
+
+            ${{ steps.metrics.outputs.summary }}
+
+            [View full report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+  tempest-track:
+    if: "success() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'openstack-experimental-release-plz'"
+    runs-on: ubuntu-latest
+    needs:
+      - k3s-test
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Fetch tempest results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v5.0.0
+        with:
+          name: tempest-identity-results
+
+      - name: Extract tempest summary
+        id: summary
+        run: |
+          {
+            echo "body<<TEMPEST_COMMENT_EOF"
+            for target in rust python; do
+              if grep -q "^\[tempest-identity-${target}\]" tempest-results.log; then
+                echo "**${target}**"
+                echo
+                echo '```'
+                grep "^\[tempest-identity-${target}\]" tempest-results.log \
+                  | sed -E "s/^\[tempest-identity-${target}\] ?//" \
+                  | awk '/^Totals$/{f=1} f{print} /^Sum of execute time/{f=0}'
+                echo '```'
+                echo
+              fi
+            done
+            echo "<details><summary>Failed test IDs</summary>"
+            echo
+            echo '```'
+            awk '/FAILED TESTS \(target=/{show=1} show{print} /END FAILED TESTS \(target=/{show=0}' tempest-results.log \
+              | sed -E 's/^\[tempest-identity-[a-z]+\] ?//'
+            echo '```'
+            echo "</details>"
+            echo "TEMPEST_COMMENT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post tempest results to PR
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        with:
+          header: tempest
+          message: |
+            🧪 **Tempest Identity Compatibility Results** (advisory, non-blocking)
+
+            ${{ steps.summary.outputs.body }}
+
+            [View full run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
