@@ -1,0 +1,3 @@
+[submodule "src/keystone"]
+	path = src/keystone
+	url = https://github.com/openstack-experimental/keystone
