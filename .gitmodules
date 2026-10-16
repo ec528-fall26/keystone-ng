@@ -1,3 +1,6 @@
-[submodule "src/keystone"]
-	path = src/keystone
+[submodule "src/main/keystone"]
+	path = src/main/keystone
 	url = https://github.com/openstack-experimental/keystone
+[submodule "src/local/keystone"]
+	path = src/local/keystone
+	url = https://github.com/millionsouls/keystone
