@@ -27,30 +27,25 @@ Rust will need to be installed on the machine. If using VSCode, instructions are
 1. Install the Rust tool chain [here](https://rustup.rs). This installer is for Windows, MacOS and Linux. 
 2. Rust-Anlyzer is also avaliable on the VSCode extensions
 3. Check if rust is installed: ```rustc --version```
-
 4. Clone to Openstack Keystone fork repo: (This is our testing fork)
 ```
 git clone https://github.com/millionsouls/keystone
 ```
 5. Ensure you are on the demo-2 branch as this contains the proposed changes.
+6. Keystone needs `protoc` to build. MacOS: ```brew install protobuf```. Ubuntu: ```sudo apt-get install protobuf-compiler pkg-config 
+libssl-dev```.
 
-5. Keystone needs `protoc` to build. MacOS: ```brew install protobuf```. Ubuntu: ```sudo apt-get install protobuf-compiler pkg-config libssl-dev```.
 
 ## 4. Running the experiments
-
-One entry per claim you make. Someone else runs these; you do not get to
-explain them in person.
-
-### #1353 Exchanged Token Lifetimes are Capped
+### Exchanged Token Lifetimes are Capped
 | | |
 | --- | --- |
 | Supports | Exchanged token lifetimes' expiry should not exceed the total credential chain lifetime |
 | Command | `experiments/<script>.sh` |
 | Expected runtime | 3 minutes |
-| Expected output | All tests should pass with no failures. Ignored tests are expected. |
+| Expected output | All tests should pass with no failures. Ignored tests are expected as these are not relevent to fix. |
 
-### Experiment 2: External JWT verification
-
+### External JWT verification
 | | |
 | --- | --- |
 | Supports | verify_external_jwt accepts a JWT from an issuer trusted through an identity provider's `bound_issuer` and rejects bad ones (PR #1458) |
