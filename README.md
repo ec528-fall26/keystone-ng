@@ -2,11 +2,11 @@
 
 **Team:** <names>Kevin Wang, Thinh Nguyen, Dominic Murphy, Zebang Li\
 **Mentor:** Artem Goncharov (OpenStack Keystone) \
-**Project:** <one sentence: what this system does>
+**Project:** Openstack Keystone in Rust Language
 
 ## What this is
 
-<2-3 sentences. The problem, and what your system does about it.>
+Openstack Keystone's in the idnetity and access managment system which currently operates in the Python language. In this project we aim to assist the transitiojn to the Rust language.
 
 ## Quick start
 
