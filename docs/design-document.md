@@ -27,7 +27,7 @@
 Exact dependencies, versions, and hardware assumptions. Written so that someone
 starting from a clean machine can follow it.
 
-Rust will need to be installed on the machine. If using VSCode, instructions are able on the official website [here](https://code.visualstudio.com/docs/languages/rust).
+Rust will need to be installed on the machine. If using VSCode, instructions are on the official website [here](https://code.visualstudio.com/docs/languages/rust).
 
 1. Install the Rust tool chain [here](https://rustup.rs). This installer is for Windows, MacOS and Linux. 
 2. Rust-Anlyzer is also avaliable on the VSCode extensions
@@ -102,7 +102,7 @@ __Limitations__
 - The expired-subject HTTP test mocks token validation. It exercises the defense-in-depth path in claim building. In production, token validation would typically reject an expired subject token earlier.
 - MissingSubjectTokenExpiry is covered at the core level, not over HTTP. Covering it over HTTP needs a test helper that can build a subject token without an expiry.
 
-### JWT Validation
+### [2] JWT Validation
 Works: a token from a trusted issuer with a good signature and audience is accepted. The tests check that bad ones are rejected: untrusted issuer, empty audience list, expired, wrong audience, wrong key, changed token, `alg: none` and HS256.
 
 Not done: the token exchange endpoint only uses these functions in our patch (`src/external-jwt/4-token-exchange.patch`), not in PR #1458. The token it gives back only says who the external user is, it has no roles or project, since we did not map external users to Keystone users yet. The trusted issuers come from the `bound_issuer` of the enabled identity providers. `jwt_validation_pubkeys` is not used. We only tested with a mock identity provider, not a real one like Keycloak. The PR is still being reviewed so it can change.
