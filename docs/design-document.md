@@ -30,13 +30,22 @@ Rust will need to be installed on the machine. If using VSCode, instructions are
 
 1. Install the Rust tool chain [here](https://rustup.rs). This installer is for Windows, MacOS and Linux. 
 2. Rust-Anlyzer is also avaliable on the VSCode extensions
-3. Check if rust is installed: ```rustc --version```
-4. Clone to Openstack Keystone fork repo: (This is our testing fork)
+3. Check if rust is installed (This workspace requires Rust 1.96 or later):
+```
+rustc --version
+cargo --version
+rustup show
+```
+4. The formatting and lint components can be installed or refreshed with:
+```
+rustup component add rustfmt clippy
+```
+5. Clone to Openstack Keystone fork repo: (This is our testing fork)
 ```
 git clone https://github.com/millionsouls/keystone
 ```
-5. Ensure you are on the demo-2 branch as this contains the proposed changes.
-6. Keystone needs `protoc` to build. MacOS: ```brew install protobuf```. Ubuntu: ```sudo apt-get install protobuf-compiler pkg-config 
+6. Ensure you are on the demo-2 branch as this contains the proposed changes.
+7. Keystone needs `protoc` to build. MacOS: ```brew install protobuf```. Ubuntu: ```sudo apt-get install protobuf-compiler pkg-config 
 libssl-dev```.
 
 
