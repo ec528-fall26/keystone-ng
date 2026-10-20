@@ -43,7 +43,7 @@ libssl-dev```.
 | --- | --- |
 | Supports | Exchanged token lifetimes' expiry should not exceed the total credential chain lifetime |
 | Command | `experiments/README.md` |
-| Expected runtime | 3 minutes |
+| Expected runtime | Around 3-5 minutes depending on compile time based on hardware. |
 | Expected output | All tests should pass with no failures. Ignored tests are expected as these are not relevent. |
 
 ### External JWT verification
