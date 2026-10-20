@@ -76,6 +76,15 @@ libssl-dev```.
 | Expected runtime | Initial compilation may take several minutes; tests took approximately 0.26 seconds after compilation locally. |
 | Expected output | On the updated `demo-2` branch: `17 passed; 0 failed`. |
 
+### Validation Profile for OAuth2 subject tokens
+
+| Item | Details |
+| --- | --- |
+| Supports | `SubjectTokenValidationProfile` configures JWT validation rules by subject-token type; `verify_subject_token_jwt` validates signature, issuer, audience, required claims, and timing. `verify_openstack_access_token` reuses the Keystone-native profile while retaining revocation and delegation checks |
+| Command | `cd crates/core && cargo test -p openstack-keystone-core verify::tests` |
+| Expected runtime | ~5 minutes |
+| Expected output | On the updated `demo-2` branch: `46 passed; 0 failed` for verifier tests. |
+
 
 ## 5. Claims and limitations
 
