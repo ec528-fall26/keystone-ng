@@ -18,6 +18,15 @@ supports, how long it takes, and what output to expect.
 ```
 experiments/external-jwt-demo.sh
 ```
+
+Run it from the repo root on the `demo-2` branch. You need Rust and `protoc`, and the first build takes a few minutes.
+
+It runs two things:
+1. `demo_external_jwt_verification` starts a mock identity provider and checks 8 tokens against it. Only the valid one should be ACCEPTED. The other 7 should be REJECTED: untrusted issuer, issuer of a disabled provider, wrong audience, empty audience list, expired, HS256, and a changed payload.
+2. The token exchange tests, which include the external JWT cases: a JWT from a trusted issuer is accepted, one from an untrusted issuer is rejected, and one made for a different client is rejected.
+
+If everything passes, the last line is `OK: demo passed and all 17 token exchange tests passed.`
+
 ### Token-exchange request validation
 Verify the external JWT demonstration separately
 ```
