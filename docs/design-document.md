@@ -8,6 +8,7 @@
 1. [Issue](https://github.com/openstack-experimental/keystone/issues/1353) :: [PR](https://github.com/openstack-experimental/keystone/pull/1459) :: Capped token lfietimes when exchanged to the earliest expiry of the credntial chain.
 2. [Issue](https://github.com/openstack-experimental/keystone/issues/945) :: [PR](https://github.com/openstack-experimental/keystone/pull/1458) :: Added verification of external JWTs (signature, issuer and audience) so they can be used as the subject token in a token exchange.
 3. [Issue](https://github.com/openstack-experimental/keystone/issues/1354) :: [PR](https://github.com/openstack-experimental/keystone/pull/1575) :: Added JWT subject-token-type validation and OAuth errors for missing or unsupported types.
+4. [Issue](https://github.com/openstack-experimental/keystone/issues/1355) :: [PR](https://github.com/openstack-experimental/keystone/pull/1560) :: Added profile-driven JWT validation for OAuth2 subject tokens, providing a shared verification path for Keystone-native tokens and short-lived external assertions.
 
 ## 2. Design decisions
 1. Part of the OAuth2 implementation, when tokens are exchanged for new ones their lifetimes much be capped to the minimum of either the original token's expiry, or default expiry. In the current code, this lifetime is instead infinietly extened by the default lifetime (15 minutes), meaning everytime it is exchanged, its lifetime is extended by 15 minutes. This is a security concern as if an attacker acquires your token, they are then able to infinitely renew it to access sensitive data, resources, or conduct actions.
@@ -17,6 +18,8 @@
    Because of that our function returns an error if the audience list is empty. The untrusted issuer is not put in the error message, since the attacker controls that text and it would end up in the logs. The trusted list is given and stored in the `bound_issuer` of the identity provider.
 
 3. We validate `subject_token_type` before continuing token exchange. As an initial milestone, only the JWT type is accepted; missing or unsupported types return HTTP 400 with `invalid_request`. This gives clients clear errors while preserving existing authentication and delegation checks. Broader token-type dispatch required by upstream #1354 remains future work.
+
+4. We add `SubjectTokenValidationProfile` and `verify_subject_token_jwt` for shared, profile-driven JWT validation. `verify_openstack_access_token` now uses the Keystone-native profile while retaining its revocation and delegation checks; external assertions can use stricter audience and lifetime rules. `SubjectTokenValidationProfile` defines the issuer, audience, required-claim, and time-validation rules for a subject-token type. `verify_subject_token_jwt` verifies a JWT’s signature and claims against those rules. `verify_openstack_access_token` now uses the Keystone-native profile while retaining its revocation and delegation checks.
 
 ## 3. Setup
 
