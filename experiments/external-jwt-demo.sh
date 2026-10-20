@@ -1,6 +1,6 @@
 #!/bin/sh
 # Runs the external JWT demo (issue #6).
-# Downloads Keystone, applies the three patches from src/external-jwt/, runs the tests.
+# Downloads Keystone, applies the four patches from src/external-jwt/, runs the tests.
 # Usage: experiments/external-jwt-demo.sh [folder]   (default /tmp/keystone-issue-6)
 set -e
 
@@ -19,9 +19,12 @@ git -C "$DIR" checkout -q --detach "$BASE"
 git -C "$DIR" apply "$PATCHES/1-verification.patch"
 git -C "$DIR" apply "$PATCHES/2-bound-issuer.patch"
 git -C "$DIR" apply "$PATCHES/3-demo-test.patch"
+git -C "$DIR" apply "$PATCHES/4-token-exchange.patch"
 
-echo "Measuring: verify_external_jwt accepts a token from a trusted issuer and rejects 7 bad ones"
+echo "Measuring: verify_external_jwt accepts a token from a trusted issuer and rejects 7 bad ones,"
+echo "and the token exchange endpoint uses it for JWTs from identity providers"
 echo "The first build takes several minutes"
 cd "$DIR"
 cargo test -p openstack-keystone --lib demo_external_jwt_verification -- --nocapture
 cargo test -p openstack-keystone --lib federation::api::oidc_utils
+cargo test -p openstack-keystone --lib api::v4::oauth2::token::token_exchange::tests

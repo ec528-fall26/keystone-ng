@@ -1,8 +1,8 @@
 diff --git a/crates/keystone/src/federation/api/oidc_utils.rs b/crates/keystone/src/federation/api/oidc_utils.rs
-index 5bc6df69..bec28efd 100644
+index 5bc6df69..99362a82 100644
 --- a/crates/keystone/src/federation/api/oidc_utils.rs
 +++ b/crates/keystone/src/federation/api/oidc_utils.rs
-@@ -2049,4 +2049,118 @@ mod tests {
+@@ -2049,4 +2049,119 @@ mod tests {
          assert_eq!(trusted[1].issuer, "https://b.example.com");
          assert_eq!(trusted[1].jwks_url, Some("https://b.example.com/keys"));
      }
@@ -11,6 +11,7 @@ index 5bc6df69..bec28efd 100644
 +    /// identity provider over real HTTP and prints the result of each case.
 +    /// Run it with `--nocapture` to see the output.
 +    #[tokio::test]
++    #[allow(clippy::print_stdout, reason = "the demo prints its results")]
 +    async fn demo_external_jwt_verification() {
 +        fn report(name: &str, result: &Result<serde_json::Value, OidcError>) {
 +            match result {

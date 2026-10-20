@@ -66,7 +66,7 @@ explain them in person.
 | Supports | verify_external_jwt accepts a JWT from an issuer trusted through an identity provider's `bound_issuer` and rejects bad ones (PR #1458) |
 | Command | `experiments/external-jwt-demo.sh` |
 | Expected runtime | about 10 to 15 minutes the first time, most of it compiling Keystone |
-| Expected output | 8 lines, `valid token` is ACCEPTED and the other 7 are REJECTED, then `65 passed; 0 failed` |
+| Expected output | 8 lines, `valid token` is ACCEPTED and the other 7 are REJECTED, then `65 passed; 0 failed`, and `12 passed; 0 failed` for the token exchange tests |
 
 ## 5. Claims and limitations
 
@@ -76,5 +76,5 @@ cannot reproduce.*
 
 Works: a token from a trusted issuer with a good signature and audience is accepted. The tests check that bad ones are rejected: untrusted issuer, empty audience list, expired, wrong audience, wrong key, changed token, `alg: none` and HS256.
 
-Not done: nothing calls these functions yet, the token exchange endpoint only handles Keystone's own tokens. We did not decide where the trusted issuer list comes from. `jwt_validation_pubkeys` is not used. Only tested with a mock identity provider, not a real one like Keycloak. The PR is still in review so it can change.
+Not done: the token exchange endpoint only uses these functions in our patch (`src/external-jwt/4-token-exchange.patch`), not in PR #1458. The token it gives back only says who the external user is, it has no roles or project, since we did not map external users to Keystone users yet. The trusted issuers come from the `bound_issuer` of the enabled identity providers. `jwt_validation_pubkeys` is not used. We only tested with a mock identity provider, not a real one like Keycloak. The PR is still being reviewed so it can change.
 

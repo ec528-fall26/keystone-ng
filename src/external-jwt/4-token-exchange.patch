@@ -1,0 +1,347 @@
+diff --git a/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs b/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
+index 7219200c..d450e414 100644
+--- a/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
++++ b/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
+@@ -25,9 +25,13 @@ use governor::clock::Clock as _;
+ 
+ use openstack_keystone_core::auth::ExecutionContext;
+ use openstack_keystone_core_types::catalog::ServiceListParameters;
++use openstack_keystone_core_types::federation::IdentityProviderListParameters;
+ use openstack_keystone_core_types::oauth2_client::{Audience, GrantType};
+ 
+ use crate::audit::{build_initiator_from_vsc, emit_oauth2_session_event};
++use crate::federation::api::oidc_utils::{
++    build_http_client, extract_issuer, trusted_issuers_from_idps, verify_external_jwt,
++};
+ use crate::keystone::ServiceState;
+ 
+ use super::common::*;
+@@ -85,6 +89,21 @@ pub(super) async fn handle_token_exchange_grant(
+         ));
+     }
+ 
++    // A JWT from a trusted external identity provider is verified here. Anything
++    // else is treated as a Keystone token below.
++    if let Some(response) = exchange_external_jwt(
++        state,
++        domain_id,
++        headers,
++        oauth2_cfg,
++        &client.client_id,
++        &subject_token,
++    )
++    .await?
++    {
++        return Ok(response);
++    }
++
+     let (vsc, delegation_context) =
+         openstack_keystone_core::oauth2_client::validate_subject_token(state, &subject_token)
+             .await
+@@ -147,6 +166,106 @@ pub(super) async fn handle_token_exchange_grant(
+     Ok((StatusCode::OK, Json(response)).into_response())
+ }
+ 
++/// Claims of the token returned for an external subject token. It only says who
++/// the external identity is. There is no `openstack_context`, so OpenStack
++/// services do not accept it as an access token.
++#[derive(serde::Serialize)]
++struct ExternalIdentityClaims {
++    iss: String,
++    sub: String,
++    aud: String,
++    client_id: String,
++    external_issuer: String,
++    exp: i64,
++    iat: i64,
++    nbf: i64,
++    jti: String,
++    token_use: &'static str,
++}
++
++/// Exchange a JWT from an external identity provider. Returns `None` when the
++/// subject token is not a JWT or its issuer is not trusted, so the caller can
++/// handle it as a Keystone token.
++///
++/// The trusted issuers are the `bound_issuer` of the enabled identity providers
++/// of this domain (and the global ones). The token has to be made for the
++/// exchanging client (`aud`).
++async fn exchange_external_jwt(
++    state: &ServiceState,
++    domain_id: &str,
++    headers: &HeaderMap,
++    oauth2_cfg: &openstack_keystone_config::Oauth2Provider,
++    client_id: &str,
++    subject_token: &str,
++) -> Result<Option<Response>, Oauth2TokenError> {
++    let Ok(claimed_issuer) = extract_issuer(subject_token) else {
++        return Ok(None);
++    };
++
++    let idps = state
++        .provider
++        .get_federation_provider()
++        .list_identity_providers(
++            &ExecutionContext::internal(state),
++            &IdentityProviderListParameters {
++                domain_ids: Some(HashSet::from([None, Some(domain_id.to_string())])),
++                ..Default::default()
++            },
++        )
++        .await
++        .map_err(|e| {
++            tracing::warn!(error = %e, "oauth2 token exchange identity provider lookup failed");
++            Oauth2TokenError::internal("token issuance failed")
++        })?;
++    let trusted = trusted_issuers_from_idps(&idps);
++    if !trusted.iter().any(|t| t.issuer == claimed_issuer) {
++        return Ok(None);
++    }
++
++    let http_client = build_http_client().map_err(|e| {
++        tracing::warn!(error = %e, "oauth2 token exchange http client failed");
++        Oauth2TokenError::internal("token issuance failed")
++    })?;
++    let verified = verify_external_jwt(subject_token, &trusted, &[client_id], &http_client)
++        .await
++        .map_err(|e| {
++            tracing::warn!(error = %e, "oauth2 token exchange external subject_token rejected");
++            Oauth2TokenError::invalid_grant(
++                "subject_token is invalid, expired, or not for this client",
++            )
++        })?;
++    let Some(subject) = verified["sub"].as_str() else {
++        return Err(Oauth2TokenError::invalid_grant("subject_token has no sub"));
++    };
++
++    let base = base_url(state, headers).await;
++    let now = chrono::Utc::now().timestamp();
++    let access_lifetime = i64::from(oauth2_cfg.access_token_lifetime_minutes) * 60;
++    let claims = ExternalIdentityClaims {
++        iss: format!("{base}/v4/oauth2/{domain_id}"),
++        sub: subject.to_string(),
++        aud: client_id.to_string(),
++        client_id: client_id.to_string(),
++        external_issuer: claimed_issuer,
++        exp: now + access_lifetime,
++        iat: now,
++        nbf: now,
++        jti: uuid::Uuid::new_v4().to_string(),
++        token_use: "external_identity",
++    };
++    let access_token = sign_jwt(state, domain_id, &claims).await?;
++
++    let response = TokenResponse {
++        access_token,
++        token_type: "Bearer",
++        expires_in: access_lifetime,
++        scope: "external_identity".to_string(),
++        id_token: None,
++        refresh_token: None,
++    };
++    Ok(Some((StatusCode::OK, Json(response)).into_response()))
++}
++
+ /// Upper bound on `audience` values per request; there are far fewer service
+ /// types than this in any deployment.
+ const MAX_AUDIENCE_VALUES: usize = 16;
+@@ -635,4 +754,133 @@ mod tests {
+         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+         assert_eq!(json_body(response).await["error"], "invalid_grant");
+     }
++
++    /// Federation provider that knows one enabled identity provider whose
++    /// `bound_issuer` and `jwks_url` point at the mock server.
++    fn external_idp_provider(
++        issuer: &str,
++        jwks_url: &str,
++    ) -> crate::federation::MockFederationProvider {
++        let (issuer, jwks_url) = (issuer.to_string(), jwks_url.to_string());
++        let mut federation_mock = crate::federation::MockFederationProvider::default();
++        federation_mock
++            .expect_list_identity_providers()
++            .returning(move |_, _| {
++                Ok(vec![
++                    openstack_keystone_core_types::federation::IdentityProvider {
++                        id: "idp-1".into(),
++                        name: "keycloak".into(),
++                        enabled: true,
++                        bound_issuer: Some(issuer.clone()),
++                        jwks_url: Some(jwks_url.clone()),
++                        ..Default::default()
++                    },
++                ])
++            });
++        federation_mock
++    }
++
++    /// Exchange `subject_token` at a state that trusts the identity provider at
++    /// `server`. A subject token that is not external fails the Keystone check.
++    async fn exchange_external(
++        server: &httpmock::MockServer,
++        subject_token: &str,
++    ) -> axum::response::Response {
++        use crate::federation::api::oidc_utils::fixtures::{TEST_JWK_E, TEST_JWK_N, TEST_KID};
++        server.mock(|when, then| {
++            when.method(httpmock::Method::GET).path("/jwks");
++            then.status(200).json_body(serde_json::json!({"keys": [{
++                "kty": "RSA", "use": "sig", "alg": "RS256", "kid": TEST_KID,
++                "n": TEST_JWK_N, "e": TEST_JWK_E,
++            }]}));
++        });
++        let client = token_exchange_client().await;
++        let mut client_mock = MockOauth2ClientProvider::default();
++        client_mock
++            .expect_get_by_client_id()
++            .returning(move |_, _| Ok(Some(client.clone())));
++        let mut token_mock = crate::token::MockTokenProvider::default();
++        token_mock.expect_validate_to_context().returning(|_, _, _, _| {
++            Err(openstack_keystone_core_types::token::TokenProviderError::ActorHasNoRolesOnTarget)
++        });
++        let provider = Provider::mocked_builder()
++            .mock_oauth2_client(client_mock)
++            .mock_token(token_mock)
++            .mock_federation(external_idp_provider(
++                &server.base_url(),
++                &server.url("/jwks"),
++            ))
++            .mock_oauth2_key(ok_key_mock());
++        let state = get_mocked_state(provider, true, None).await;
++        let mut api = openapi_router()
++            .layer(TraceLayer::new_for_http())
++            .with_state(state);
++        api.as_service()
++            .oneshot(request(&format!(
++                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&client_id=client-1&client_secret=s3cr3t&subject_token={subject_token}"
++            )))
++            .await
++            .unwrap()
++    }
++
++    fn external_claims(issuer: &str, aud: &str) -> serde_json::Value {
++        serde_json::json!({
++            "sub": "external-user",
++            "iss": issuer,
++            "aud": aud,
++            "exp": chrono::Utc::now().timestamp() + 3600,
++            "iat": chrono::Utc::now().timestamp(),
++        })
++    }
++
++    #[tokio::test]
++    async fn test_token_exchange_accepts_jwt_from_bound_issuer() {
++        use crate::federation::api::oidc_utils::fixtures::{TEST_KID, make_jwt};
++        let server = httpmock::MockServer::start();
++        let subject = make_jwt(
++            &external_claims(&server.base_url(), "client-1"),
++            Some(TEST_KID),
++        );
++
++        let response = exchange_external(&server, &subject).await;
++        assert_eq!(response.status(), StatusCode::OK);
++        let body = json_body(response).await;
++        let claims = jwt_payload(body["access_token"].as_str().unwrap());
++        assert_eq!(claims["sub"], "external-user");
++        assert_eq!(claims["token_use"], "external_identity");
++        assert_eq!(claims["external_issuer"], server.base_url().as_str());
++        assert_eq!(claims["aud"], "client-1");
++        assert!(
++            claims.get("delegation_context").is_none(),
++            "an external identity token must not carry an OpenStack context"
++        );
++    }
++
++    #[tokio::test]
++    async fn test_token_exchange_rejects_external_jwt_for_other_client() {
++        use crate::federation::api::oidc_utils::fixtures::{TEST_KID, make_jwt};
++        let server = httpmock::MockServer::start();
++        let subject = make_jwt(
++            &external_claims(&server.base_url(), "some-other-client"),
++            Some(TEST_KID),
++        );
++
++        let response = exchange_external(&server, &subject).await;
++        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
++        assert_eq!(json_body(response).await["error"], "invalid_grant");
++    }
++
++    #[tokio::test]
++    async fn test_token_exchange_rejects_jwt_from_untrusted_issuer() {
++        use crate::federation::api::oidc_utils::fixtures::{TEST_KID, make_jwt};
++        let server = httpmock::MockServer::start();
++        let subject = make_jwt(
++            &external_claims("https://evil.example.com", "client-1"),
++            Some(TEST_KID),
++        );
++
++        let response = exchange_external(&server, &subject).await;
++        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
++        assert_eq!(json_body(response).await["error"], "invalid_grant");
++    }
+ }
+diff --git a/crates/keystone/src/federation/api/oidc_utils.rs b/crates/keystone/src/federation/api/oidc_utils.rs
+index 99362a82..d312f59f 100644
+--- a/crates/keystone/src/federation/api/oidc_utils.rs
++++ b/crates/keystone/src/federation/api/oidc_utils.rs
+@@ -335,7 +335,7 @@ fn check_nonce(
+ 
+ /// Build a `reqwest::Client` with redirect following disabled (SSRF guard)
+ /// and a reasonable default timeout to prevent resource exhaustion.
+-pub(super) fn build_http_client() -> Result<reqwest::Client, OidcError> {
++pub(crate) fn build_http_client() -> Result<reqwest::Client, OidcError> {
+     openstack_keystone_tls_provider::install_default();
+     reqwest::ClientBuilder::new()
+         .redirect(reqwest::redirect::Policy::none())
+@@ -345,12 +345,8 @@ pub(super) fn build_http_client() -> Result<reqwest::Client, OidcError> {
+ }
+ 
+ /// An issuer trusted to sign external JWTs.
+-#[cfg_attr(
+-    not(test),
+-    expect(dead_code, reason = "used by the external token exchange path")
+-)]
+ #[derive(Clone, Copy, Debug)]
+-pub(super) struct TrustedIssuer<'a> {
++pub(crate) struct TrustedIssuer<'a> {
+     /// Issuer identifier, compared exactly with the `iss` claim of the token.
+     pub issuer: &'a str,
+     /// Static JWKS URL. When set, discovery is skipped.
+@@ -359,11 +355,7 @@ pub(super) struct TrustedIssuer<'a> {
+ 
+ /// Read `iss` from a JWT payload without verifying the token. Only use the
+ /// result to pick a trusted issuer; `verify_jwt` checks the signed claim later.
+-#[cfg_attr(
+-    not(test),
+-    expect(dead_code, reason = "used by the external token exchange path")
+-)]
+-pub(super) fn extract_issuer(token: &str) -> Result<String, OidcError> {
++pub(crate) fn extract_issuer(token: &str) -> Result<String, OidcError> {
+     // Reject anything without a valid JWT header before parsing the payload by
+     // hand. The decoded header itself is not needed here.
+     decode_header(token)?;
+@@ -400,11 +392,7 @@ pub(super) fn extract_issuer(token: &str) -> Result<String, OidcError> {
+ ///
+ /// `audiences` must not be empty: `verify_jwt` skips the `aud` check for an
+ /// empty list, which would let a token minted for another service through.
+-#[cfg_attr(
+-    not(test),
+-    expect(dead_code, reason = "used by the external token exchange path")
+-)]
+-pub(super) async fn verify_external_jwt(
++pub(crate) async fn verify_external_jwt(
+     token: &str,
+     trusted_issuers: &[TrustedIssuer<'_>],
+     audiences: &[&str],
+@@ -437,11 +425,7 @@ pub(super) async fn verify_external_jwt(
+ 
+ /// Build the trusted issuer list from identity providers. An enabled provider
+ /// with a `bound_issuer` is trusted, and its `jwks_url` is used when it has one.
+-#[cfg_attr(
+-    not(test),
+-    expect(dead_code, reason = "used by the external token exchange path")
+-)]
+-pub(super) fn trusted_issuers_from_idps(
++pub(crate) fn trusted_issuers_from_idps(
+     idps: &[openstack_keystone_core_types::federation::IdentityProvider],
+ ) -> Vec<TrustedIssuer<'_>> {
+     idps.iter()
