@@ -28,10 +28,11 @@ Rust will need to be installed on the machine. If using VSCode, instructions are
 2. Rust-Anlyzer is also avaliable on the VSCode extensions
 3. Check if rust is installed: ```rustc --version```
 
-4. Clone to Openstack Keystone repo: \
+4. Clone to Openstack Keystone fork repo: (This is our testing fork)
 ```
-git clone https://github.com/openstack-experimental/keystone.git
+git clone https://github.com/millionsouls/keystone
 ```
+5. Ensure you are on the demo-2 branch as this contains the proposed changes.
 
 5. Keystone needs `protoc` to build. MacOS: ```brew install protobuf```. Ubuntu: ```sudo apt-get install protobuf-compiler pkg-config libssl-dev```.
 
@@ -40,24 +41,13 @@ git clone https://github.com/openstack-experimental/keystone.git
 One entry per claim you make. Someone else runs these; you do not get to
 explain them in person.
 
-### Experiment 1: <the claim this supports>
-
+### #1353 Exchanged Token Lifetimes are Capped
 | | |
 | --- | --- |
-| Supports | <which figure, table, or statement in your slides> |
+| Supports | Exchanged token lifetimes' expiry should not exceed the total credential chain lifetime |
 | Command | `experiments/<script>.sh` |
-| Expected runtime | <minutes> |
-| Expected output | <what they should see, and what counts as a match> |
-
-### Testing Exchanged Tokens Lifetimes are Capped
-
-```cargo test -p openstack-keystone-core oauth2_client::token_exchange::tests``` Verifies expiry rules are in place
-
-```cargo test -p openstack-keystone api::v4::oauth2::token::token_exchange::tests``` Pings token endpoints
-
-```cargo check -p openstack-keystone --message-format=short``` Verifies everything complies together
-
-```cargo fmt --check``` Ensures proper code format as part of Keystone contributer documents
+| Expected runtime | 3 minutes |
+| Expected output | All tests should pass with no failures. Ignored tests are expected. |
 
 ### Experiment 2: External JWT verification
 
