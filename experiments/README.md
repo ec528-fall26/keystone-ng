@@ -14,7 +14,6 @@ supports, how long it takes, and what output to expect.
 3. ```cargo check -p openstack-keystone --message-format=short``` Verifies everything complies together
 4. ```cargo fmt --check``` Ensures proper code format as part of Keystone contributer documents
 
-## External JWT Verification
 ### JWT Verification Demo
 ```
 experiments/external-jwt-demo.sh
