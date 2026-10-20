@@ -5,13 +5,14 @@
 
 ## 1. Architecture
 
-1. [Issue](https://github.com/openstack-experimental/keystone/issues/1353) :: [PR](https://github.com/openstack-experimental/keystone/pull/1459) :: Capped token lfietimes when exchanged to the earliest expiry of the credntial chain.
+1. [Issue](https://github.com/openstack-experimental/keystone/issues/1353) :: [PR](https://github.com/openstack-experimental/keystone/pull/1459) :: Capped token lfietimes when exchanged to the earliest expiry of the credntial chain. Code diff under: `src/expiry-lifetime/expity.patch` 
 2. [Issue](https://github.com/openstack-experimental/keystone/issues/945) :: [PR](https://github.com/openstack-experimental/keystone/pull/1458) :: Added verification of external JWTs (signature, issuer and audience) so they can be used as the subject token in a token exchange.
 3. [Issue](https://github.com/openstack-experimental/keystone/issues/1354) :: [PR](https://github.com/openstack-experimental/keystone/pull/1575) :: Added JWT subject-token-type validation and OAuth errors for missing or unsupported types.
 4. [Issue](https://github.com/openstack-experimental/keystone/issues/1355) :: [PR](https://github.com/openstack-experimental/keystone/pull/1560) :: Added profile-driven JWT validation for OAuth2 subject tokens, providing a shared verification path for Keystone-native tokens and short-lived external assertions.
 
 ## 2. Design decisions
-1. Part of the OAuth2 implementation, when tokens are exchanged for new ones their lifetimes much be capped to the minimum of either the original token's expiry, or default expiry. In the current code, this lifetime is instead infinietly extened by the default lifetime (15 minutes), meaning everytime it is exchanged, its lifetime is extended by 15 minutes. This is a security concern as if an attacker acquires your token, they are then able to infinitely renew it to access sensitive data, resources, or conduct actions.
+
+1. Previously, each token exchange issued a token expiring at now + access_token_lifetime_minutes (15 minutes by default), regardless of the subject token's expiry. Because an exchanged token could be exchanged again, an attacker holding one token could renew it indefinitely. The issued token's expiry is now the minimum of the configured lifetime, the subject token's expiry, and the delegated application credential's expiry, if it has one. The subject token's expiry is required, so a missing one is rejected with invalid_grant. The credential's expiry is optional, since application credentials may be non-expiring, and a missing one simply adds no extra cap. If the capped expiry is at or before the issue time, the request is also rejected with invalid_grant.
 
 2. During the token exchange process, the subject token can be a JWT from an outside identity provider which can be faked very easily if no proper authentication method is carried out. Therefore, Keystone has to check it itself. We read the `iss` from the token and only keep proceeding with the authentication process if it found on the provided list of trusted issuers, else the process stops and nothing is fetched. 
    If the trusted issuer has a `jwks_url` we use it to get the keys, if not we use the discovery document that is already included the src code. The existing `verify_jwt` carry out the signature check which uses the issuer from our list, not the one in the token which prevent wrong verification. It also skips the audience check when no audience is given, so a token made for another service would be accepted without hard coding it to our specific implementation.
@@ -50,11 +51,11 @@ libssl-dev```.
 
 
 ## 4. Running the experiments
-### Exchanged Token Lifetimes are Capped
+### [1] Token Lifetime Expiry Cap
 | | |
 | --- | --- |
 | Supports | Exchanged token lifetimes' expiry should not exceed the total credential chain lifetime |
-| Command | `experiments/README.md` |
+| Command | Instructions in: `experiments/README.md` |
 | Expected runtime | Around 3-5 minutes depending on compile time based on hardware. |
 | Expected output | All tests should pass with no failures. Ignored tests are expected as these are not relevent. |
 
@@ -78,7 +79,20 @@ libssl-dev```.
 
 ## 5. Claims and limitations
 
-### Token 
+### [1] Token Lifetime Expiry Cap
+__Claims__
+- An exchanged token never outlives its subject token.
+- An exchanged token never outlives the application credential it was delegated from, when that credential has an expiry.
+- An exchanged token never exceeds the configured access token lifetime.
+- Re-exchanging an exchanged token cannot extend its lifetime beyond the original bounds.
+
+__Limitations__
+- A non-expiring application credential is still a long-lived credential. This change bounds each exchanged token, not the credential. Anyone who can obtain a fresh subject token from it can keep getting new exchanged tokens.
+- Only application credential delegation is supported. Trust and EC2 return UnsupportedDelegation. The interface is built to extend, but a delegation with several expiries would need to return the earliest one.
+- The cap relies on the caller passing credential_expiration. Passing None skips the credential cap silently. The integration test that asserts exp equals the credential's expiry guards against this.
+- The expired-subject HTTP test mocks token validation. It exercises the defense-in-depth path in claim building. In production, token validation would typically reject an expired subject token earlier.
+- MissingSubjectTokenExpiry is covered at the core level, not over HTTP. Covering it over HTTP needs a test helper that can build a subject token without an expiry.
+
 ### JWT Validation
 Works: a token from a trusted issuer with a good signature and audience is accepted. The tests check that bad ones are rejected: untrusted issuer, empty audience list, expired, wrong audience, wrong key, changed token, `alg: none` and HS256.
 
