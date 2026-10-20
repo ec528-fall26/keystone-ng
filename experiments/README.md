@@ -16,3 +16,9 @@ cargo run --bin server
 
 cargo test --test token_integration -- --include-ignored --nocapture
 ```
+
+## External JWT Verification
+### JWT Verification Demo
+```
+experiments/external-jwt-demo.sh
+```

@@ -33,6 +33,8 @@ Rust will need to be installed on the machine. If using VSCode, instructions are
 git clone https://github.com/openstack-experimental/keystone.git
 ```
 
+5. Keystone needs `protoc` to build. MacOS: ```brew install protobuf```. Ubuntu: ```sudo apt-get install protobuf-compiler pkg-config libssl-dev```.
+
 ## 4. Running the experiments
 
 One entry per claim you make. Someone else runs these; you do not get to
@@ -56,6 +58,15 @@ explain them in person.
 ```cargo check -p openstack-keystone --message-format=short``` Verifies everything complies together
 
 ```cargo fmt --check``` Ensures proper code format as part of Keystone contributer documents
+
+### Experiment 2: External JWT verification
+
+| | |
+| --- | --- |
+| Supports | verify_external_jwt accepts a JWT from an issuer trusted through an identity provider's `bound_issuer` and rejects bad ones (PR #1458) |
+| Command | `experiments/external-jwt-demo.sh` |
+| Expected runtime | about 10 to 15 minutes the first time, most of it compiling Keystone |
+| Expected output | 8 lines, `valid token` is ACCEPTED and the other 7 are REJECTED, then `65 passed; 0 failed` |
 
 ## 5. Claims and limitations
 
