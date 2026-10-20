@@ -42,9 +42,9 @@ libssl-dev```.
 | | |
 | --- | --- |
 | Supports | Exchanged token lifetimes' expiry should not exceed the total credential chain lifetime |
-| Command | `experiments/<script>.sh` |
+| Command | `experiments/expiry.md` |
 | Expected runtime | 3 minutes |
-| Expected output | All tests should pass with no failures. Ignored tests are expected as these are not relevent to fix. |
+| Expected output | All tests should pass with no failures. Ignored tests are expected as these are not relevent. |
 
 ### External JWT verification
 | | |
@@ -64,14 +64,10 @@ libssl-dev```.
 | Expected output | On the updated `demo-2` branch: `17 passed; 0 failed`. |
 
 
-
-18:05
 ## 5. Claims and limitations
 
-What your artifact supports, and an honest account of what does not work or was
-not tested. *An honest narrower result scores better than an impressive result we
-cannot reproduce.*
-
+### Token 
+### JWT Validation
 Works: a token from a trusted issuer with a good signature and audience is accepted. The tests check that bad ones are rejected: untrusted issuer, empty audience list, expired, wrong audience, wrong key, changed token, `alg: none` and HS256.
 
 Not done: the token exchange endpoint only uses these functions in our patch (`src/external-jwt/4-token-exchange.patch`), not in PR #1458. The token it gives back only says who the external user is, it has no roles or project, since we did not map external users to Keystone users yet. The trusted issuers come from the `bound_issuer` of the enabled identity providers. `jwt_validation_pubkeys` is not used. We only tested with a mock identity provider, not a real one like Keycloak. The PR is still being reviewed so it can change.
