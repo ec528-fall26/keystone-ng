@@ -54,6 +54,18 @@ libssl-dev```.
 | Expected runtime | about 10 to 15 minutes the first time, most of it compiling Keystone |
 | Expected output | 8 lines, `valid token` is ACCEPTED and the other 7 are REJECTED, then `65 passed; 0 failed`, and `12 passed; 0 failed` for the token exchange tests |
 
+### Token-exchange request validation
+
+| Item | Details |
+| --- | --- |
+| Supports | Rejects missing or unsupported token types while preserving existing token-exchange checks. |
+| Command | `cargo test -p openstack-keystone --lib api::v4::oauth2::token::token_exchange::tests -j 1` |
+| Expected runtime | Initial compilation may take several minutes; tests took approximately 0.26 seconds after compilation locally. |
+| Expected output | On the updated `demo-2` branch: `17 passed; 0 failed`. |
+
+
+
+18:05
 ## 5. Claims and limitations
 
 What your artifact supports, and an honest account of what does not work or was
