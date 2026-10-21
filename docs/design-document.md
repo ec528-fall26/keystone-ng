@@ -24,8 +24,8 @@
 
 ## 3. Setup
 
-Exact dependencies, versions, and hardware assumptions. Written so that someone
-starting from a clean machine can follow it.
+_Exact dependencies, versions, and hardware assumptions. Written so that someone
+starting from a clean machine can follow it._
 
 Rust will need to be installed on the machine. If using VSCode, instructions are on the official website [here](https://code.visualstudio.com/docs/languages/rust).
 
@@ -56,7 +56,7 @@ libssl-dev```.
 Run every command inside the fork clone from Setup (`millionsouls/keystone`, branch `demo-2`), not in this repo.
 
 ### [1] Token Lifetime Expiry Cap
-| | |
+| Item | Details |
 | --- | --- |
 | Supports | Exchanged token lifetimes' expiry should not exceed the total credential chain lifetime |
 | Command | Instructions in: `experiments/README.md` |
@@ -64,7 +64,7 @@ Run every command inside the fork clone from Setup (`millionsouls/keystone`, bra
 | Expected output | All tests should pass with no failures. Ignored tests are expected as these are not relevent. |
 
 ### [2] External JWT verification
-| | |
+| Item | Details |
 | --- | --- |
 | Supports | `verify_external_jwt` accepts a JWT from an issuer trusted through an identity provider's `bound_issuer` and rejects bad ones (PR #1458). The token exchange uses it for JWTs from those providers. |
 | Command | Instructions in: `experiments/README.md` |
