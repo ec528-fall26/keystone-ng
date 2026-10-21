@@ -15,11 +15,11 @@ git branch --show-current
 ```
 The last command should print `demo-2`. You need Rust and `protoc` (see Setup in the design document).
 
-### Token Lifetime Expiry Cap
+## Token Lifetime Expiry Cap
 1. ```cargo test -p openstack-keystone-core oauth2_client::token_exchange::tests``` Verifies expiry rules are in place
 2. ```cargo test -p openstack-keystone api::v4::oauth2::token::token_exchange::tests``` Pings token endpoints
 
-### JWT Verification Demo
+## JWT Verification Demo
 1. Checks 8 tokens against a fake identity provider. Only the valid one is ACCEPTED. The other 7 are REJECTED: untrusted issuer, issuer of a disabled provider, wrong audience, empty audience list, expired, HS256, and a token changed after signing. It ends with `1 passed; 0 failed`.
 ```
 cargo test -p openstack-keystone --lib demo_external_jwt_verification -- --nocapture
@@ -33,22 +33,20 @@ cargo test -p openstack-keystone --lib federation::api::oidc_utils
 cargo test -p openstack-keystone --lib api::v4::oauth2::token::token_exchange::tests
 ```
 
-
-
-### Token-exchange request validation
+## Token-exchange request validation
 Verify the external JWT demonstration separately
 ```
 cargo test -p openstack-keystone --lib api::v4::oauth2::token::token_exchange::tests -j 1
 ```
 
-### Validation Profile for OAuth2 subject tokens
+## Validation Profile for OAuth2 subject tokens
 Navigate your Terminal to the crates/core folder to run the cargo tests
 ```
 cd crates/core
 cargo test -p openstack-keystone-core verify::tests
 ```
 
-### Conform with contributor and security expectations
+## Conform with contributor and security expectations
 ```
 cd crates/core
 ```
