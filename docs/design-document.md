@@ -6,7 +6,7 @@
 ## 1. Architecture
 
 1. [Issue](https://github.com/openstack-experimental/keystone/issues/1353) :: [PR](https://github.com/openstack-experimental/keystone/pull/1459) :: Capped token lfietimes when exchanged to the earliest expiry of the credntial chain. Code diff under: `src/expiry-lifetime/expity.patch` 
-2. [Issue](https://github.com/openstack-experimental/keystone/issues/945) :: [PR](https://github.com/openstack-experimental/keystone/pull/1458) :: Added verification of external JWTs (signature, issuer and audience) so they can be used as the subject token in a token exchange.
+2. [Issue](https://github.com/openstack-experimental/keystone/issues/945) :: [PR](https://github.com/openstack-experimental/keystone/pull/1458) :: Added verification of external JWTs (signature, issuer and audience) so they can be used as the subject token in a token exchange. The code is on the `demo-2` branch of our fork. Patches against upstream: `src/external-jwt/`.
 3. [Issue](https://github.com/openstack-experimental/keystone/issues/1354) :: [PR](https://github.com/openstack-experimental/keystone/pull/1575) :: Added JWT subject-token-type validation and OAuth errors for missing or unsupported types.
 4. [Issue](https://github.com/openstack-experimental/keystone/issues/1355) :: [PR](https://github.com/openstack-experimental/keystone/pull/1560) :: Added profile-driven JWT validation for OAuth2 subject tokens, providing a shared verification path for Keystone-native tokens and short-lived external assertions.
 
@@ -15,8 +15,8 @@
 1. Previously, each token exchange issued a token expiring at now + access_token_lifetime_minutes (15 minutes by default), regardless of the subject token's expiry. Because an exchanged token could be exchanged again, an attacker holding one token could renew it indefinitely. The issued token's expiry is now the minimum of the configured lifetime, the subject token's expiry, and the delegated application credential's expiry, if it has one. The subject token's expiry is required, so a missing one is rejected with invalid_grant. The credential's expiry is optional, since application credentials may be non-expiring, and a missing one simply adds no extra cap. If the capped expiry is at or before the issue time, the request is also rejected with invalid_grant.
 
 2. During the token exchange process, the subject token can be a JWT from an outside identity provider which can be faked very easily if no proper authentication method is carried out. Therefore, Keystone has to check it itself. We read the `iss` from the token and only keep proceeding with the authentication process if it found on the provided list of trusted issuers, else the process stops and nothing is fetched. 
-   If the trusted issuer has a `jwks_url` we use it to get the keys, if not we use the discovery document that is already included the src code. The existing `verify_jwt` carry out the signature check which uses the issuer from our list, not the one in the token which prevent wrong verification. It also skips the audience check when no audience is given, so a token made for another service would be accepted without hard coding it to our specific implementation.
-   Because of that our function returns an error if the audience list is empty. The untrusted issuer is not put in the error message, since the attacker controls that text and it would end up in the logs. The trusted list is given and stored in the `bound_issuer` of the identity provider.
+   If the trusted issuer has a `jwks_url` we use it to get the keys, if not we use the discovery document that is already included the src code. The existing `verify_jwt` carry out the signature check which uses the issuer from our list, not the one in the token which prevent wrong verification. It only allows asymmetric algorithms, so HS256 and `alg: none` tokens are rejected. It also skips the audience check when no audience is given, so a token made for another service would be accepted without hard coding it to our specific implementation.
+   Because of that our function returns an error if the audience list is empty. The untrusted issuer is not put in the error message, since the attacker controls that text and it would end up in the logs. The trusted list is given and stored in the `bound_issuer` of the identity provider, and only enabled providers count. The audience has to be the `client_id` of the client doing the exchange. A JWT from an issuer that is not on the list is treated as a normal Keystone token and rejected there.
 
 3. We validate `subject_token_type` before continuing token exchange. As an initial milestone, only the JWT type is accepted; missing or unsupported types return HTTP 400 with `invalid_request`. This gives clients clear errors while preserving existing authentication and delegation checks. Broader token-type dispatch required by upstream #1354 remains future work.
 
@@ -41,16 +41,20 @@ rustup show
 ```
 rustup component add rustfmt clippy
 ```
-5. Clone to Openstack Keystone fork repo: (This is our testing fork)
+5. Clone to Openstack Keystone fork repo: (This is our testing fork). Our code is on the `demo-2` branch, so clone that branch:
 ```
-git clone https://github.com/millionsouls/keystone
+git clone -b demo-2 https://github.com/millionsouls/keystone.git
+cd keystone
+git branch --show-current
 ```
-6. Ensure you are on the demo-2 branch as this contains the proposed changes.
+6. The last command should print `demo-2`.
 7. Keystone needs `protoc` to build. MacOS: ```brew install protobuf```. Ubuntu: ```sudo apt-get install protobuf-compiler pkg-config 
 libssl-dev```.
 
 
 ## 4. Running the experiments
+Run every command inside the fork clone from Setup (`millionsouls/keystone`, branch `demo-2`), not in this repo.
+
 ### [1] Token Lifetime Expiry Cap
 | | |
 | --- | --- |
@@ -62,10 +66,12 @@ libssl-dev```.
 ### External JWT verification
 | | |
 | --- | --- |
-| Supports | verify_external_jwt accepts a JWT from an issuer trusted through an identity provider's `bound_issuer` and rejects bad ones (PR #1458) |
-| Command | `experiments/external-jwt-demo.sh` |
-| Expected runtime | about 10 to 15 minutes the first time, most of it compiling Keystone |
-| Expected output | 8 lines, `valid token` is ACCEPTED and the other 7 are REJECTED, then `65 passed; 0 failed`, and `12 passed; 0 failed` for the token exchange tests |
+| Supports | `verify_external_jwt` accepts a JWT from an issuer trusted through an identity provider's `bound_issuer` and rejects bad ones (PR #1458). The token exchange uses it for JWTs from those providers. |
+| Command | `./experiments/external-jwt-demo.sh` |
+| Expected runtime | A few minutes the first time (compiling Keystone), a few seconds after that. |
+| Expected output | A table of 8 tokens, `valid token` is ACCEPTED and the other 7 are REJECTED, then `1 passed; 0 failed`. Then the token exchange tests end with `17 passed; 0 failed` and the last line is `OK: demo passed and all 17 token exchange tests passed.` |
+
+All the JWT verification tests: `cargo test -p openstack-keystone --lib federation::api::oidc_utils`, should end with `65 passed; 0 failed`.
 
 ### Token-exchange request validation
 
@@ -105,5 +111,5 @@ __Limitations__
 ### [2] JWT Validation
 Works: a token from a trusted issuer with a good signature and audience is accepted. The tests check that bad ones are rejected: untrusted issuer, empty audience list, expired, wrong audience, wrong key, changed token, `alg: none` and HS256.
 
-Not done: the token exchange endpoint only uses these functions in our patch (`src/external-jwt/4-token-exchange.patch`), not in PR #1458. The token it gives back only says who the external user is, it has no roles or project, since we did not map external users to Keystone users yet. The trusted issuers come from the `bound_issuer` of the enabled identity providers. `jwt_validation_pubkeys` is not used. We only tested with a mock identity provider, not a real one like Keycloak. The PR is still being reviewed so it can change.
+Not done: PR #1458 does not call these functions. The token exchange only uses them in our fork on the `demo-2` branch (same change against upstream: `src/external-jwt/4-token-exchange.patch`). The token it gives back only says who the external user is, with no roles or project, since we did not map external users to Keystone users yet. It also gets the default lifetime and is not capped to the expiry of the external JWT, so it can outlive it (the cap in [1] only covers Keystone tokens). The trusted issuers come from the `bound_issuer` of the enabled identity providers. `jwt_validation_pubkeys` is not used. We only tested with a mock identity provider, not a real one like Keycloak. The PR is still being reviewed so it can change.
 
