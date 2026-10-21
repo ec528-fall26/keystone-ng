@@ -18,8 +18,6 @@ The last command should print `demo-2`. You need Rust and `protoc` (see Setup in
 ### Token Lifetime Expiry Cap
 1. ```cargo test -p openstack-keystone-core oauth2_client::token_exchange::tests``` Verifies expiry rules are in place
 2. ```cargo test -p openstack-keystone api::v4::oauth2::token::token_exchange::tests``` Pings token endpoints
-3. ```cargo check -p openstack-keystone --message-format=short``` Verifies everything complies together
-4. ```cargo fmt --check``` Ensures proper code format as part of Keystone contributer documents
 
 ### JWT Verification Demo
 ```
@@ -44,4 +42,19 @@ Verify the external JWT demonstration separately
 ```
 cargo test -p openstack-keystone --lib api::v4::oauth2::token::token_exchange::tests -j 1
 ```
+
+### Validation Profile for OAuth2 subject tokens
+Navigate your Terminal to the crates/core folder to run the cargo tests
+```
+cd crates/core
+cargo test -p openstack-keystone-core verify::tests
+```
+
+### Conform with contributor and security expectations
+```
+cd crates/core
+```
+1. ```cargo clippy -p openstack-keystone-core --all-targets``` Catch common mistakes, optimize code, and enforce style guidelines
+2. ```cargo check -p openstack-keystone --message-format=short``` Verifies everything complies together
+3. ```cargo fmt --check``` Ensures proper code format as part of Keystone contributer documents
 
