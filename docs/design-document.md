@@ -131,7 +131,21 @@ __Claims and Limitations__
 - Adds focused tests for valid and rejected tokens, including signature, issuer, audience, claims, and timing checks.
 - Does not wire external JWT verification into the token-exchange endpoint.
 - Does not fetch external issuer keys, implement replay prevention, or integrate the mapping engine.
+### [5] Subject Token Type Validation
 
+**Claims**
+
+- Token-exchange requests require the include `subject_token_type`.
+- It only accepts `urn:ietf:params:oauth:token-type:jwt`as the requirement token class.
+- Missing or unsupported types return HTTP 400 with the OAuth `invalid_request` error.
+- Two new negative tests about missing and unsupported types. All 11 targeted tests passed on the feature branch. 
+**Limitations**
+
+- This checks the declared token type, it not really check the format, signature, issuer, or audience of token. Those checks will vaildate on the downstream verifier.
+- JWT-only acceptance is an initial milestone. It does not implement the broader token-type dispatch required by upstream issue #1354.
+- This change does not met other RFC 8693 requirements,  `requested_token_type` and `issued_token_type`, or scope handling still need time to solve.
+- Passing the targeted tests does not establish full project compatibility. The broader Tempest run reported failures that still need investigation.
+- PR #1575 was submitted upstream; submission does not mean the change has been accepted or merged.
 ### Functionality Tests We Contributed to the Testing Suites
 #### In core token-exchange tests:
 test_build_token_exchange_claims_caps_at_subject_token_expiry
