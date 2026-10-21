@@ -91,6 +91,15 @@ All the JWT verification tests: `cargo test -p openstack-keystone --lib federati
 | Expected runtime | ~5 minutes |
 | Expected output | On the updated `demo-2` branch: `46 passed; 0 failed` for verifier tests. |
 
+### [5] Conform with contributor and security expectations
+
+| Item | Details |
+| --- | --- |
+| Supports | Catching common mistakes, optimizing code, enforcing style guidelines, verifing everything complies together and assures proper code format as part of Keystone contributer documents |
+| Command | Instructions in: `experiments/README.md` |
+| Expected runtime | NEEDS TO BE UPDATED |
+| Expected output | NEEDS TO BE UPDATED |
+
 
 ## 5. Claims and limitations
 
@@ -112,4 +121,14 @@ __Limitations__
 Works: a token from a trusted issuer with a good signature and audience is accepted. The tests check that bad ones are rejected: untrusted issuer, empty audience list, expired, wrong audience, wrong key, changed token, `alg: none` and HS256.
 
 Not done: PR #1458 does not call these functions. The token exchange only uses them in our fork on the `demo-2` branch (same change against upstream: `src/external-jwt/4-token-exchange.patch`). The token it gives back only says who the external user is, with no roles or project, since we did not map external users to Keystone users yet. It also gets the default lifetime and is not capped to the expiry of the external JWT, so it can outlive it (the cap in [1] only covers Keystone tokens). The trusted issuers come from the `bound_issuer` of the enabled identity providers. `jwt_validation_pubkeys` is not used. We only tested with a mock identity provider, not a real one like Keycloak. The PR is still being reviewed so it can change.
+
+### [4] Validation Profiles
+
+__Claims and Limitations__
+- Adds SubjectTokenValidationProfile to define issuer, audience, required-claim, and time-validation rules for different JWT subject-token types.
+- Adds verify_subject_token_jwt to validate a JWT’s signature and claims against a profile.
+- Refactors verify_openstack_access_token to use the Keystone-native profile while retaining revocation and delegation checks.
+- Adds focused tests for valid and rejected tokens, including signature, issuer, audience, claims, and timing checks.
+- Does not wire external JWT verification into the token-exchange endpoint.
+- Does not fetch external issuer keys, implement replay prevention, or integrate the mapping engine.
 
