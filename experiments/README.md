@@ -16,8 +16,14 @@ git branch --show-current
 The last command should print `demo-2`. You need Rust and `protoc` (see Setup in the design document).
 
 ## Token Lifetime Expiry Cap
-1. ```cargo test -p openstack-keystone-core oauth2_client::token_exchange::tests``` Verifies expiry rules are in place
-2. ```cargo test -p openstack-keystone api::v4::oauth2::token::token_exchange::tests``` Pings token endpoints
+1. Core unit tests for token exchange claim building. Verify that exp is the minimum of the configured lifetime, the subject token's expiry and the app credential's expiry (where a non-expiring credential adds no cap), and that a missing subject token expiry or a lifetime of zero or less is rejected with an error.
+```
+cargo test -p openstack-keystone-core oauth2_client::token_exchange::tests
+``` 
+2. Runs the HTTP-level token exchange tests through the real router with mocked providers. Verify that the issued JWT's exp is capped by the app credential's expiry, and that an already-expired app credential, an app credential expiring now, and an expired subject token are each rejected with 400 invalid_grant.
+```
+cargo test -p openstack-keystone api::v4::oauth2::token::token_exchange::tests
+``` 
 
 ## JWT Verification Demo
 1. Checks 8 tokens against a fake identity provider. Only the valid one is ACCEPTED. The other 7 are REJECTED: untrusted issuer, issuer of a disabled provider, wrong audience, empty audience list, expired, HS256, and a token changed after signing. It ends with `1 passed; 0 failed`.
@@ -42,15 +48,10 @@ cargo test -p openstack-keystone --lib api::v4::oauth2::token::token_exchange::t
 ## Validation Profile for OAuth2 subject tokens
 Navigate your Terminal to the crates/core folder to run the cargo tests
 ```
-cd crates/core
 cargo test -p openstack-keystone-core verify::tests
 ```
 
 ## Conform with contributor and security expectations
-```
-cd crates/core
-```
 1. ```cargo clippy -p openstack-keystone-core --all-targets``` Catch common mistakes, optimize code, and enforce style guidelines
 2. ```cargo check -p openstack-keystone --message-format=short``` Verifies everything complies together
-3. ```cargo fmt --check``` Ensures proper code format as part of Keystone contributer documents
 

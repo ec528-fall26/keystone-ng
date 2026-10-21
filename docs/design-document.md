@@ -60,7 +60,7 @@ Run every command inside the fork clone from Setup (`millionsouls/keystone`, bra
 | --- | --- |
 | Supports | Exchanged token lifetimes' expiry should not exceed the total credential chain lifetime |
 | Command | Instructions in: `experiments/README.md` |
-| Expected runtime | Around 3-5 minutes depending on compile time based on hardware. |
+| Expected runtime | Around 3-5 minutes depending on compile time based on hardware. Tests should take a few seconds after. |
 | Expected output | All tests should pass with no failures. Ignored tests are expected as these are not relevent. |
 
 ### [2] External JWT verification
