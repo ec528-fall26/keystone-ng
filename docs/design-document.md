@@ -87,7 +87,7 @@ All the JWT verification tests: `cargo test -p openstack-keystone --lib federati
 | Item | Details |
 | --- | --- |
 | Supports | `SubjectTokenValidationProfile` configures JWT validation rules by subject-token type; `verify_subject_token_jwt` validates signature, issuer, audience, required claims, and timing. `verify_openstack_access_token` reuses the Keystone-native profile while retaining revocation and delegation checks |
-| Command | `cd crates/core && cargo test -p openstack-keystone-core verify::tests` |
+| Command | Instructions in: `experiments/README.md` |
 | Expected runtime | ~5 minutes |
 | Expected output | On the updated `demo-2` branch: `46 passed; 0 failed` for verifier tests. |
 
