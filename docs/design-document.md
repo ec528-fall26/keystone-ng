@@ -97,8 +97,8 @@ All the JWT verification tests: `cargo test -p openstack-keystone --lib federati
 | --- | --- |
 | Supports | Catching common mistakes, optimizing code, enforcing style guidelines, verifing everything complies together and assures proper code format as part of Keystone contributer documents |
 | Command | Instructions in: `experiments/README.md` |
-| Expected runtime | NEEDS TO BE UPDATED |
-| Expected output | NEEDS TO BE UPDATED |
+| Expected runtime | ~10 minutes |
+| Expected output | 6 warnings and 0 failures. Please note that these warnings are in regards to unused code which we did not contribute. |
 
 
 ## 5. Claims and limitations
