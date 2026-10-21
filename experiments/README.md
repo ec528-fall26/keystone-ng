@@ -22,22 +22,20 @@ The last command should print `demo-2`. You need Rust and `protoc` (see Setup in
 4. ```cargo fmt --check``` Ensures proper code format as part of Keystone contributer documents
 
 ### JWT Verification Demo
+1. Checks 8 tokens against a fake identity provider. Only the valid one is ACCEPTED. The other 7 are REJECTED: untrusted issuer, issuer of a disabled provider, wrong audience, empty audience list, expired, HS256, and a token changed after signing. It ends with `1 passed; 0 failed`.
 ```
-./experiments/external-jwt-demo.sh
+cargo test -p openstack-keystone --lib demo_external_jwt_verification -- --nocapture
 ```
-
-Run this inside the fork folder from above. The first build takes a few minutes, after that it is quick.
-
-The script runs two things:
-1. `demo_external_jwt_verification` sets up a fake identity provider and checks 8 tokens. Only the valid one is ACCEPTED. The other 7 are REJECTED: untrusted issuer, issuer of a disabled provider, wrong audience, empty audience list, expired, HS256, and a token changed after signing.
-2. The token exchange tests, which include the external JWT cases (trusted issuer accepted, untrusted issuer rejected, token made for a different client rejected).
-
-If it all passes, the last line is `OK: demo passed and all 17 token exchange tests passed.`
-
-To also run all the JWT verification tests (65):
+2. All the JWT verification tests (bad signature, wrong key, `alg: none`, untrusted issuer and so on). It ends with `65 passed; 0 failed`.
 ```
 cargo test -p openstack-keystone --lib federation::api::oidc_utils
 ```
+3. The token exchange tests, which include the external JWT cases (trusted issuer accepted, untrusted issuer rejected, token made for a different client rejected). It ends with `17 passed; 0 failed`.
+```
+cargo test -p openstack-keystone --lib api::v4::oauth2::token::token_exchange::tests
+```
+
+
 
 ### Token-exchange request validation
 Verify the external JWT demonstration separately
