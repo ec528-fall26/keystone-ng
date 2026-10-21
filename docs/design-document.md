@@ -68,7 +68,7 @@ Run every command inside the fork clone from Setup (`millionsouls/keystone`, bra
 | --- | --- |
 | Supports | `verify_external_jwt` accepts a JWT from an issuer trusted through an identity provider's `bound_issuer` and rejects bad ones (PR #1458). The token exchange uses it for JWTs from those providers. |
 | Command | Instructions in: `experiments/README.md` |
-| Expected runtime | About 5 to 10 minutes the first time”(compiling Keystone), a few seconds after that. |
+| Expected runtime | About 5 to 10 minutes the first time (compiling Keystone), a few seconds after that. |
 | Expected output | A table of 8 tokens, `valid token` is ACCEPTED and the other 7 are REJECTED, then `1 passed; 0 failed`. Then the token exchange tests end with `17 passed; 0 failed` and the last line is `OK: demo passed and all 17 token exchange tests passed.` |
 
 All the JWT verification tests: `cargo test -p openstack-keystone --lib federation::api::oidc_utils`, should end with `65 passed; 0 failed`.
