@@ -63,17 +63,17 @@ Run every command inside the fork clone from Setup (`millionsouls/keystone`, bra
 | Expected runtime | Around 3-5 minutes depending on compile time based on hardware. |
 | Expected output | All tests should pass with no failures. Ignored tests are expected as these are not relevent. |
 
-### External JWT verification
+### [2] External JWT verification
 | | |
 | --- | --- |
 | Supports | `verify_external_jwt` accepts a JWT from an issuer trusted through an identity provider's `bound_issuer` and rejects bad ones (PR #1458). The token exchange uses it for JWTs from those providers. |
-| Command | `./experiments/external-jwt-demo.sh` |
+| Command | Instructions in: `experiments/README.md` |
 | Expected runtime | A few minutes the first time (compiling Keystone), a few seconds after that. |
 | Expected output | A table of 8 tokens, `valid token` is ACCEPTED and the other 7 are REJECTED, then `1 passed; 0 failed`. Then the token exchange tests end with `17 passed; 0 failed` and the last line is `OK: demo passed and all 17 token exchange tests passed.` |
 
 All the JWT verification tests: `cargo test -p openstack-keystone --lib federation::api::oidc_utils`, should end with `65 passed; 0 failed`.
 
-### Token-exchange request validation
+### [3] Token-exchange request validation
 
 | Item | Details |
 | --- | --- |
@@ -82,7 +82,7 @@ All the JWT verification tests: `cargo test -p openstack-keystone --lib federati
 | Expected runtime | Initial compilation may take several minutes; tests took approximately 0.26 seconds after compilation locally. |
 | Expected output | On the updated `demo-2` branch: `17 passed; 0 failed`. |
 
-### Validation Profile for OAuth2 subject tokens
+### [4] Validation Profile for OAuth2 subject tokens
 
 | Item | Details |
 | --- | --- |
