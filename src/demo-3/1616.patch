@@ -1,0 +1,415 @@
+From 0f9045fa3a2fd3d292d1f2bed682b821e98a7e0d Mon Sep 17 00:00:00 2001
+From: Kevin <36448536+millionsouls@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 23:04:48 -0500
+Subject: [PATCH 1/4] fix(oauth2): Apply default token exp if nil (#1353)
+
+Use configured access token lifetime if the subject or app cred
+token have no expiry. Caps exp at credential expiry that is present,
+reject any lifetime that is not postive, and send result to
+expires_in.
+
+Assisted-by: Claude <noreply@anthropic.com>
+
+Signed-off-by: Kevin <36448536+millionsouls@users.noreply.github.com>
+---
+ .../core/src/oauth2_client/token_exchange.rs  | 42 +++++++++++--------
+ .../src/api/v4/oauth2/token/token_exchange.rs | 23 +++++++++-
+ doc/src/adr/0026-oauth2-oidc-provider.md      | 13 +++---
+ 3 files changed, 53 insertions(+), 25 deletions(-)
+
+diff --git a/crates/core/src/oauth2_client/token_exchange.rs b/crates/core/src/oauth2_client/token_exchange.rs
+index 2dc3de17c..ee61ef415 100644
+--- a/crates/core/src/oauth2_client/token_exchange.rs
++++ b/crates/core/src/oauth2_client/token_exchange.rs
+@@ -56,13 +56,8 @@ pub enum TokenExchangeError {
+     #[error("subject_token's context has no resolved authorization scope")]
+     NoAuthorization,
+ 
+-    /// The validated subject token has no expiry to bound the exchanged token.
+-    #[error("subject_token has no expiration")]
+-    MissingSubjectTokenExpiry,
+-
+-    /// The credential-chain expiry is not later than the new token's issue
+-    /// time. Subject token/App Cred has either already expired or expires
+-    /// at/before the new token's issue time.
++    /// The credential-chain expiry is not later than the new token's issue time.
++    /// Subject token/App Cred has either already expired or expires at/before the new token's issue time.
+     #[error("credential-chain expiry does not leave a positive token lifetime")]
+     CredentialChainExpired,
+ 
+@@ -200,13 +195,10 @@ pub fn build_token_exchange_claims(
+         return Err(TokenExchangeError::CrossDomainSubjectToken);
+     }
+ 
+-    let subject_expires_at = vsc
+-        .inner()
+-        .expires_at()
+-        .ok_or(TokenExchangeError::MissingSubjectTokenExpiry)?
+-        .timestamp();
+-
+-    let mut exp = exp.min(subject_expires_at);
++    let mut exp = exp;
++    if let Some(subject_expires_at) = vsc.inner().expires_at() {
++        exp = exp.min(subject_expires_at.timestamp());
++    }
+     if let Some(credential_expires_at) = credential_expiration {
+         exp = exp.min(credential_expires_at.timestamp());
+     }
+@@ -537,11 +529,25 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn test_build_token_exchange_claims_rejects_missing_subject_expiry() {
+-        let app_cred_expiry = Some(chrono::DateTime::from_timestamp(2000, 0).unwrap());
++    fn test_build_token_exchange_claims_applies_default_when_no_expiry_present() {
++        let at = |ts| Some(chrono::DateTime::from_timestamp(ts, 0).unwrap());
++
++        // Neither subject token nor app cred expires; default applied.
++        let claims = build_claims_with_expiries(None, None, 1900).unwrap();
++        assert_eq!(claims.exp, 1900);
++
++        // No subject expiry, app cred expires later than the default.
++        let claims = build_claims_with_expiries(None, at(2100), 1900).unwrap();
++        assert_eq!(claims.exp, 1900);
++
++        // No subject expiry, app cred expires sooner than the default.
++        let claims = build_claims_with_expiries(None, at(1500), 1900).unwrap();
++        assert_eq!(claims.exp, 1500);
++
++        // An already-expired app cred is still rejected without a subject expiry.
+         assert!(matches!(
+-            build_claims_with_expiries(None, app_cred_expiry, 1900),
+-            Err(TokenExchangeError::MissingSubjectTokenExpiry)
++            build_claims_with_expiries(None, at(1000), 1900),
++            Err(TokenExchangeError::CredentialChainExpired)
+         ));
+     }
+ 
+diff --git a/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs b/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
+index 84bfaa779..f882d05dc 100644
+--- a/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
++++ b/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
+@@ -145,7 +145,28 @@ pub(super) async fn handle_token_exchange_grant(
+         now + access_lifetime,
+         audience,
+     )
+-    .map_err(exchange_error)?;
++    .map_err(|e| {
++        use openstack_keystone_core::oauth2_client::TokenExchangeError;
++
++        match e {
++            TokenExchangeError::CrossDomainSubjectToken => {
++                tracing::warn!(error = %e, "subject_token's scope belongs to a different domain than this token endpoint");
++                Oauth2TokenError::invalid_grant(
++                    "subject_token's scope belongs to a different domain than this token endpoint",
++                )
++            }
++            TokenExchangeError::CredentialChainExpired => {
++                tracing::warn!(error = %e, "subject_token or application credential chain is already expired or expires too soon");
++                Oauth2TokenError::invalid_grant(
++                    "subject_token or application credential expiry does not permit token exchange",
++                )
++            }
++            _ => {
++                tracing::error!(error = %e, "unexpected error occurred during token exchange");
++                Oauth2TokenError::internal("token issuance failed")
++            }
++        }
++    })?;
+     let token_type = super::dpop::token_type(confirmation.as_ref());
+     claims.cnf = confirmation;
+     let access_token = sign_jwt(state, domain_id, &claims).await?;
+diff --git a/doc/src/adr/0026-oauth2-oidc-provider.md b/doc/src/adr/0026-oauth2-oidc-provider.md
+index 91096aa54..fa5781679 100644
+--- a/doc/src/adr/0026-oauth2-oidc-provider.md
++++ b/doc/src/adr/0026-oauth2-oidc-provider.md
+@@ -1728,12 +1728,13 @@ The grant above is now built, as the follow-up amendment this section itself
+ anticipated. Concrete choices made during implementation:
+ 
+ - **Expiry bounded by the credential chain.** The exchanged access token's
+-  `exp` is capped at the earliest of the configured access-token lifetime, the
+-  validated `subject_token` expiry, and the application credential's expiry.
+-  Both credential expiries must be present; a missing expiry or a resulting
+-  non-positive lifetime is rejected as `invalid_grant`. The response's
+-  `expires_in` reports the capped lifetime, so repeated exchanges cannot extend
+-  a delegated credential past its configured expiry.
++  `exp` is capped at the earliest of the configured access-token lifetime and
++  any expiry present on the validated `subject_token` and its application
++  credential. A credential without an expiry does not further constrain the
++  token; if neither credential expires, the configured access-token lifetime
++  applies. A resulting non-positive lifetime is rejected as `invalid_grant`.
++  The response's `expires_in` reports the capped lifetime, so repeated
++  exchanges cannot extend a delegated credential past its configured expiry.
+ - **`AppCred` only, not `Trust` or `Ec2`.** Only `ApplicationCredential`'s
+   immutable project (`ApplicationCredential.project_id`) is carried on the
+   object embedded in `AuthenticationContext::ApplicationCredential` once
+
+From 0125af55eccde00a0d691fbba01e9bac2a3eb0fc Mon Sep 17 00:00:00 2001
+From: Kevin <36448536+millionsouls@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 16:59:07 -0500
+Subject: [PATCH 2/4] feat(oauth2): Verify default token expiry (#1353)
+
+Assert that token exchange uses configured default when validated cred
+expiries are later, and that expires_in matches exp-iat. Returns
+invalid_request for expired or invalid subject credentials.
+
+Assisted-by: Claude <noreply@anthropic.com>
+
+Signed-off-by: Kevin <36448536+millionsouls@users.noreply.github.com>
+---
+ .../core/src/oauth2_client/token_exchange.rs  | 22 +++++++++++++-----
+ .../src/api/v4/oauth2/token/token_exchange.rs | 17 +++++++-------
+ .../integration/src/oauth2_token_exchange.rs  | 23 +++++++++++++++----
+ 3 files changed, 44 insertions(+), 18 deletions(-)
+
+diff --git a/crates/core/src/oauth2_client/token_exchange.rs b/crates/core/src/oauth2_client/token_exchange.rs
+index ee61ef415..fbfe21c4b 100644
+--- a/crates/core/src/oauth2_client/token_exchange.rs
++++ b/crates/core/src/oauth2_client/token_exchange.rs
+@@ -56,8 +56,10 @@ pub enum TokenExchangeError {
+     #[error("subject_token's context has no resolved authorization scope")]
+     NoAuthorization,
+ 
+-    /// The credential-chain expiry is not later than the new token's issue time.
+-    /// Subject token/App Cred has either already expired or expires at/before the new token's issue time.
++    /// The resulting expiry is not later than the new token's issue time:
++    /// the subject token or application credential has already expired (or
++    /// expires at/before the issue time), or the default lifetime passed in
++    /// leaves no positive lifetime.
+     #[error("credential-chain expiry does not leave a positive token lifetime")]
+     CredentialChainExpired,
+ 
+@@ -153,6 +155,14 @@ pub async fn validate_subject_token(
+ /// [`DelegationContext`]. `aud` is [`Audience::control_plane`] unless the
+ /// request narrowed it to service types (ADR 0036 §7.1).
+ ///
++/// `default_exp` is the default expiry (`iat` + configured access-token
++/// lifetime).
++/// The issued `exp` is the minimum of it, the subject token's expiry and the
++/// application credential's expiry, ignoring any of the latter two that are
++/// absent. A token is therefore always issued with an expiration, and the
++/// token endpoint reports `expires_in` from the resulting `exp` (RFC 6749
++/// §5.1, as used by RFC 8693 §2.2.1).
++///
+ /// # Errors
+ /// See [`TokenExchangeError`] for each rejection reason.
+ #[allow(clippy::too_many_arguments)]
+@@ -164,7 +174,7 @@ pub fn build_token_exchange_claims(
+     issuer: &str,
+     jti: String,
+     iat: i64,
+-    exp: i64,
++    default_exp: i64,
+     aud: Audience,
+ ) -> Result<OpenStackAccessTokenClaims, TokenExchangeError> {
+     let principal = vsc.inner().principal();
+@@ -195,7 +205,7 @@ pub fn build_token_exchange_claims(
+         return Err(TokenExchangeError::CrossDomainSubjectToken);
+     }
+ 
+-    let mut exp = exp;
++    let mut exp = default_exp;
+     if let Some(subject_expires_at) = vsc.inner().expires_at() {
+         exp = exp.min(subject_expires_at.timestamp());
+     }
+@@ -474,7 +484,7 @@ mod tests {
+     fn build_claims_with_expiries(
+         subject_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+         app_cred_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+-        requested_exp: i64,
++        default_exp: i64,
+     ) -> Result<OpenStackAccessTokenClaims, TokenExchangeError> {
+         let ctx = app_cred_context("project-1", app_cred_expires_at);
+         let (delegation, credential_expiration) = derive_delegation_context(&ctx).unwrap();
+@@ -487,7 +497,7 @@ mod tests {
+             "https://ks.example/v4/oauth2/domain-1",
+             "jti-1".to_string(),
+             1000,
+-            requested_exp,
++            default_exp,
+             Audience::control_plane(),
+         )
+     }
+diff --git a/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs b/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
+index f882d05dc..772114d8e 100644
+--- a/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
++++ b/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
+@@ -132,6 +132,10 @@ pub(super) async fn handle_token_exchange_grant(
+     let issuer = format!("{base}/v4/oauth2/{domain_id}");
+     let now = chrono::Utc::now().timestamp();
+     let access_lifetime = i64::from(oauth2_cfg.access_token_lifetime_minutes) * 60;
++    if access_lifetime <= 0 {
++        tracing::error!("oauth2 access_token_lifetime_minutes must be greater than zero");
++        return Err(Oauth2TokenError::internal("token issuance failed"));
++    }
+     let jti = uuid::Uuid::new_v4().to_string();
+ 
+     let mut claims = openstack_keystone_core::oauth2_client::build_token_exchange_claims(
+@@ -151,13 +155,13 @@ pub(super) async fn handle_token_exchange_grant(
+         match e {
+             TokenExchangeError::CrossDomainSubjectToken => {
+                 tracing::warn!(error = %e, "subject_token's scope belongs to a different domain than this token endpoint");
+-                Oauth2TokenError::invalid_grant(
++                Oauth2TokenError::invalid_request(
+                     "subject_token's scope belongs to a different domain than this token endpoint",
+                 )
+             }
+             TokenExchangeError::CredentialChainExpired => {
+                 tracing::warn!(error = %e, "subject_token or application credential chain is already expired or expires too soon");
+-                Oauth2TokenError::invalid_grant(
++                Oauth2TokenError::invalid_request(
+                     "subject_token or application credential expiry does not permit token exchange",
+                 )
+             }
+@@ -193,8 +197,9 @@ pub(super) async fn handle_token_exchange_grant(
+     Ok((StatusCode::OK, Json(response)).into_response())
+ }
+ 
+-/// RFC 8693 §2.2.2: invalid subjects use invalid_request; provider failures
+-/// are server errors rather than evidence of invalid credentials.
++/// RFC 8693 §2.2.2: a request whose subject_token is invalid for any reason
++/// (expired, revoked, not delegated, outside policy) is `invalid_request`.
++/// Provider failures are server errors, not evidence of a bad credential.
+ fn exchange_error(
+     error: openstack_keystone_core::oauth2_client::TokenExchangeError,
+ ) -> Oauth2TokenError {
+@@ -220,9 +225,6 @@ fn exchange_error(
+         TokenExchangeError::CrossDomainSubjectToken => Oauth2TokenError::invalid_request(
+             "subject_token's scope belongs to a different domain than this token endpoint",
+         ),
+-        TokenExchangeError::MissingSubjectTokenExpiry => Oauth2TokenError::invalid_request(
+-            "subject_token is missing an expiry claim, cannot be exchanged",
+-        ),
+         TokenExchangeError::CredentialChainExpired => Oauth2TokenError::invalid_request(
+             "subject_token or application credential expiry does not permit token exchange",
+         ),
+@@ -237,7 +239,6 @@ fn exchange_error(
+         _ => Oauth2TokenError::internal("token issuance failed"),
+     }
+ }
+-
+ /// Whether `token` is a JWT whose payload has a `cnf` claim, or one whose
+ /// payload cannot be read. The payload is read without verifying anything:
+ /// the caller has already validated the token and only uses this to fail
+diff --git a/tests/integration/src/oauth2_token_exchange.rs b/tests/integration/src/oauth2_token_exchange.rs
+index 9cb80b582..9dfe46bfb 100644
+--- a/tests/integration/src/oauth2_token_exchange.rs
++++ b/tests/integration/src/oauth2_token_exchange.rs
+@@ -189,6 +189,19 @@ async fn test_token_exchange_full_flow_issues_app_cred_delegated_claims() -> Res
+ 
+     let (vsc, delegation, credential_expiration) =
+         validate_subject_token(&state, &subject_token).await?;
++    let iat = chrono::Utc::now().timestamp();
++    let default_exp = iat + 900;
++    assert!(
++        vsc.inner()
++            .expires_at()
++            .is_some_and(|subject_exp| subject_exp.timestamp() > default_exp),
++        "validated subject token must outlive the configured default"
++    );
++    assert!(
++        credential_expiration
++            .is_some_and(|credential_exp| credential_exp.timestamp() > default_exp),
++        "application credential must outlive the configured default"
++    );
+     let issuer = format!("https://ks.example/v4/oauth2/{}", domain.id);
+     let claims = build_token_exchange_claims(
+         &client,
+@@ -197,12 +210,14 @@ async fn test_token_exchange_full_flow_issues_app_cred_delegated_claims() -> Res
+         credential_expiration,
+         &issuer,
+         Uuid::new_v4().to_string(),
+-        chrono::Utc::now().timestamp(),
+-        chrono::Utc::now().timestamp() + 900,
++        iat,
++        default_exp,
+         Audience::control_plane(),
+     )?;
+ 
+     assert_eq!(claims.aud, Audience::control_plane());
++    assert_eq!(claims.iat, iat);
++    assert_eq!(claims.exp, default_exp);
+     assert!(claims.amr.contains(&"application_credential".to_string()));
+ 
+     Ok(())
+@@ -229,8 +244,8 @@ async fn test_token_exchange_caps_expiry_at_short_lived_app_credential() -> Resu
+         credential_expiration,
+         &issuer,
+         Uuid::new_v4().to_string(),
+-        chrono::Utc::now().timestamp(),
+-        chrono::Utc::now().timestamp() + 900,
++        now,
++        now + 900,
+         Audience::control_plane(),
+     )?;
+ 
+
+From 11528140a2e36316689d0017e64bd57818fcd41e Mon Sep 17 00:00:00 2001
+From: Kevin <36448536+millionsouls@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 17:01:23 -0500
+Subject: [PATCH 3/4] refactor: Pre commit fix for end of file
+
+Signed-off-by: Kevin <36448536+millionsouls@users.noreply.github.com>
+---
+ doc/src/adr/0036-service-delegation.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/doc/src/adr/0036-service-delegation.md b/doc/src/adr/0036-service-delegation.md
+index ace17fd58..69150478b 100644
+--- a/doc/src/adr/0036-service-delegation.md
++++ b/doc/src/adr/0036-service-delegation.md
+@@ -1394,4 +1394,4 @@ will stop carrying scope.
+   `keystone-rs`.
+ - **New state and a new driver crate**, plus one more `AuthenticationContext`
+   pair to keep in every match arm. The ADR 0017 checklist and compile-time
+-  exhaustive matches make omissions a build error rather than a runtime hole.
+\ No newline at end of file
++  exhaustive matches make omissions a build error rather than a runtime hole.
+
+From 095e8c23575a3429dd1f6a66ae87ca29be3615c0 Mon Sep 17 00:00:00 2001
+From: Kevin <36448536+millionsouls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 14:02:00 -0500
+Subject: [PATCH 4/4] fix(oauth2): Use existing error mappings
+
+Route claim building failures to the shared exchange_error mapper
+instead of a partial inline mapping.
+
+Signed-off-by: Kevin <36448536+millionsouls@users.noreply.github.com>
+---
+ .../src/api/v4/oauth2/token/token_exchange.rs | 23 +------------------
+ 1 file changed, 1 insertion(+), 22 deletions(-)
+
+diff --git a/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs b/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
+index 772114d8e..f70e99114 100644
+--- a/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
++++ b/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
+@@ -149,28 +149,7 @@ pub(super) async fn handle_token_exchange_grant(
+         now + access_lifetime,
+         audience,
+     )
+-    .map_err(|e| {
+-        use openstack_keystone_core::oauth2_client::TokenExchangeError;
+-
+-        match e {
+-            TokenExchangeError::CrossDomainSubjectToken => {
+-                tracing::warn!(error = %e, "subject_token's scope belongs to a different domain than this token endpoint");
+-                Oauth2TokenError::invalid_request(
+-                    "subject_token's scope belongs to a different domain than this token endpoint",
+-                )
+-            }
+-            TokenExchangeError::CredentialChainExpired => {
+-                tracing::warn!(error = %e, "subject_token or application credential chain is already expired or expires too soon");
+-                Oauth2TokenError::invalid_request(
+-                    "subject_token or application credential expiry does not permit token exchange",
+-                )
+-            }
+-            _ => {
+-                tracing::error!(error = %e, "unexpected error occurred during token exchange");
+-                Oauth2TokenError::internal("token issuance failed")
+-            }
+-        }
+-    })?;
++    .map_err(exchange_error)?;
+     let token_type = super::dpop::token_type(confirmation.as_ref());
+     claims.cnf = confirmation;
+     let access_token = sign_jwt(state, domain_id, &claims).await?;
