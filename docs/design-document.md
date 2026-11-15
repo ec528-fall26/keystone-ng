@@ -37,6 +37,25 @@ The service (etc Cinder) redeems it with the custom `urn:openstack:params:oauth:
 Essentially, a user tells Keystone "Let this service act for me on this project, with these roles". The service then proves its identity via a SPIFFE certificate and asks Keystone for a short-lived access token. Keystone checks that the grant is still valid and that the user still has the relevant roles. The token says who the user is (sub) and which service is acting (act). The service can request another token later by redeeming the grant again. Revoking the grant prevents future redemptions, though already-issued tokens remain usable until they expire.
 
 Permanent or overly long-lived service grants are dangerous because they violate the Principle of Least Privilege. Service tokens travel extensively across internal control plane networks to facilitate inter-service communication (e.g., Nova talking to Cinder or Neutron). If an internal control plane node is compromised, or if a service token accidentally leaks into debug logs or unencrypted databases, a permanent grant gives an attacker an indefinite, unexpiring key to cloud infrastructure.
+### 4. PR #1575 — RFC 8693 token exchange validation
+
+**Background.** In token exchange, `subject_token_type` let Keystone know what kind of token the client is sending. `requested_token_type` let Keystone know what kind of token the client wants back. Keystone only read these fields without validating them in the past.In another hand, it did not report what type of token it had issued when a successful response occur.
+
+**Validate the token types.** My first version required `jwt`, but review pointed out that an existing API test sent `access_token`. I changed the handler to use an explicit match that keeps `access_token` working, recognizes the Keystone-specific type, and preserves the existing JWT compatibility path. A missing, empty, or unsupported subject type now returns HTTP 400 with `invalid_request`. The JWT path still uses Keystone’s existing validator; support for JWTs from external providers is tracked in #1018.
+**Use the same rules across both exchange paths.** I shared the request checks between the standard and on-behalf-of flows and placed them after the per-client rate limit. Unsupported actor fields, resources, and scopes now return errors that tell the client what went wrong. For example, an unsupported `resource` returns `invalid_target`.
+**Tell the client what was issued.** Successful exchanges now include `issued_token_type`, so the client can tell that it received an access token. I added regression tests for invalid inputs and the successful response, while preserving the existing `access_token` case.
+
+**Status.** [PR #1575](https://github.com/openstack-experimental/keystone/pull/1575) was merged upstream.
+
+### PR5. #1646 — Keycloak test setup for token exchange
+
+**Background.** Issue #1366 calls for testing token exchange with JWTs from a real identity provider. I started by building the part that obtains realistic input tokens from Keycloak for both a user and a service account.
+
+1. **Use an isolated Keycloak realm.** The test creates a temporary realm, obtains a user JWT through the password grant and a service account JWT through `client_credentials`, then deletes the realm. It runs without Selenium through an opt-in Skaffold profile.
+2. **Use the exact audience Keystone advertises.** The test reads Keystone’s token endpoint from its discovery document and configures Keycloak to use that URL as the sole audience of both JWTs. For example, if Keystone advertises `http://keystone-rs.local/v4/oauth2/default/token`, that exact URL must appear in `aud`. The test also checks the issuer, usernames, distinct subject and token IDs, and short token lifetimes.
+3. **Make setup failures visible.** The test fails if it cannot reach Keystone, instead of silently skipping. The test target compiles, and I verified the failure behavior when Keystone is unreachable. A live k3s run is still pending.
+
+**Status.** [PR #1646](https://github.com/openstack-experimental/keystone/pull/1646) is a draft. It prepares the inputs for #1366. Sending those JWTs to Keystone and checking the resulting identity and roles still depends on #1018.
 
 
 ## 3. Setup
