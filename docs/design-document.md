@@ -1,6 +1,6 @@
 # Design Document
 
-*Due in the `demo-2` branch, updated for `demo-3` and `final-demo`.
+*Due in the `demo-3` branch, updated for `demo-3` and `final-demo`.
 **The TA will run this document.** If they cannot follow it, you lose the points.*
 
 ## 1. Architecture
@@ -55,18 +55,18 @@ rustup show
 ```
 rustup component add rustfmt clippy
 ```
-5. Clone to Openstack Keystone fork repo: (This is our testing fork). Our code is on the `demo-2` branch, so clone that branch:
+5. Clone to Openstack Keystone fork repo: (This is our testing fork). Our code is on the `demo-3` branch, so clone that branch:
 ```
-git clone -b demo-2 https://github.com/millionsouls/keystone.git
+git clone -b demo-3 https://github.com/millionsouls/keystone.git
 cd keystone
 git branch --show-current
 ```
-6. The last command should print `demo-2`.
+6. The last command should print `demo-3`.
 7. Keystone needs `protoc` to build. MacOS: ```brew install protobuf```. Ubuntu: ```sudo apt-get install protobuf-compiler pkg-config 
 libssl-dev```.
 
 ## 4. Running the experiments
-Run every command inside the fork clone from Setup (`millionsouls/keystone`, branch `demo-2`), not in this repo.
+Run every command inside the fork clone from Setup (`millionsouls/keystone`, branch `demo-3`), not in this repo.
 
 ### [1] Allowed signing algorithms
 | Item | Details |

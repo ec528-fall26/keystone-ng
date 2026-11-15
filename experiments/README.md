@@ -7,48 +7,23 @@ Every script here must have a matching entry in
 supports, how long it takes, and what output to expect.
 
 ### Where to run these
-The code is in our fork, not this repo. Clone the `demo-2` branch and run all the commands below inside that folder:
+The code is in our fork, not this repo. Clone the `demo-3` branch and run all the commands below inside that folder:
 ```
-git clone -b demo-2 https://github.com/millionsouls/keystone.git
+git clone -b demo-3 https://github.com/millionsouls/keystone.git
 cd keystone
 git branch --show-current
 ```
-The last command should print `demo-2`. You need Rust and `protoc` (see Setup in the design document).
+The last command should print `demo-3`. You need Rust and `protoc` (see Setup in the design document).
 
-## Token Lifetime Expiry Cap
-1. Core unit tests for token exchange claim building. Verify that exp is the minimum of the configured lifetime, the subject token's expiry and the app credential's expiry (where a non-expiring credential adds no cap), and that a missing subject token expiry or a lifetime of zero or less is rejected with an error.
+### Service Grant Chain
+1. Runs the configuration crate’s unit and documentation tests. It verifies that Keystone’s configuration types, including the [oauth2] access_token_lifetime_minutes setting, continue to deserialize and validate correctly. It also checks that the setting the service-grant logic now reads remains available through the configuration layer.
 ```
-cargo test -p openstack-keystone-core oauth2_client::token_exchange::tests
-``` 
-2. Runs the HTTP-level token exchange tests through the real router with mocked providers. Verify that the issued JWT's exp is capped by the app credential's expiry, and that an already-expired app credential, an app credential expiring now, and an expired subject token are each rejected with 400 invalid_grant.
-```
-cargo test -p openstack-keystone api::v4::oauth2::token::token_exchange::tests
-``` 
-
-## JWT Verification Demo
-1. Checks 8 tokens against a fake identity provider. Only the valid one is ACCEPTED. The other 7 are REJECTED: untrusted issuer, issuer of a disabled provider, wrong audience, empty audience list, expired, HS256, and a token changed after signing. It ends with `1 passed; 0 failed`.
-```
-cargo test -p openstack-keystone --lib demo_external_jwt_verification -- --nocapture
-```
-2. All the JWT verification tests (bad signature, wrong key, `alg: none`, untrusted issuer and so on). It ends with `65 passed; 0 failed`.
-```
-cargo test -p openstack-keystone --lib federation::api::oidc_utils
-```
-3. The token exchange tests, which include the external JWT cases (trusted issuer accepted, untrusted issuer rejected, token made for a different client rejected). It ends with `17 passed; 0 failed`.
-```
-cargo test -p openstack-keystone --lib api::v4::oauth2::token::token_exchange::tests
+cargo test -p openstack-keystone-config
 ```
 
-## Token-exchange request validation
-Verify the external JWT demonstration separately
+2. Runs the core crate’s service-grant creation tests matching test_create_. These tests check that a grant uses the configured OAuth2 access-token lifetime only when no explicit expiry or client maximum is present; that a client maximum and a valid explicit expiry retain their precedence; and that an out-of-range client maximum returns an error instead of causing a panic.
 ```
-cargo test -p openstack-keystone --lib api::v4::oauth2::token::token_exchange::tests -j 1
-```
-
-## Validation Profile for OAuth2 subject tokens
-Navigate your Terminal to the crates/core folder to run the cargo tests
-```
-cargo test -p openstack-keystone-core verify::tests
+cargo test -p openstack-keystone-core service_grant::service::tests::test_create_
 ```
 
 ## Conform with contributor and security expectations
