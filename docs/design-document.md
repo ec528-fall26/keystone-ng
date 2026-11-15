@@ -11,7 +11,7 @@
 4. [Issue](https://github.com/openstack-experimental/keystone/issues/1353) || [PR](https://github.com/openstack-experimental/keystone/pull/1616) :: Follow-up to previous token expiration PR, this applies a default token expiration on a token that does not come with a expiration instead of silently dropped or erroring.
 5. [No Direct Issue](https://github.com/openstack-experimental/keystone/issues/1353) || [PR]() 
 :: From the project mentor, checks service grant chain and applies a default expiration on any service grants. This is based on a chain of if: grant has a specific expiration, client has a set max_grant_lifetime, then default_access_lifetime.
-6. [Issue #1354](https://github.com/openstack-experimental/keystone/issues/1354) :: [PR #1575](https://github.com/openstack-experimental/keystone/pull/1575) :: Added RFC 8693 request validation to Keystone’s token exchange endpoint. Missing, empty, or unsupported subject token types return `invalid_request`, and successful responses include `issued_token_type`. Merged. [Code diff](src/demo-3/1575.patch).
+6. [Issue #1354](https://github.com/openstack-experimental/keystone/issues/1354) :: [PR #1575](https://github.com/openstack-experimental/keystone/pull/1575) :: Added RFC 8693 request validation to Keystone’s token exchange endpoint. Missing, empty, or unsupported subject token types return `invalid_request`, and successful responses include `issued_token_type`. Merged.  Code diff under: src/demo-3/1575.patch
 7. [Issue #1366](https://github.com/openstack-experimental/keystone/issues/1366) :: PR pending :: Added a test fixture for user and service account JWTs from Keycloak. The full token exchange test in k3s is still in progress.
 
 ## 2. Design decisions
