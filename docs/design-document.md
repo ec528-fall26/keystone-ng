@@ -93,8 +93,16 @@ The whole core suite on this branch ends with `1273 passed; 0 failed`.
 | --- | --- |
 | Supports | Presented token with no expiry should have a default of 15 minutes applied. |
 | Command | Instructions in: `experiments/README.md` |
-| Expected runtime | A few minutes the first time after switching branch, a few seconds after. |
-| Expected output |  |
+| Expected runtime |  |
+| Expected output | All tests should pass with no failures. Ignored tests are expected as these are not relevent. |
+
+## [4] Service Chain Expiration
+| Item | Details |
+| --- | --- |
+| Supports | Service delegation chain for service grants should have an expiration, and generated tokens should have an expiry. |
+| Command | Instructions in: `experiments/README.md` |
+| Expected runtime |  |
+| Expected output | All tests should pass with no failures. Ignored tests are expected as these are not relevent. |
 
 
 ## 5. Claims and limitations
