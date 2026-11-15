@@ -40,7 +40,6 @@ cargo test -p openstack-keystone-api-types --all-features`
 1. ```cargo clippy -p openstack-keystone-core --all-targets``` Catch common mistakes, optimize code, and enforce style guidelines
 2. ```cargo check -p openstack-keystone --message-format=short``` Verifies everything complies together
 
-
 ### RFC 8693 Token Exchange Validation (PR #1575)
 
 Run from the root of the `demo-3` fork clone. The checkout must include PR #1575.
