@@ -41,21 +41,21 @@ Permanent or overly long-lived service grants are dangerous because they violate
 
 **Background.** In token exchange, `subject_token_type` let Keystone know what kind of token the client is sending. `requested_token_type` let Keystone know what kind of token the client wants back. Keystone only read these fields without validating them in the past.In another hand, it did not report what type of token it had issued when a successful response occur.
 
-**Validate the token types.** My first version required `jwt`, but review pointed out that an existing API test sent `access_token`. I changed the handler to use an explicit match that keeps `access_token` working, recognizes the Keystone-specific type, and preserves the existing JWT compatibility path. A missing, empty, or unsupported subject type now returns HTTP 400 with `invalid_request`. The JWT path still uses Keystone’s existing validator; support for JWTs from external providers is tracked in #1018.
-**Use the same rules across both exchange paths.** I shared the request checks between the standard and on-behalf-of flows and placed them after the per-client rate limit. Unsupported actor fields, resources, and scopes now return errors that tell the client what went wrong. For example, an unsupported `resource` returns `invalid_target`.
-**Tell the client what was issued.** Successful exchanges now include `issued_token_type`, so the client can tell that it received an access token. I added regression tests for invalid inputs and the successful response, while preserving the existing `access_token` case.
+**Validate the token types.** In first version, it allow 'jwt' subject token type to token exchange,but I find an existing API test sent `access_token`. Then I changed the handler to use an explicit match that keeps `access_token` working, check the Keystone-specific type, and preserves the existing JWT compatibility path. A missing, empty, or unsupported subject type now returns HTTP 400 with `invalid_request`. 
+**Use the same rules across both exchange paths.** I made a request check for standard and on-behalf-of flows. Keystone applies the per-client rate limit.  For unsupported things now return errors that tell the client what went wrong. For example, an unsupported `resource` returns `invalid_target`.
+**Tell the client what was issued.** Successful exchanges include `issued_token_type`, then client can report that the access token was received. I also added regression tests for invalid inputs and the successful response.
 
 **Status.** [PR #1575](https://github.com/openstack-experimental/keystone/pull/1575) was merged upstream.
 
-### PR5. #1646 — Keycloak test setup for token exchange
+### 5. PR#1646 — Keycloak test setup for token exchange
 
-**Background.** Issue #1366 calls for testing token exchange with JWTs from a real identity provider. I started by building the part that obtains realistic input tokens from Keycloak for both a user and a service account.
+**Background.** Issue #1366 calls for testing token exchange with JWTs from a real identity provider. we need building the test that obtains real input tokens from Keycloak for both a user and a client.
 
-1. **Use an isolated Keycloak realm.** The test creates a temporary realm, obtains a user JWT through the password grant and a service account JWT through `client_credentials`, then deletes the realm. It runs without Selenium through an opt-in Skaffold profile.
-2. **Use the exact audience Keystone advertises.** The test reads Keystone’s token endpoint from its discovery document and configures Keycloak to use that URL as the sole audience of both JWTs. For example, if Keystone advertises `http://keystone-rs.local/v4/oauth2/default/token`, that exact URL must appear in `aud`. The test also checks the issuer, usernames, distinct subject and token IDs, and short token lifetimes.
-3. **Make setup failures visible.** The test fails if it cannot reach Keystone, instead of silently skipping. The test target compiles, and I verified the failure behavior when Keystone is unreachable. A live k3s run is still pending.
-
-**Status.** [PR #1646](https://github.com/openstack-experimental/keystone/pull/1646) is a draft. It prepares the inputs for #1366. Sending those JWTs to Keystone and checking the resulting identity and roles still depends on #1018.
+1. **Use an isolated Keycloak realm.** The test creates a temporary realm,it obtains a user JWT by the password grant and a client account JWT  `client_credentials`, then deletes the realm. It runs without Selenium.
+2. **Use the exact audience Keystone advertises.** The test reads Keystone’s token endpoint from their document and configures Keycloak to use that URL as the sole audience of both JWTs. For example, if Keystone advertises `http://keystone-rs.local/v4/oauth2/default/token`, that exact URL must appear in `aud`. The test also checks everything about token exchange, including the issuer, usernames, distinct subject and token IDs, and short token lifetimes.
+3. **Make setup failures visible.** The test fails if it cannot reach Keystone, instead of silently skipping. we can use this fails recoed when Keystone is unreachable.
+4. 
+**Status.** [PR #1646](https://github.com/openstack-experimental/keystone/pull/1646) is a draft. It prepares the inputs for #1366. 
 
 
 ## 3. Setup
@@ -120,6 +120,26 @@ Run every command inside the fork clone from Setup (`millionsouls/keystone`, bra
 | Command | Instructions in: `experiments/README.md` |
 | Expected runtime |  |
 | Expected output | All tests should pass with no failures. Ignored tests are expected as these are not relevent. |
+### [5] RFC 8693 token exchange validation
+
+| Item | Details |
+| --- | --- |
+| Supports | Verifies that existing `access_token` requests still work, missing, empty, or unsupported `subject_token_type` values return `invalid_request`, and successful exchanges include `issued_token_type` (PR #1575). |
+| Command | `Instructions in: `experiments/README.md` |
+| Expected runtime | The first run may take several minutes to compile. |
+| Expected output | All matching tests pass with `0 failed`.  |
+
+### [6] Keycloak JWT test setup
+
+Run this experiment on a checkout that contains draft PR #1646.
+
+| Item | Details |
+| --- | --- |
+| Supports | Builds the test that prepares two kinds of JWTs from Keycloak: one for a user and one for a client account. The test checks that both tokens name Keystone’s exact token endpoint as their audience. |
+| Command | `cargo test --locked -p test_federation --test keycloak_token_exchange --no-run` (still work on that)|
+| Expected runtime | Depends on the build cache. |
+| Expected output | Cargo builds the `keycloak_token_exchange` test executable. |
+| Current status | Compilation passed, and a separate run confirmed that an unreachable Keystone causes a failure rather than a skip|
 
 
 ## 5. Claims and limitations
@@ -156,6 +176,36 @@ __Limitations__
 - A token without a `jti` can't be checked. Whether to reject those is not decided yet.
 - #1640 is in review and could change.
 
+### [3] RFC 8693 Token Exchange Validation (PR #1575)
+
+**Claims**
+
+- Keystone requires `subject_token_type`. A missing, empty, or unsupported value returns HTTP 400 with `invalid_request`.
+- Both exchange flows apply the per-client rate limit before checking the exchange parameters.
+- Unsupported resources return `invalid_target`, and unsupported scopes return `invalid_scope`.
+- A successful exchange includes `issued_token_type`, so the client knows it received an access token.
+
+**Limitations**
+
+- Declaring `jwt` does not allow tokens from external identity providers. 
+- The endpoint supports only the `openstack:api` scope for token exchange. Actor tokens and the `resource` parameter are not supported.
+- Clients that previously omitted `subject_token_type` must now send it.
+- PR #1575 was merged upstream.
+
+### [4] Keycloak JWT Test Setup (PR #1646)
+
+**Claims**
+
+- The fixture is designed to get two JWTs from Keycloak: one for a user and one for a client account.
+- It checks that both tokens name Keystone’s exact `/token` URL as their only audience. It also checks the issuer, usernames, distinct subject and token IDs, and short lifetimes.
+- The test target compiled. A separate run confirmed that an unreachable Keystone makes the test fail instead of skipping.
+
+**Limitations**
+
+- The live run with Keycloak in k3s is still pending, so successful JWT issuance in that environment has not been verified.
+- The fixture does not submit the JWTs for exchange or check the resulting identities and roles. 
+- PR #1646 is a draft and does not complete #1366.
+
 ### Functionality Tests We Contributed to the Testing Suites
 #### Verify tests (#1639):
 external_profile_defaults_to_rs256_and_es256
@@ -185,3 +235,25 @@ test_scope_is_injective
 test_entry_lives_until_exp_plus_skew
 test_one_issuer_cannot_fill_the_cache
 test_purge_expired
+#### Token exchange handler tests — PR #1575 (merged)
+
+- `test_token_exchange_accepts_access_token_subject_type` — checks that an existing `access_token` request still works.
+- `test_token_exchange_accepts_keystone_subject_type` — checks that the Keystone-specific token type is accepted.
+- `test_token_exchange_missing_subject_token_type_is_invalid_request` — checks that omitting the type returns `invalid_request`.
+- `test_token_exchange_empty_subject_token_type_is_invalid_request` — checks that `subject_token_type=` returns `invalid_request`.
+- `test_token_exchange_unsupported_subject_token_type_is_invalid_request` — checks that an unknown type returns `invalid_request`.
+- `test_token_exchange_rate_limit_precedes_subject_token_type_validation` — checks that rate limiting runs before type validation.
+- `test_token_exchange_rejects_actor_token`, `test_token_exchange_rejects_actor_token_type`, and `test_token_exchange_rejects_resource_even_if_empty_or_repeated` — check that unsupported parameters are rejected.
+- `test_token_exchange_rejects_unsupported_scope_without_issuing_token` — checks that an unsupported scope does not result in a new token.
+
+#### Token exchange API tests — PR #1575 (merged)
+
+- `test_token_exchange_success_with_jwt_type` and `test_token_exchange_success_with_keystone_type` — cover successful exchange through the existing Keystone validation path.
+- `test_token_exchange_requires_subject_token_type` and `test_token_exchange_rejects_unsupported_subject_token_type` — check that the HTTP API rejects missing and unsupported types.
+- `test_token_exchange_rejects_unsupported_rfc8693_parameters` — checks rejection of unsupported request parameters at the API level.
+- `test_token_exchange_accepts_requested_output_type_and_scope` — checks that a valid request succeeds and the response reports the issued token type and scope.
+
+#### Keycloak test setup — PR #1646 (draft)
+
+- `keycloak_issues_user_and_service_account_subjects` — prepares a user JWT and a service account JWT from Keycloak. It checks that both tokens name Keystone’s exact token endpoint as their audience and have distinct subject and token IDs.
+- The test compiled, and an unreachable Keystone caused it to fail rather than skip. The live k3s run is still pending. This test does not yet submit either JWT for exchange.
