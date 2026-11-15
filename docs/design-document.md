@@ -72,21 +72,17 @@ Run every command inside the fork clone from Setup (`millionsouls/keystone`, bra
 | Item | Details |
 | --- | --- |
 | Supports | Algorithms not on the list, HMAC, `alg: none` and wrong key types are rejected (PRs #1639 and #1642). |
-| Command |  |
+| Command | `cargo test -p openstack-keystone-core --lib -- oauth2_client::verify::tests::external_profile oauth2_client::verify::tests::profile_allows_only` |
 | Expected runtime | 5 to 10 minutes the first time (compiling), about 10 seconds after. |
-| Expected output | `65 passed; 0 failed` |
-
-The whole core suite (`cargo test -p openstack-keystone-core --lib`) ends with `1271 passed; 0 failed`.
+| Expected output | `9 passed; 0 failed` |
 
 ### [2] Replay cache
 | Item | Details |
 | --- | --- |
 | Supports | The same `jti` is refused the second time, a full cache keeps live entries, and the DPoP cache works as before (PR #1640). |
-| Command |  |
-| Expected runtime | A few minutes the first time after switching branch, a few seconds after. |
+| Command | `cargo test -p openstack-keystone-core --lib replay` |
+| Expected runtime | A few seconds, the build is already done by experiment [1]. |
 | Expected output | `23 passed; 0 failed` (8 general cache, 6 assertion cache, 9 DPoP cache) |
-
-The whole core suite on this branch ends with `1273 passed; 0 failed`.
 
 ## [3] Token Default Expiry
 | Item | Details |
