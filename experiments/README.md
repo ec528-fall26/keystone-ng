@@ -36,12 +36,15 @@ cargo test -p openstack-keystone-core-types service_grant
 cargo test -p openstack-keystone-api-types --all-features`
 ```
 
-## Conform with contributor and security expectations
-1. ```cargo clippy -p openstack-keystone-core --all-targets``` Catch common mistakes, optimize code, and enforce style guidelines
-2. ```cargo check -p openstack-keystone --message-format=short``` Verifies everything complies together
+### Token Expiry Rules
+```
+cargo test -p openstack-keystone-core oauth2_client::token_exchange::tests
+```
+```
+cargo test -p openstack-keystone api::v4::oauth2::token::token_exchange::tests
+```
 
 ### RFC 8693 Token Exchange Validation (PR #1575)
-
 Run from the root of the `demo-3` fork clone. The checkout must include PR #1575.
 
 ```bash
@@ -56,3 +59,8 @@ subject token types are rejected, and that successful responses include
 **Expected runtime:** Several minutes on a clean build; later runs reuse the build.
 **Expected output:** All matching tests pass with `0 failed`. The exact count
 depends on the branch revision.
+
+
+## Conform with contributor and security expectations
+1. ```cargo clippy -p openstack-keystone-core --all-targets``` Catch common mistakes, optimize code, and enforce style guidelines
+2. ```cargo check -p openstack-keystone --message-format=short``` Verifies everything complies together
