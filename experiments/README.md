@@ -40,3 +40,20 @@ cargo test -p openstack-keystone-api-types --all-features`
 1. ```cargo clippy -p openstack-keystone-core --all-targets``` Catch common mistakes, optimize code, and enforce style guidelines
 2. ```cargo check -p openstack-keystone --message-format=short``` Verifies everything complies together
 
+
+### RFC 8693 Token Exchange Validation (PR #1575)
+
+Run from the root of the `demo-3` fork clone. The checkout must include PR #1575.
+
+```bash
+cargo test -p openstack-keystone --lib token_exchange
+```
+
+This runs the token exchange handler tests. It checks that existing
+`access_token` requests still work, that missing, empty, or unsupported
+subject token types are rejected, and that successful responses include
+`issued_token_type`.
+
+**Expected runtime:** Several minutes on a clean build; later runs reuse the build.
+**Expected output:** All matching tests pass with `0 failed`. The exact count
+depends on the branch revision.
