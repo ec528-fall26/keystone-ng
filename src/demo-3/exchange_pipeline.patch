@@ -1,0 +1,2956 @@
+From 532607859b4e2e9ffe9bbc5a4dbc708e9bcda42e Mon Sep 17 00:00:00 2001
+From: Dominic Murphy <ddmurphy@bu.edu>
+Date: Sun, 15 Nov 2026 00:28:38 -0500
+Subject: [PATCH 1/5] feat(oauth2): Add external JWT exchange path
+
+Validate external JWTs against trusted IdPs and prepare mapping-based
+token issuance with assertion-expiry caps.
+
+Fail closed until assertion replay protection is wired.
+
+Signed-off-by: Dominic Murphy <ddmurphy@bu.edu>
+---
+ crates/core/src/mapping/service.rs            |  38 ++-
+ crates/core/src/oauth2_client.rs              |   5 +-
+ crates/core/src/oauth2_client/token.rs        | 228 +++++++++++++++++-
+ crates/keystone/src/api/v4/oauth2/token.rs    |   3 +-
+ .../api/v4/oauth2/token/exchange_request.rs   |  10 +-
+ .../src/api/v4/oauth2/token/token_exchange.rs |  32 ++-
+ crates/keystone/src/federation/api.rs         |   2 +-
+ crates/keystone/src/federation/api/common.rs  |   2 +-
+ .../keystone/src/federation/api/oidc_utils.rs |   8 +-
+ 9 files changed, 291 insertions(+), 37 deletions(-)
+
+diff --git a/crates/core/src/mapping/service.rs b/crates/core/src/mapping/service.rs
+index 94e5eb3ae..bab365358 100644
+--- a/crates/core/src/mapping/service.rs
++++ b/crates/core/src/mapping/service.rs
+@@ -401,10 +401,36 @@ impl MappingService {
+         ruleset: &MappingRuleSet,
+         req: &MappingAuthRequest,
+     ) -> Result<AuthenticationResult, MappingProviderError> {
+-        let IdentitySource::Federation { idp_id } = &req.source else {
+-            return Err(MappingProviderError::LocalIdentityRequiresFederation(
+-                req.source.to_string_key(),
+-            ));
++        let idp_id = match &req.source {
++            IdentitySource::Federation { idp_id } => idp_id.clone(),
++            IdentitySource::TokenExchange { issuer } => {
++                let request_domain = req.domain_id.as_deref().ok_or(
++                    MappingProviderError::LocalIdentityRequiresFederation(
++                        req.source.to_string_key(),
++                    ),
++                )?;
++                state
++                    .provider
++                    .get_federation_provider()
++                    .get_identity_provider_by_issuer(
++                        &ExecutionContext::internal(state),
++                        request_domain,
++                        issuer,
++                    )
++                    .await
++                    .map_err(MappingProviderError::driver)?
++                    .ok_or_else(|| {
++                        MappingProviderError::LocalIdentityRequiresFederation(
++                            req.source.to_string_key(),
++                        )
++                    })?
++                    .id
++            }
++            _ => {
++                return Err(MappingProviderError::LocalIdentityRequiresFederation(
++                    req.source.to_string_key(),
++                ));
++            }
+         };
+ 
+         let domain_id = match_result
+@@ -418,7 +444,7 @@ impl MappingService {
+         let user = self
+             .find_or_create_federated_user(
+                 state,
+-                idp_id,
++                &idp_id,
+                 &domain_id,
+                 &match_result.user_name,
+                 &req.unique_workload_id,
+@@ -427,7 +453,7 @@ impl MappingService {
+ 
+         // Always sync group memberships to reflect current claims, not just
+         // on first-time creation.
+-        self.sync_user_groups(state, &user, match_result, idp_id)
++        self.sync_user_groups(state, &user, match_result, &idp_id)
+             .await?;
+ 
+         let user_groups = state
+diff --git a/crates/core/src/oauth2_client.rs b/crates/core/src/oauth2_client.rs
+index 6df37aa2e..6175e26d7 100644
+--- a/crates/core/src/oauth2_client.rs
++++ b/crates/core/src/oauth2_client.rs
+@@ -44,7 +44,10 @@ pub use hook::Oauth2ClientHook;
+ pub use id_token::{IdTokenClaimsError, IdTokenParams, TemplateScope, build_id_token_claims};
+ pub use provider_api::Oauth2ClientApi;
+ pub use service::Oauth2ClientService;
+-pub use token::{build_access_token_claims, hydrate_client_credentials_context};
++pub use token::{
++    build_access_token_claims, build_external_assertion_claims, hydrate_client_credentials_context,
++    hydrate_external_assertion_context,
++};
+ pub use token_exchange::{TokenExchangeError, build_token_exchange_claims, validate_subject_token};
+ pub use verify::{
+     IntrospectedAccessToken, RevocableAccessToken, SubjectTokenValidationProfile,
+diff --git a/crates/core/src/oauth2_client/token.rs b/crates/core/src/oauth2_client/token.rs
+index 061a0e841..01fc53693 100644
+--- a/crates/core/src/oauth2_client/token.rs
++++ b/crates/core/src/oauth2_client/token.rs
+@@ -135,6 +135,77 @@ pub async fn hydrate_client_credentials_context(
+     Ok((vsc, ruleset.ruleset_version))
+ }
+ 
++/// Run an external assertion's verified claims through the domain's token
++/// exchange mapping ruleset and return a fully hydrated security context.
++pub async fn hydrate_external_assertion_context(
++    state: &ServiceState,
++    domain_id: &str,
++    issuer: &str,
++    subject: &str,
++    claims: HashMap<String, Vec<String>>,
++) -> Result<(ValidatedSecurityContext, u128), AuthenticationError> {
++    let source = IdentitySource::TokenExchange {
++        issuer: issuer.to_string(),
++    };
++    let exec = ExecutionContext::internal(state);
++    let ruleset = state
++        .provider
++        .get_mapping_provider()
++        .get_ruleset_by_source(&exec, domain_id, &source)
++        .await
++        .map_err(|e| AuthenticationError::Provider {
++            source: Box::new(e),
++            context: Some("external assertion mapping ruleset lookup".to_string()),
++        })?
++        .ok_or(AuthenticationError::Unauthorized)?;
++
++    if !ruleset.enabled {
++        return Err(AuthenticationError::Unauthorized);
++    }
++
++    let match_result =
++        engine::evaluate_ruleset(&ruleset, &claims, ruleset.domain_id.as_deref(), None).map_err(
++            |e| AuthenticationError::Provider {
++                source: Box::new(e),
++                context: Some("external assertion mapping evaluation".to_string()),
++            },
++        )?;
++    let authorization = match &match_result {
++        None => return Err(AuthenticationError::NoAuthorizationsFound),
++        Some(mr) if mr.authorizations.is_empty() => {
++            return Err(AuthenticationError::NoAuthorizationsFound);
++        }
++        Some(mr) if mr.authorizations.len() > 1 => {
++            return Err(AuthenticationError::MultipleScopesForbidden);
++        }
++        Some(mr) => &mr.authorizations[0],
++    };
++
++    let scope = scope_info_from_authorization(state, &exec, authorization).await?;
++    scope.validate()?;
++
++    let mapping_req = MappingAuthRequest {
++        domain_id: Some(domain_id.to_string()),
++        source,
++        unique_workload_id: subject.to_string(),
++        claims,
++        rule_name: None,
++    };
++    let auth_result = state
++        .provider
++        .get_mapping_provider()
++        .authenticate_by_mapping(&exec, &mapping_req)
++        .await
++        .map_err(|e| AuthenticationError::Provider {
++            source: Box::new(e),
++            context: Some("external assertion mapping authentication".to_string()),
++        })?;
++
++    let ctx = SecurityContext::try_from(auth_result)?;
++    let vsc = ValidatedSecurityContext::new_for_scope(ctx, scope, state).await?;
++    Ok((vsc, ruleset.ruleset_version))
++}
++
+ /// Resolve the mapping-matched [`Authorization`] into a [`ScopeInfo`] backed
+ /// by the resource provider's live `Project`/`Domain` records, not by
+ /// ruleset-declared placeholders.
+@@ -144,7 +215,7 @@ pub async fn hydrate_client_credentials_context(
+ /// disabled after the ruleset was written, without the ruleset itself being
+ /// updated). Fetching the real record here -- rather than fabricating one
+ /// with `enabled: true` hardcoded -- is what makes the subsequent
+-/// `ScopeInfo::validate()` call in `hydrate_client_credentials_context`
++/// `ScopeInfo::validate()` call during context hydration
+ /// meaningful: without it, `validate()` would only ever be checking its own
+ /// placeholder's `true` against itself.
+ ///
+@@ -164,15 +235,15 @@ async fn scope_info_from_authorization(
+             let project = resource_provider
+                 .get_project_ref(exec, project_id)
+                 .await
+-                .auth_context("fetching oauth2 client_credentials scope project")?
++                .auth_context("fetching oauth2 mapping scope project")?
+                 .ok_or_else(|| ResourceProviderError::ProjectNotFound(project_id.clone()))
+-                .auth_context("fetching oauth2 client_credentials scope project")?;
++                .auth_context("fetching oauth2 mapping scope project")?;
+             let project_domain = resource_provider
+                 .get_domain_ref(exec, &project.domain_id)
+                 .await
+-                .auth_context("fetching oauth2 client_credentials scope project domain")?
++                .auth_context("fetching oauth2 mapping scope project domain")?
+                 .ok_or_else(|| ResourceProviderError::DomainNotFound(project.domain_id.clone()))
+-                .auth_context("fetching oauth2 client_credentials scope project domain")?;
++                .auth_context("fetching oauth2 mapping scope project domain")?;
+             Ok(ScopeInfo::Project {
+                 project,
+                 project_domain,
+@@ -182,9 +253,9 @@ async fn scope_info_from_authorization(
+             let domain = resource_provider
+                 .get_domain_ref(exec, domain_id)
+                 .await
+-                .auth_context("fetching oauth2 client_credentials scope domain")?
++                .auth_context("fetching oauth2 mapping scope domain")?
+                 .ok_or_else(|| ResourceProviderError::DomainNotFound(domain_id.clone()))
+-                .auth_context("fetching oauth2 client_credentials scope domain")?;
++                .auth_context("fetching oauth2 mapping scope domain")?;
+             Ok(ScopeInfo::Domain(domain))
+         }
+         Authorization::System { system_id, .. } => Ok(ScopeInfo::System(system_id.clone())),
+@@ -280,3 +351,146 @@ pub fn build_access_token_claims(
+         cnf: None,
+     })
+ }
++
++/// Build claims for a token minted from an external assertion.
++///
++/// The returned token never outlives the validated assertion, even when the
++/// configured access-token lifetime is longer.
++#[allow(clippy::too_many_arguments)]
++pub fn build_external_assertion_claims(
++    client: &OAuth2ClientResource,
++    vsc: &ValidatedSecurityContext,
++    issuer: &str,
++    jti: String,
++    ruleset_version: u128,
++    iat: i64,
++    configured_exp: i64,
++    assertion_exp: i64,
++    audience: Audience,
++) -> Result<OpenStackAccessTokenClaims, Oauth2ClientProviderError> {
++    use openstack_keystone_core_types::auth::IdentityInfo;
++
++    let identity = &vsc.inner().principal().identity;
++    let (user_id, user_name, user_domain_id, amr) = match identity {
++        IdentityInfo::User(user) => {
++            let user_name = user
++                .user
++                .as_ref()
++                .map(|record| record.name.clone())
++                .unwrap_or_else(|| user.user_id.clone());
++            (
++                user.user_id.clone(),
++                user_name,
++                user.user_domain.as_ref().map(|domain| domain.id.clone()),
++                vec!["external_jwt".to_string()],
++            )
++        }
++        IdentityInfo::Principal(principal) => (
++            principal.id.clone(),
++            principal
++                .resolved_user_name
++                .clone()
++                .unwrap_or_else(|| principal.id.clone()),
++            principal.domain.as_ref().map(|domain| domain.id.clone()),
++            vec!["external_jwt".to_string()],
++        ),
++    };
++
++    let authz = vsc.inner().authorization().ok_or_else(|| {
++        Oauth2ClientProviderError::Validation(
++            "external assertion mapping has no authorization scope".to_string(),
++        )
++    })?;
++    let scope_domain_id = match &authz.scope {
++        ScopeInfo::Project { project_domain, .. } => project_domain.id.as_str(),
++        ScopeInfo::Domain(domain) => domain.id.as_str(),
++        ScopeInfo::System(_) => &client.domain_id,
++        _ => {
++            return Err(Oauth2ClientProviderError::Validation(
++                "external assertion mapping has an unsupported scope".to_string(),
++            ));
++        }
++    };
++    if scope_domain_id != client.domain_id {
++        return Err(Oauth2ClientProviderError::Validation(
++            "external assertion mapping scope belongs to another domain".to_string(),
++        ));
++    }
++
++    let exp = cap_external_assertion_expiry(configured_exp, assertion_exp, iat)?;
++
++    let role_refs = authz.effective_roles().unwrap_or(&[]).to_vec();
++    let role_names = role_refs
++        .iter()
++        .filter_map(|role| role.name.clone())
++        .collect();
++    let scope = match &authz.scope {
++        ScopeInfo::Project {
++            project,
++            project_domain,
++        } => OpenStackScope::Project {
++            project_id: project.id.clone(),
++            project_domain_id: project_domain.id.clone(),
++            roles: role_refs,
++        },
++        ScopeInfo::Domain(domain) => OpenStackScope::Domain {
++            domain_id: domain.id.clone(),
++            roles: role_refs,
++        },
++        ScopeInfo::System(system_id) => OpenStackScope::System {
++            system_id: system_id.clone(),
++            roles: role_refs,
++        },
++        _ => OpenStackScope::Unscoped,
++    };
++
++    Ok(OpenStackAccessTokenClaims {
++        iss: issuer.to_string(),
++        sub: user_id.clone(),
++        aud: audience,
++        client_id: client.client_id.clone(),
++        exp,
++        iat,
++        nbf: iat,
++        jti,
++        keystone_ruleset_version: ruleset_version,
++        amr,
++        token_use: "access".to_string(),
++        delegation_context: DelegationContext::Plain,
++        act: None,
++        openstack_context: OpenStackContext {
++            user_id,
++            user_name,
++            user_domain_id,
++            scope,
++            roles: role_names,
++        },
++        cnf: None,
++    })
++}
++
++fn cap_external_assertion_expiry(
++    configured_exp: i64,
++    assertion_exp: i64,
++    iat: i64,
++) -> Result<i64, Oauth2ClientProviderError> {
++    let exp = configured_exp.min(assertion_exp);
++    if exp <= iat {
++        return Err(Oauth2ClientProviderError::Validation(
++            "external assertion expires before the access token can be issued".to_string(),
++        ));
++    }
++    Ok(exp)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::cap_external_assertion_expiry;
++
++    #[test]
++    fn external_token_expiry_never_exceeds_assertion_expiry() {
++        assert!(cap_external_assertion_expiry(500, 300, 100).is_ok_and(|exp| exp == 300));
++        assert!(cap_external_assertion_expiry(250, 300, 100).is_ok_and(|exp| exp == 250));
++        assert!(cap_external_assertion_expiry(300, 100, 100).is_err());
++    }
++}
+diff --git a/crates/keystone/src/api/v4/oauth2/token.rs b/crates/keystone/src/api/v4/oauth2/token.rs
+index 42df52e34..3cf26e07e 100644
+--- a/crates/keystone/src/api/v4/oauth2/token.rs
++++ b/crates/keystone/src/api/v4/oauth2/token.rs
+@@ -30,6 +30,7 @@ mod device_code;
+ mod dpop;
+ mod error;
+ mod exchange_request;
++mod external_assertion;
+ mod on_behalf_of;
+ mod refresh_token;
+ mod service_grant;
+@@ -94,7 +95,7 @@ pub(super) struct TokenForm {
+     #[serde(default)]
+     refresh_token: Option<String>,
+     /// RFC 8693 Token Exchange grant only: the existing Keystone-native
+-    /// token (Fernet or JWS) being exchanged.
++    /// token (Fernet or JWS) or external assertion JWT being exchanged.
+     #[serde(default)]
+     subject_token: Option<String>,
+     /// RFC 8693 subject type: access_token, Keystone-native, or native JWT.
+diff --git a/crates/keystone/src/api/v4/oauth2/token/exchange_request.rs b/crates/keystone/src/api/v4/oauth2/token/exchange_request.rs
+index bde2346af..f7bf63ec1 100644
+--- a/crates/keystone/src/api/v4/oauth2/token/exchange_request.rs
++++ b/crates/keystone/src/api/v4/oauth2/token/exchange_request.rs
+@@ -11,13 +11,13 @@
+ // limitations under the License.
+ //
+ // SPDX-License-Identifier: Apache-2.0
+-//! Shared RFC 8693 request rules for native and on-behalf-of exchange.
++//! Shared RFC 8693 request rules for native and external JWT exchange.
+ 
+ use super::{Oauth2TokenError, TokenForm};
+ 
+ pub(super) const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
+ pub(super) const KEYSTONE_TOKEN_TYPE: &str = "urn:openstack:params:oauth:token-type:keystone";
+-const JWT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
++pub(super) const JWT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
+ const API_SCOPE: &str = "openstack:api";
+ 
+ /// Validate the common exchange envelope after the caller's rate limit.
+@@ -31,11 +31,7 @@ pub(super) fn validate_exchange_request(form: &TokenForm) -> Result<String, Oaut
+     };
+     match subject_type {
+         ACCESS_TOKEN_TYPE | KEYSTONE_TOKEN_TYPE => {}
+-        JWT_TOKEN_TYPE => {
+-            // #1018 extension point: external JWT ingress must use the mapping
+-            // engine. For compatibility this arm currently permits only JWTs
+-            // accepted by the existing Keystone-native validation backend.
+-        }
++        JWT_TOKEN_TYPE => {}
+         _ => {
+             return Err(Oauth2TokenError::invalid_request(format!(
+                 "subject_token_type `{subject_type}` is not supported"
+diff --git a/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs b/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
+index 84bfaa779..7e3d862c9 100644
+--- a/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
++++ b/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
+@@ -36,14 +36,12 @@ use crate::api::v4::oauth2::well_known::base_url;
+ 
+ use super::exchange_request::{ACCESS_TOKEN_TYPE, validate_exchange_request};
+ 
+-/// RFC 8693 Token Exchange grant (ADR 0026 §12 "v2 shape", implemented as
+-/// the follow-up amendment the ADR itself defers this grant's concrete
+-/// shape to). Trades an existing Keystone-native delegated credential
+-/// (trust or application credential; EC2 deferred) for a native
+-/// `OpenStackAccessTokenClaims`. Gating: the exchanging client must hold
+-/// `token-exchange` in its own `grant_types` -- SystemAdmin-only to enable,
+-/// mirroring `pre_authorized`'s gating (ADR 0026 §5), enforced at client
+-/// create/update time, not here.
++/// RFC 8693 Token Exchange grant (ADR 0026 §12 "v2 shape"). Dispatches
++/// Keystone-native credentials to the native exchange flow and external JWT
++/// assertions to the IdP-backed mapping flow. Gating: the exchanging client
++/// must hold `token-exchange` in its own `grant_types` -- SystemAdmin-only to
++/// enable, mirroring `pre_authorized`'s gating (ADR 0026 §5), enforced at
++/// client create/update time, not here.
+ pub(super) async fn handle_token_exchange_grant(
+     state: &ServiceState,
+     domain_id: &str,
+@@ -111,6 +109,22 @@ pub(super) async fn handle_token_exchange_grant(
+     )
+     .await?;
+ 
++    if form.subject_token_type.as_deref() == Some(super::exchange_request::JWT_TOKEN_TYPE) {
++        return super::external_assertion::handle_external_assertion_exchange(
++            state,
++            domain_id,
++            headers,
++            correlation_id,
++            form,
++            &client,
++            subject_token,
++            confirmation,
++            scope,
++            oauth2_cfg,
++        )
++        .await;
++    }
++
+     let (vsc, delegation_context, credential_expires_at) =
+         openstack_keystone_core::oauth2_client::validate_subject_token(state, &subject_token)
+             .await
+@@ -223,7 +237,7 @@ fn exchange_error(
+ /// closed on a token type it cannot honour, so a JWT-shaped token that cannot
+ /// be inspected counts as carrying a confirmation rather than as plain.
+ /// Tokens that are not JWT-shaped (the opaque Fernet tokens) have no claims.
+-fn subject_token_carries_cnf(token: &str) -> bool {
++pub(super) fn subject_token_carries_cnf(token: &str) -> bool {
+     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+     let mut parts = token.split('.');
+     let (Some(_), Some(payload), Some(_), None) =
+diff --git a/crates/keystone/src/federation/api.rs b/crates/keystone/src/federation/api.rs
+index df1ca3118..56de5b05d 100644
+--- a/crates/keystone/src/federation/api.rs
++++ b/crates/keystone/src/federation/api.rs
+@@ -27,7 +27,7 @@ use utoipa_axum::router::OpenApiRouter;
+ use crate::keystone::ServiceState;
+ 
+ pub mod auth;
+-mod common;
++pub(crate) mod common;
+ pub mod error;
+ pub mod identity_provider;
+ pub mod jwt;
+diff --git a/crates/keystone/src/federation/api/common.rs b/crates/keystone/src/federation/api/common.rs
+index f718d4038..c5f205f3b 100644
+--- a/crates/keystone/src/federation/api/common.rs
++++ b/crates/keystone/src/federation/api/common.rs
+@@ -52,7 +52,7 @@ const CLAIMS_MAP_LIMIT: usize = 64 * 1024;
+ /// # Returns
+ /// Flattened claims map, or `MappingProviderError::ClaimsMapTooLarge` if
+ /// the total map exceeds 64 KiB.
+-pub(super) fn flatten_federation_claims(
++pub(crate) fn flatten_federation_claims(
+     claims_json: &Value,
+ ) -> Result<HashMap<String, Vec<String>>, MappingProviderError> {
+     let mut claims = HashMap::new();
+diff --git a/crates/keystone/src/federation/api/oidc_utils.rs b/crates/keystone/src/federation/api/oidc_utils.rs
+index 8117e8af9..db306376b 100644
+--- a/crates/keystone/src/federation/api/oidc_utils.rs
++++ b/crates/keystone/src/federation/api/oidc_utils.rs
+@@ -31,7 +31,7 @@ use super::error::OidcError;
+ 
+ /// Subset of the OIDC Provider Metadata we actually use.
+ #[derive(Debug, Deserialize)]
+-pub(super) struct OidcProviderMetadata {
++pub(crate) struct OidcProviderMetadata {
+     pub issuer: String,
+     pub authorization_endpoint: String,
+     pub token_endpoint: String,
+@@ -46,7 +46,7 @@ pub(super) struct OidcProviderMetadata {
+ ///
+ /// Validates per RFC 8414 §3 that the returned `issuer` matches the URL used
+ /// for discovery.
+-pub(super) async fn discover(
++pub(crate) async fn discover(
+     issuer_url: &str,
+     client: &reqwest::Client,
+ ) -> Result<OidcProviderMetadata, OidcError> {
+@@ -186,7 +186,7 @@ pub(super) async fn exchange_code(
+ }
+ 
+ /// Fetch a JWKS from the given URI.
+-pub(super) async fn fetch_jwks(
++pub(crate) async fn fetch_jwks(
+     jwks_uri: &str,
+     client: &reqwest::Client,
+ ) -> Result<JwkSet, OidcError> {
+@@ -335,7 +335,7 @@ fn check_nonce(
+ 
+ /// Build a `reqwest::Client` with redirect following disabled (SSRF guard)
+ /// and a reasonable default timeout to prevent resource exhaustion.
+-pub(super) fn build_http_client() -> Result<reqwest::Client, OidcError> {
++pub(crate) fn build_http_client() -> Result<reqwest::Client, OidcError> {
+     openstack_keystone_tls_provider::install_default();
+     reqwest::ClientBuilder::new()
+         .redirect(reqwest::redirect::Policy::none())
+
+From 63ae4b219e72626eb20ddc55ef3fe0a904e93f1e Mon Sep 17 00:00:00 2001
+From: Dominic Murphy <ddmurphy@bu.edu>
+Date: Sun, 15 Nov 2026 00:32:45 -0500
+Subject: [PATCH 2/5] feat(oauth2): Add external assertion handler
+
+Verify external JWTs using trusted IdP keys and the shared profile.
+Prepare mapped token claims with assertion-expiry caps; fail closed
+until replay protection is available.
+
+Signed-off-by: Dominic Murphy <ddmurphy@bu.edu>
+---
+ .../api/v4/oauth2/token/external_assertion.rs | 285 ++++++++++++++++++
+ 1 file changed, 285 insertions(+)
+ create mode 100644 crates/keystone/src/api/v4/oauth2/token/external_assertion.rs
+
+diff --git a/crates/keystone/src/api/v4/oauth2/token/external_assertion.rs b/crates/keystone/src/api/v4/oauth2/token/external_assertion.rs
+new file mode 100644
+index 000000000..12fb21c58
+--- /dev/null
++++ b/crates/keystone/src/api/v4/oauth2/token/external_assertion.rs
+@@ -0,0 +1,285 @@
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++// SPDX-License-Identifier: Apache-2.0
++//! External JWT subject-token exchange.
++
++use axum::{
++    Json,
++    http::{HeaderMap, StatusCode},
++    response::{IntoResponse, Response},
++};
++use cadf::Outcome;
++use serde_json::Value;
++
++use openstack_keystone_config::Oauth2Provider;
++use openstack_keystone_core::auth::ExecutionContext;
++use openstack_keystone_core::oauth2_client::{
++    SubjectTokenValidationProfile, verify_subject_token_jwt,
++};
++use openstack_keystone_core_types::auth::AuthenticationError;
++use openstack_keystone_core_types::federation::IdentityProvider;
++use openstack_keystone_core_types::oauth2_client::{Confirmation, OAuth2ClientResource};
++
++use crate::audit::{build_initiator_from_vsc, emit_oauth2_session_event};
++use crate::federation::api::oidc_utils;
++use crate::keystone::ServiceState;
++
++use super::exchange_request::ACCESS_TOKEN_TYPE;
++use super::token_exchange::{requested_audience, subject_token_carries_cnf};
++use super::{Oauth2TokenError, TokenForm, TokenResponse};
++
++#[allow(clippy::too_many_arguments)]
++pub(super) async fn handle_external_assertion_exchange(
++    state: &ServiceState,
++    domain_id: &str,
++    headers: &HeaderMap,
++    correlation_id: &str,
++    form: &TokenForm,
++    client: &OAuth2ClientResource,
++    subject_token: String,
++    confirmation: Option<Confirmation>,
++    scope: String,
++    oauth2_cfg: &Oauth2Provider,
++) -> Result<Response, Oauth2TokenError> {
++    let unverified_issuer = extract_unverified_issuer(&subject_token)
++        .ok_or_else(|| Oauth2TokenError::invalid_grant("subject_token is not a valid JWT"))?;
++    let exec = ExecutionContext::internal(state);
++    let idp = state
++        .provider
++        .get_federation_provider()
++        .get_identity_provider_by_issuer(&exec, domain_id, &unverified_issuer)
++        .await
++        .map_err(|error| {
++            tracing::error!(error = %error, "external assertion issuer lookup failed");
++            Oauth2TokenError::internal("subject_token validation failed")
++        })?
++        .ok_or_else(|| Oauth2TokenError::invalid_grant("subject_token issuer is not trusted"))?;
++
++    let jwks = load_identity_provider_jwks(&idp).await?;
++    let base = crate::api::v4::oauth2::well_known::base_url(state, headers).await;
++    let token_endpoint_audience = format!("{base}/v4/oauth2/{domain_id}/token");
++    let profile = SubjectTokenValidationProfile::external_assertion(
++        std::slice::from_ref(&unverified_issuer),
++        &token_endpoint_audience,
++    );
++    let verified_claims: Value = verify_subject_token_jwt(&subject_token, &jwks, &profile)
++        .map_err(|error| {
++            tracing::warn!(error = %error, "external assertion rejected");
++            Oauth2TokenError::invalid_grant(
++                "subject_token is invalid, expired, or has invalid claims",
++            )
++        })?;
++
++    if subject_token_carries_cnf(&subject_token) {
++        return Err(Oauth2TokenError::invalid_request(
++            "a DPoP-bound subject_token cannot be exchanged",
++        ));
++    }
++
++    let assertion_exp = verified_claims
++        .get("exp")
++        .and_then(Value::as_i64)
++        .ok_or_else(|| Oauth2TokenError::invalid_grant("subject_token has no valid expiry"))?;
++    let assertion_jti = verified_claims
++        .get("jti")
++        .and_then(Value::as_str)
++        .filter(|jti| !jti.is_empty() && jti.len() <= 256)
++        .ok_or_else(|| Oauth2TokenError::invalid_grant("subject_token has no valid jti"))?;
++
++    // Fail closed until the shared bounded assertion replay cache from #1640
++    // is available on this branch. Do this before mapping, which can create or
++    // update local identity records.
++    require_assertion_replay_protection(
++        domain_id,
++        &unverified_issuer,
++        assertion_jti,
++        assertion_exp,
++    )?;
++
++    let subject = verified_claims
++        .get("sub")
++        .and_then(Value::as_str)
++        .ok_or_else(|| Oauth2TokenError::invalid_grant("subject_token has no valid subject"))?;
++    let flattened = crate::federation::api::common::flatten_federation_claims(&verified_claims)
++        .map_err(|error| {
++            tracing::warn!(error = %error, "external assertion claims could not be mapped");
++            Oauth2TokenError::invalid_grant("subject_token claims could not be mapped")
++        })?;
++    let (vsc, ruleset_version) =
++        openstack_keystone_core::oauth2_client::hydrate_external_assertion_context(
++            state,
++            domain_id,
++            &unverified_issuer,
++            subject,
++            flattened,
++        )
++        .await
++        .map_err(map_mapping_error)?;
++
++    let audience = requested_audience(state, &form.audience).await?;
++    let issuer = format!("{base}/v4/oauth2/{domain_id}");
++    let now = chrono::Utc::now().timestamp();
++    let access_lifetime = i64::from(oauth2_cfg.access_token_lifetime_minutes) * 60;
++    let jti = uuid::Uuid::new_v4().to_string();
++    let mut claims = openstack_keystone_core::oauth2_client::build_external_assertion_claims(
++        client,
++        &vsc,
++        &issuer,
++        jti,
++        ruleset_version,
++        now,
++        now + access_lifetime,
++        assertion_exp,
++        audience,
++    )
++    .map_err(|error| {
++        tracing::warn!(error = %error, "external assertion token claims could not be built");
++        Oauth2TokenError::invalid_grant("subject_token does not permit token issuance")
++    })?;
++    let token_type = super::dpop::token_type(confirmation.as_ref());
++    claims.cnf = confirmation;
++    let access_token = super::common::sign_jwt(state, domain_id, &claims).await?;
++
++    emit_oauth2_session_event(
++        &state.audit_dispatcher,
++        correlation_id,
++        "authenticate",
++        build_initiator_from_vsc(&vsc),
++        &client.client_id,
++        Outcome::Success,
++        None,
++    );
++
++    let response = TokenResponse {
++        issued_token_type: Some(ACCESS_TOKEN_TYPE),
++        access_token,
++        token_type,
++        expires_in: claims.exp - now,
++        scope,
++        id_token: None,
++        refresh_token: None,
++    };
++    Ok((StatusCode::OK, Json(response)).into_response())
++}
++
++fn extract_unverified_issuer(token: &str) -> Option<String> {
++    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
++
++    let mut parts = token.split('.');
++    let (Some(_), Some(payload), Some(_), None) =
++        (parts.next(), parts.next(), parts.next(), parts.next())
++    else {
++        return None;
++    };
++    let claims: Value =
++        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?)
++            .ok()?;
++    claims
++        .get("iss")
++        .and_then(Value::as_str)
++        .filter(|issuer| !issuer.is_empty() && issuer.len() <= 2048)
++        .map(str::to_string)
++}
++
++async fn load_identity_provider_jwks(
++    idp: &IdentityProvider,
++) -> Result<jsonwebtoken::jwk::JwkSet, Oauth2TokenError> {
++    let client = oidc_utils::build_http_client().map_err(|error| {
++        tracing::error!(error = %error, "external assertion HTTP client creation failed");
++        Oauth2TokenError::internal("subject_token validation failed")
++    })?;
++    let jwks_uri = if let Some(jwks_url) = idp.jwks_url.as_deref() {
++        jwks_url.to_string()
++    } else if let Some(discovery_url) = idp.oidc_discovery_url.as_deref() {
++        oidc_utils::discover(discovery_url, &client)
++            .await
++            .map_err(|error| {
++                tracing::error!(error = %error, "external assertion discovery failed");
++                Oauth2TokenError::internal("subject_token validation failed")
++            })?
++            .jwks_uri
++    } else {
++        tracing::error!(
++            identity_provider_id = %idp.id,
++            has_static_keys = idp.jwt_validation_pubkeys.as_ref().is_some_and(|keys| !keys.is_empty()),
++            "identity provider has no usable JWKS configuration"
++        );
++        return Err(Oauth2TokenError::internal(
++            "identity provider has no usable JWKS configuration",
++        ));
++    };
++    oidc_utils::fetch_jwks(&jwks_uri, &client)
++        .await
++        .map_err(|error| {
++            tracing::error!(error = %error, "external assertion JWKS fetch failed");
++            Oauth2TokenError::internal("subject_token validation failed")
++        })
++}
++
++fn require_assertion_replay_protection(
++    _domain_id: &str,
++    _issuer: &str,
++    _jti: &str,
++    _expires_at: i64,
++) -> Result<(), Oauth2TokenError> {
++    Err(Oauth2TokenError::server_error_unavailable(
++        "external assertion replay protection is not available",
++    ))
++}
++
++fn map_mapping_error(error: AuthenticationError) -> Oauth2TokenError {
++    tracing::warn!(error = %error, "external assertion mapping rejected");
++    match error {
++        AuthenticationError::Unauthorized
++        | AuthenticationError::NoAuthorizationsFound
++        | AuthenticationError::MultipleScopesForbidden
++        | AuthenticationError::UserDisabled(_)
++        | AuthenticationError::UserDomainDisabled
++        | AuthenticationError::DomainDisabled(_)
++        | AuthenticationError::ProjectDisabled(_) => {
++            Oauth2TokenError::invalid_grant("subject_token claims could not be mapped")
++        }
++        AuthenticationError::Provider { .. }
++        | AuthenticationError::StructBuilder { .. }
++        | AuthenticationError::RoleConversionFailed => {
++            Oauth2TokenError::internal("subject_token mapping failed")
++        }
++        _ => Oauth2TokenError::invalid_grant("subject_token claims could not be mapped"),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn issuer_extraction_only_selects_a_candidate() {
++        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
++
++        let payload = URL_SAFE_NO_PAD.encode(br#"{"iss":"https://issuer.example"}"#);
++        assert_eq!(
++            extract_unverified_issuer(&format!("header.{payload}.signature")),
++            Some("https://issuer.example".to_string())
++        );
++        assert_eq!(extract_unverified_issuer("not.a.jwt.extra"), None);
++        assert_eq!(extract_unverified_issuer("header.e30.signature"), None);
++    }
++
++    #[test]
++    fn external_assertion_issuance_fails_closed_without_replay_cache() {
++        let error = require_assertion_replay_protection("domain", "issuer", "jti", 100)
++            .expect_err("cache is not wired");
++        assert_eq!(error.error_code(), "server_error");
++        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
++    }
++}
+
+From 42867885604cd1b2880b909c07627e46a31aed90 Mon Sep 17 00:00:00 2001
+From: Dominic Murphy <ddmurphy@bu.edu>
+Date: Sun, 15 Nov 2026 00:59:22 -0500
+Subject: [PATCH 3/5] test(oauth2): Cover external JWT exchange
+
+Exercise issuer/key resolution, verification, mapping, replay rejection,
+
+and minted-token claims through the external exchange handler.
+
+Signed-off-by: Dominic Murphy <ddmurphy@bu.edu>
+---
+ .../api/v4/oauth2/token/external_assertion.rs | 450 +++++++++++++++++-
+ 1 file changed, 428 insertions(+), 22 deletions(-)
+
+diff --git a/crates/keystone/src/api/v4/oauth2/token/external_assertion.rs b/crates/keystone/src/api/v4/oauth2/token/external_assertion.rs
+index 12fb21c58..96efb617e 100644
+--- a/crates/keystone/src/api/v4/oauth2/token/external_assertion.rs
++++ b/crates/keystone/src/api/v4/oauth2/token/external_assertion.rs
+@@ -50,6 +50,36 @@ pub(super) async fn handle_external_assertion_exchange(
+     confirmation: Option<Confirmation>,
+     scope: String,
+     oauth2_cfg: &Oauth2Provider,
++) -> Result<Response, Oauth2TokenError> {
++    handle_external_assertion_exchange_with_replay(
++        state,
++        domain_id,
++        headers,
++        correlation_id,
++        form,
++        client,
++        subject_token,
++        confirmation,
++        scope,
++        oauth2_cfg,
++        &ReplayProtectionUnavailable,
++    )
++    .await
++}
++
++#[allow(clippy::too_many_arguments)]
++async fn handle_external_assertion_exchange_with_replay(
++    state: &ServiceState,
++    domain_id: &str,
++    headers: &HeaderMap,
++    correlation_id: &str,
++    form: &TokenForm,
++    client: &OAuth2ClientResource,
++    subject_token: String,
++    confirmation: Option<Confirmation>,
++    scope: String,
++    oauth2_cfg: &Oauth2Provider,
++    replay_protection: &dyn AssertionReplayProtection,
+ ) -> Result<Response, Oauth2TokenError> {
+     let unverified_issuer = extract_unverified_issuer(&subject_token)
+         .ok_or_else(|| Oauth2TokenError::invalid_grant("subject_token is not a valid JWT"))?;
+@@ -96,15 +126,10 @@ pub(super) async fn handle_external_assertion_exchange(
+         .filter(|jti| !jti.is_empty() && jti.len() <= 256)
+         .ok_or_else(|| Oauth2TokenError::invalid_grant("subject_token has no valid jti"))?;
+ 
+-    // Fail closed until the shared bounded assertion replay cache from #1640
+-    // is available on this branch. Do this before mapping, which can create or
+-    // update local identity records.
+-    require_assertion_replay_protection(
+-        domain_id,
+-        &unverified_issuer,
+-        assertion_jti,
+-        assertion_exp,
+-    )?;
++    replay_protection
++        .check_and_record(domain_id, &unverified_issuer, assertion_jti, assertion_exp)
++        .await
++        .map_err(map_replay_protection_error)?;
+ 
+     let subject = verified_claims
+         .get("sub")
+@@ -226,15 +251,48 @@ async fn load_identity_provider_jwks(
+         })
+ }
+ 
+-fn require_assertion_replay_protection(
+-    _domain_id: &str,
+-    _issuer: &str,
+-    _jti: &str,
+-    _expires_at: i64,
+-) -> Result<(), Oauth2TokenError> {
+-    Err(Oauth2TokenError::server_error_unavailable(
+-        "external assertion replay protection is not available",
+-    ))
++#[async_trait::async_trait]
++trait AssertionReplayProtection: Send + Sync {
++    async fn check_and_record(
++        &self,
++        domain_id: &str,
++        issuer: &str,
++        jti: &str,
++        expires_at: i64,
++    ) -> Result<(), ReplayProtectionError>;
++}
++
++#[derive(Debug)]
++enum ReplayProtectionError {
++    Unavailable,
++    #[cfg_attr(not(test), allow(dead_code))]
++    Replayed,
++}
++
++struct ReplayProtectionUnavailable;
++
++#[async_trait::async_trait]
++impl AssertionReplayProtection for ReplayProtectionUnavailable {
++    async fn check_and_record(
++        &self,
++        _domain_id: &str,
++        _issuer: &str,
++        _jti: &str,
++        _expires_at: i64,
++    ) -> Result<(), ReplayProtectionError> {
++        Err(ReplayProtectionError::Unavailable)
++    }
++}
++
++fn map_replay_protection_error(error: ReplayProtectionError) -> Oauth2TokenError {
++    match error {
++        ReplayProtectionError::Unavailable => Oauth2TokenError::server_error_unavailable(
++            "external assertion replay protection is not available",
++        ),
++        ReplayProtectionError::Replayed => {
++            Oauth2TokenError::invalid_grant("subject_token assertion has already been used")
++        }
++    }
+ }
+ 
+ fn map_mapping_error(error: AuthenticationError) -> Oauth2TokenError {
+@@ -260,7 +318,203 @@ fn map_mapping_error(error: AuthenticationError) -> Oauth2TokenError {
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::{collections::HashSet, sync::Mutex};
++
++    use httpmock::prelude::*;
++    use serde_json::json;
++
++    use openstack_keystone_core_types::mapping::resolution::IdentitySource;
++    use openstack_keystone_core_types::{
++        federation::IdentityProvider, oauth2_client::OAuth2ClientResource,
++    };
++
+     use super::*;
++    use crate::api::v4::oauth2::token::test_fixtures::{
++        confidential_client, json_body, jwt_claims, matching_ruleset, ok_key_mock,
++        successful_auth_result,
++    };
++    use crate::federation::MockFederationProvider;
++    use crate::federation::api::oidc_utils::fixtures::{TEST_KID, make_jwt, rsa_jwk};
++    use crate::mapping::MockMappingProvider;
++    use crate::provider::Provider;
++    use crate::resource::MockResourceProvider;
++
++    const EXTERNAL_ISSUER: &str = "https://issuer.example";
++
++    #[derive(Default)]
++    struct TestReplayProtection(Mutex<HashSet<(String, String, String)>>);
++
++    #[async_trait::async_trait]
++    impl AssertionReplayProtection for TestReplayProtection {
++        async fn check_and_record(
++            &self,
++            domain_id: &str,
++            issuer: &str,
++            jti: &str,
++            _expires_at: i64,
++        ) -> Result<(), ReplayProtectionError> {
++            let Ok(mut seen) = self.0.lock() else {
++                return Err(ReplayProtectionError::Unavailable);
++            };
++            if seen.insert((domain_id.to_string(), issuer.to_string(), jti.to_string())) {
++                Ok(())
++            } else {
++                Err(ReplayProtectionError::Replayed)
++            }
++        }
++    }
++
++    async fn test_state(
++        issuer: &str,
++        idp: Option<IdentityProvider>,
++        configure_mapping: bool,
++    ) -> crate::keystone::ServiceState {
++        let expected_issuer = issuer.to_string();
++        let mut federation = MockFederationProvider::default();
++        federation
++            .expect_get_identity_provider_by_issuer()
++            .returning(move |_, domain_id, requested_issuer| {
++                assert_eq!(domain_id, "domain-1");
++                assert_eq!(requested_issuer, expected_issuer);
++                Ok(idp.clone())
++            });
++
++        let mut mapping = MockMappingProvider::default();
++        if configure_mapping {
++            let source = IdentitySource::TokenExchange {
++                issuer: issuer.to_string(),
++            };
++            let ruleset_source = source.clone();
++            let mut ruleset = matching_ruleset();
++            ruleset.source = source.clone();
++            mapping.expect_get_ruleset_by_source().returning(
++                move |_, domain_id, requested_source| {
++                    assert_eq!(domain_id, "domain-1");
++                    assert_eq!(requested_source, &ruleset_source);
++                    Ok(Some(ruleset.clone()))
++                },
++            );
++            let expected_source = source.clone();
++            let expected_issuer = issuer.to_string();
++            mapping
++                .expect_authenticate_by_mapping()
++                .returning(move |_, request| {
++                    assert_eq!(request.domain_id.as_deref(), Some("domain-1"));
++                    assert_eq!(request.source, expected_source);
++                    assert_eq!(request.unique_workload_id, "external-user");
++                    assert!(request.claims["iss"].contains(&expected_issuer));
++                    assert!(request.claims["sub"].contains(&"external-user".to_string()));
++                    assert!(request.claims["aud"].contains(&assertion_audience()));
++                    assert!(request.claims["jti"].contains(&"assertion-1".to_string()));
++                    Ok(successful_auth_result())
++                });
++        }
++
++        let mut resource = MockResourceProvider::default();
++        resource.expect_get_domain_ref().returning(|_, _| {
++            Ok(Some(openstack_keystone_core_types::resource::DomainRef {
++                id: "domain-1".to_string(),
++                name: "domain-1".to_string(),
++                enabled: true,
++            }))
++        });
++
++        let provider = Provider::mocked_builder()
++            .mock_federation(federation)
++            .mock_mapping(mapping)
++            .mock_resource(resource)
++            .mock_oauth2_key(ok_key_mock());
++        openstack_keystone_core::api::tests::get_mocked_state(provider, true, None).await
++    }
++
++    fn test_idp(issuer: &str, jwks_url: &str) -> IdentityProvider {
++        IdentityProvider {
++            id: "idp-1".to_string(),
++            enabled: true,
++            bound_issuer: Some(issuer.to_string()),
++            jwks_url: Some(jwks_url.to_string()),
++            ..Default::default()
++        }
++    }
++
++    async fn exchange(
++        state: &crate::keystone::ServiceState,
++        subject_token: String,
++        replay_protection: &dyn AssertionReplayProtection,
++    ) -> Result<Response, Oauth2TokenError> {
++        let client: OAuth2ClientResource = confidential_client().await;
++        handle_external_assertion_exchange_with_replay(
++            state,
++            "domain-1",
++            &HeaderMap::new(),
++            "test-correlation",
++            &TokenForm::default(),
++            &client,
++            subject_token,
++            None,
++            "openstack:api".to_string(),
++            &Oauth2Provider {
++                access_token_lifetime_minutes: 1,
++                ..Default::default()
++            },
++            replay_protection,
++        )
++        .await
++    }
++
++    async fn production_exchange(
++        state: &crate::keystone::ServiceState,
++        subject_token: String,
++    ) -> Result<Response, Oauth2TokenError> {
++        let client: OAuth2ClientResource = confidential_client().await;
++        handle_external_assertion_exchange(
++            state,
++            "domain-1",
++            &HeaderMap::new(),
++            "test-correlation",
++            &TokenForm::default(),
++            &client,
++            subject_token,
++            None,
++            "openstack:api".to_string(),
++            &Oauth2Provider {
++                access_token_lifetime_minutes: 1,
++                ..Default::default()
++            },
++        )
++        .await
++    }
++
++    async fn jwks_server() -> (MockServer, String) {
++        let server = MockServer::start_async().await;
++        let jwks = json!({"keys": [rsa_jwk(TEST_KID)]});
++        server
++            .mock_async(|when, then| {
++                when.method(GET).path("/jwks");
++                then.status(200)
++                    .header("content-type", "application/json")
++                    .json_body(jwks);
++            })
++            .await;
++        let url = format!("{}/jwks", server.base_url());
++        (server, url)
++    }
++
++    fn assertion_token(issuer: &str, audience: &str, jti: &str, kid: &str) -> (String, i64) {
++        let exp = chrono::Utc::now().timestamp() + 45;
++        let claims = json!({
++            "iss": issuer,
++            "sub": "external-user",
++            "aud": audience,
++            "exp": exp,
++            "jti": jti,
++        });
++        (make_jwt(&claims, Some(kid)), exp)
++    }
++
++    fn assertion_audience() -> String {
++        "http://localhost/v4/oauth2/domain-1/token".to_string()
++    }
+ 
+     #[test]
+     fn issuer_extraction_only_selects_a_candidate() {
+@@ -275,11 +529,163 @@ mod tests {
+         assert_eq!(extract_unverified_issuer("header.e30.signature"), None);
+     }
+ 
+-    #[test]
+-    fn external_assertion_issuance_fails_closed_without_replay_cache() {
+-        let error = require_assertion_replay_protection("domain", "issuer", "jti", 100)
+-            .expect_err("cache is not wired");
++    #[tokio::test]
++    async fn production_handler_fails_closed_before_mapping_without_replay_cache() {
++        let (_server, jwks_url) = jwks_server().await;
++        let idp = test_idp(EXTERNAL_ISSUER, &jwks_url);
++        let state = test_state(EXTERNAL_ISSUER, Some(idp), false).await;
++        let (token, _) = assertion_token(
++            EXTERNAL_ISSUER,
++            &assertion_audience(),
++            "assertion-1",
++            TEST_KID,
++        );
++
++        let Err(error) = production_exchange(&state, token).await else {
++            panic!("production exchange must fail closed without replay protection");
++        };
+         assert_eq!(error.error_code(), "server_error");
+         assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+     }
++
++    #[tokio::test]
++    async fn external_exchange_verifies_maps_mints_claims_and_rejects_replay() {
++        let (_server, jwks_url) = jwks_server().await;
++        let idp = test_idp(EXTERNAL_ISSUER, &jwks_url);
++        let state = test_state(EXTERNAL_ISSUER, Some(idp), true).await;
++        let (token, assertion_exp) = assertion_token(
++            EXTERNAL_ISSUER,
++            &assertion_audience(),
++            "assertion-1",
++            TEST_KID,
++        );
++        let replay_protection = TestReplayProtection::default();
++
++        let Ok(response) = exchange(&state, token.clone(), &replay_protection).await else {
++            panic!("valid external assertion exchange should succeed");
++        };
++        assert_eq!(response.status(), StatusCode::OK);
++        let body = json_body(response).await;
++        let Some(access_token) = body["access_token"].as_str() else {
++            panic!("response contains an access token");
++        };
++        let claims = jwt_claims(access_token);
++        assert_eq!(claims["iss"], "http://localhost/v4/oauth2/domain-1");
++        assert_eq!(claims["sub"], "shadow-1");
++        assert_eq!(claims["aud"], "openstack-apis");
++        assert_eq!(claims["exp"].as_i64(), Some(assertion_exp));
++        assert_eq!(claims["keystone_ruleset_version"], 7);
++        assert_eq!(claims["amr"][0], "external_jwt");
++        assert_eq!(claims["user_id"], "shadow-1");
++        assert_eq!(claims["roles"][0], "member");
++
++        let Err(error) = exchange(&state, token, &replay_protection).await else {
++            panic!("replayed assertion should be rejected");
++        };
++        assert_eq!(error.error_code(), "invalid_grant");
++        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
++    }
++
++    #[tokio::test]
++    async fn external_exchange_rejects_untrusted_issuer_before_mapping() {
++        let untrusted_issuer = "https://untrusted.example";
++        let state = test_state(untrusted_issuer, None, false).await;
++        let (token, _) = assertion_token(
++            untrusted_issuer,
++            &assertion_audience(),
++            "assertion-untrusted",
++            TEST_KID,
++        );
++
++        let Err(error) = exchange(&state, token, &TestReplayProtection::default()).await else {
++            panic!("untrusted issuer should be rejected");
++        };
++        assert_eq!(error.error_code(), "invalid_grant");
++        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
++    }
++
++    #[tokio::test]
++    async fn external_exchange_rejects_bad_signatures_audiences_and_expired_tokens() {
++        let (_server, jwks_url) = jwks_server().await;
++        let idp = test_idp(EXTERNAL_ISSUER, &jwks_url);
++        let state = test_state(EXTERNAL_ISSUER, Some(idp), false).await;
++
++        let (wrong_audience, _) = assertion_token(
++            EXTERNAL_ISSUER,
++            "https://other.example/token",
++            "wrong-audience",
++            TEST_KID,
++        );
++        let expired_claims = json!({
++            "iss": EXTERNAL_ISSUER,
++            "sub": "external-user",
++            "aud": assertion_audience(),
++            "exp": chrono::Utc::now().timestamp() - 120,
++            "jti": "expired",
++        });
++        let expired = make_jwt(&expired_claims, Some(TEST_KID));
++        let mut bad_signature = assertion_token(
++            EXTERNAL_ISSUER,
++            &assertion_audience(),
++            "bad-signature",
++            TEST_KID,
++        )
++        .0;
++        let Some(signature_start) = bad_signature.rfind('.').map(|dot| dot + 1) else {
++            panic!("generated JWT has a signature segment");
++        };
++        let replacement = if bad_signature.as_bytes()[signature_start] == b'A' {
++            "B"
++        } else {
++            "A"
++        };
++        bad_signature.replace_range(signature_start..signature_start + 1, replacement);
++        for token in [bad_signature, wrong_audience, expired] {
++            let Err(error) = exchange(&state, token, &TestReplayProtection::default()).await else {
++                panic!("invalid assertion should be rejected");
++            };
++            assert_eq!(error.error_code(), "invalid_grant");
++            assert_eq!(error.status(), StatusCode::BAD_REQUEST);
++        }
++    }
++
++    #[tokio::test]
++    async fn identity_provider_discovery_resolves_jwks() {
++        let server = MockServer::start_async().await;
++        let server_base_url = server.base_url();
++        let jwks_uri = format!("{server_base_url}/keys");
++        let discovery_document = json!({
++            "issuer": server_base_url,
++            "authorization_endpoint": format!("{server_base_url}/authorize"),
++            "token_endpoint": format!("{server_base_url}/token"),
++            "jwks_uri": jwks_uri,
++        });
++        let jwks = json!({"keys": [rsa_jwk(TEST_KID)]});
++        server
++            .mock_async(|when, then| {
++                when.method(GET).path("/.well-known/openid-configuration");
++                then.status(200)
++                    .header("content-type", "application/json")
++                    .json_body(discovery_document);
++            })
++            .await;
++        server
++            .mock_async(|when, then| {
++                when.method(GET).path("/keys");
++                then.status(200)
++                    .header("content-type", "application/json")
++                    .json_body(jwks);
++            })
++            .await;
++        let idp = IdentityProvider {
++            id: "idp-1".to_string(),
++            oidc_discovery_url: Some(server_base_url),
++            ..Default::default()
++        };
++
++        let Ok(jwks) = load_identity_provider_jwks(&idp).await else {
++            panic!("valid discovery metadata should resolve JWKS");
++        };
++        assert_eq!(jwks.keys.len(), 1);
++    }
+ }
+
+From 674904e6ffd37208878ab484d035e7d9871cd41d Mon Sep 17 00:00:00 2001
+From: Dominic Murphy <ddmurphy@bu.edu>
+Date: Sun, 15 Nov 2026 16:03:13 -0500
+Subject: [PATCH 4/5] feat(oauth2): Integrate assertion replay
+
+Wire external exchange to the shared replay cache.
+
+Preserve native JWT compatibility.
+
+Require explicit opt-in for per-node replay protection.
+
+Signed-off-by: Dominic Murphy <ddmurphy@bu.edu>
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ crates/config/src/oauth2.rs                   |   6 +
+ crates/core/src/api/auth.rs                   |   7 +
+ crates/core/src/keystone.rs                   |  24 ++
+ crates/core/src/oauth2_client.rs              |   2 +-
+ crates/core/src/oauth2_client/token.rs        |  52 +++-
+ crates/keystone/src/api/v4/oauth2/token.rs    |   2 +-
+ .../api/v4/oauth2/token/external_assertion.rs | 282 ++++++++++--------
+ .../src/api/v4/oauth2/token/token_exchange.rs |  52 ++--
+ doc/src/admin/features/oauth2.md              |   6 +
+ doc/src/user/features/oauth2.md               |   2 +-
+ 10 files changed, 266 insertions(+), 169 deletions(-)
+
+diff --git a/crates/config/src/oauth2.rs b/crates/config/src/oauth2.rs
+index a16ebe83b..efbca669a 100644
+--- a/crates/config/src/oauth2.rs
++++ b/crates/config/src/oauth2.rs
+@@ -399,6 +399,11 @@ pub struct Oauth2Provider {
+     #[serde(default = "default_assertion_replay_cache_max_entries_per_issuer")]
+     #[validate(range(min = 1))]
+     pub assertion_replay_cache_max_entries_per_issuer: u32,
++
++    /// Permit process-local replay protection for external assertions.
++    /// Entries are not shared across nodes or retained across restarts.
++    #[serde(default)]
++    pub allow_per_node_assertion_replay: bool,
+ }
+ 
+ fn default_assertion_replay_cache_max_entries() -> u32 {
+@@ -582,6 +587,7 @@ impl Default for Oauth2Provider {
+                 default_assertion_replay_cache_max_entries_per_domain(),
+             assertion_replay_cache_max_entries_per_issuer:
+                 default_assertion_replay_cache_max_entries_per_issuer(),
++            allow_per_node_assertion_replay: false,
+         }
+     }
+ }
+diff --git a/crates/core/src/api/auth.rs b/crates/core/src/api/auth.rs
+index 3798ea9d1..86dd59108 100644
+--- a/crates/core/src/api/auth.rs
++++ b/crates/core/src/api/auth.rs
+@@ -459,6 +459,7 @@ mod tests {
+             storage: None,
+             local_emergency_store: tokio::sync::RwLock::new(None),
+             dpop: Default::default(),
++            assertion_replay: None,
+             spiffe_health_check: tokio::sync::RwLock::new(None),
+             local_emergency_leaderless_tracker:
+                 openstack_keystone_local_emergency_store::LeaderlessTracker::new(),
+@@ -676,6 +677,7 @@ mod tests {
+             storage: None,
+             local_emergency_store: tokio::sync::RwLock::new(None),
+             dpop: Default::default(),
++            assertion_replay: None,
+             spiffe_health_check: tokio::sync::RwLock::new(None),
+             local_emergency_leaderless_tracker:
+                 openstack_keystone_local_emergency_store::LeaderlessTracker::new(),
+@@ -862,6 +864,7 @@ mod tests {
+             storage: None,
+             local_emergency_store: tokio::sync::RwLock::new(None),
+             dpop: Default::default(),
++            assertion_replay: None,
+             spiffe_health_check: tokio::sync::RwLock::new(None),
+             local_emergency_leaderless_tracker:
+                 openstack_keystone_local_emergency_store::LeaderlessTracker::new(),
+@@ -945,6 +948,7 @@ mod tests {
+             storage: None,
+             local_emergency_store: tokio::sync::RwLock::new(None),
+             dpop: Default::default(),
++            assertion_replay: None,
+             spiffe_health_check: tokio::sync::RwLock::new(None),
+             local_emergency_leaderless_tracker:
+                 openstack_keystone_local_emergency_store::LeaderlessTracker::new(),
+@@ -1027,6 +1031,7 @@ mod tests {
+             storage: None,
+             local_emergency_store: tokio::sync::RwLock::new(None),
+             dpop: Default::default(),
++            assertion_replay: None,
+             spiffe_health_check: tokio::sync::RwLock::new(None),
+             local_emergency_leaderless_tracker:
+                 openstack_keystone_local_emergency_store::LeaderlessTracker::new(),
+@@ -1169,6 +1174,7 @@ mod tests {
+             storage: None,
+             local_emergency_store: tokio::sync::RwLock::new(None),
+             dpop: Default::default(),
++            assertion_replay: None,
+             spiffe_health_check: tokio::sync::RwLock::new(None),
+             local_emergency_leaderless_tracker:
+                 openstack_keystone_local_emergency_store::LeaderlessTracker::new(),
+@@ -1262,6 +1268,7 @@ mod tests {
+             storage: None,
+             local_emergency_store: tokio::sync::RwLock::new(None),
+             dpop: Default::default(),
++            assertion_replay: None,
+             spiffe_health_check: tokio::sync::RwLock::new(None),
+             local_emergency_leaderless_tracker:
+                 openstack_keystone_local_emergency_store::LeaderlessTracker::new(),
+diff --git a/crates/core/src/keystone.rs b/crates/core/src/keystone.rs
+index 69f2360a8..b434e954e 100644
+--- a/crates/core/src/keystone.rs
++++ b/crates/core/src/keystone.rs
+@@ -114,6 +114,9 @@ pub struct Service {
+     /// DPoP replay cache and nonce generator (ADR 0043 §2).
+     pub dpop: crate::oauth2_client::dpop_runtime::DpopRuntime,
+ 
++    /// Process-local external assertion replay cache, when explicitly enabled.
++    pub assertion_replay: Option<crate::oauth2_client::assertion_replay::AssertionReplayCache>,
++
+     /// Loaded dynamic auth plugins (ADR 0025). Empty (an
+     /// [`EmptyAuthPluginRuntime`]) until `crates/keystone`'s
+     /// `load_auth_plugins` runs post-construction - `CoreHostFunctions`
+@@ -229,6 +232,26 @@ impl Service {
+         let dpop =
+             crate::oauth2_client::dpop_runtime::DpopRuntime::from_config(&*cfg.config.read().await);
+ 
++        let assertion_replay = if oauth2_cfg.allow_per_node_assertion_replay {
++            // The shared cache has no per-domain quota; cap the entire cache
++            // at that limit so no individual domain can exceed it.
++            let max_total = oauth2_cfg
++                .assertion_replay_cache_max_entries
++                .min(oauth2_cfg.assertion_replay_cache_max_entries_per_domain);
++            tracing::warn!(
++                max_total,
++                "external assertion replay protection is per-node and is lost on restart"
++            );
++            Some(
++                crate::oauth2_client::assertion_replay::AssertionReplayCache::new(
++                    oauth2_cfg.assertion_replay_cache_max_entries_per_issuer as usize,
++                    max_total as usize,
++                ),
++            )
++        } else {
++            None
++        };
++
+         // Build rate-limiting state from config. Fails fast (Invariant 2) if
+         // any enabled bucket has zero burst or replenish rate.
+         let rate_limiters = {
+@@ -249,6 +272,7 @@ impl Service {
+             api_key_rate_limiter,
+             oauth2_token_rate_limiter,
+             dpop,
++            assertion_replay,
+             auth_plugin_registry: RwLock::new(Arc::new(EmptyAuthPluginRuntime)),
+             core_host_functions: RwLock::new(None),
+             rate_limiters,
+diff --git a/crates/core/src/oauth2_client.rs b/crates/core/src/oauth2_client.rs
+index 6175e26d7..ee0acd895 100644
+--- a/crates/core/src/oauth2_client.rs
++++ b/crates/core/src/oauth2_client.rs
+@@ -46,7 +46,7 @@ pub use provider_api::Oauth2ClientApi;
+ pub use service::Oauth2ClientService;
+ pub use token::{
+     build_access_token_claims, build_external_assertion_claims, hydrate_client_credentials_context,
+-    hydrate_external_assertion_context,
++    hydrate_external_assertion_context, prepare_external_assertion_mapping,
+ };
+ pub use token_exchange::{TokenExchangeError, build_token_exchange_claims, validate_subject_token};
+ pub use verify::{
+diff --git a/crates/core/src/oauth2_client/token.rs b/crates/core/src/oauth2_client/token.rs
+index 01fc53693..0521e28b6 100644
+--- a/crates/core/src/oauth2_client/token.rs
++++ b/crates/core/src/oauth2_client/token.rs
+@@ -135,15 +135,24 @@ pub async fn hydrate_client_credentials_context(
+     Ok((vsc, ruleset.ruleset_version))
+ }
+ 
+-/// Run an external assertion's verified claims through the domain's token
+-/// exchange mapping ruleset and return a fully hydrated security context.
+-pub async fn hydrate_external_assertion_context(
++/// A matched assertion mapping, before any identity records are changed.
++pub struct PreparedExternalAssertionMapping {
++    scope: ScopeInfo,
++    request: MappingAuthRequest,
++    ruleset_version: u128,
++}
++
++/// Evaluate an external assertion against the domain's token exchange mapping.
++///
++/// # Errors
++/// Returns an authentication error when no enabled rule grants one valid scope.
++pub async fn prepare_external_assertion_mapping(
+     state: &ServiceState,
+     domain_id: &str,
+     issuer: &str,
+     subject: &str,
+     claims: HashMap<String, Vec<String>>,
+-) -> Result<(ValidatedSecurityContext, u128), AuthenticationError> {
++) -> Result<PreparedExternalAssertionMapping, AuthenticationError> {
+     let source = IdentitySource::TokenExchange {
+         issuer: issuer.to_string(),
+     };
+@@ -184,17 +193,32 @@ pub async fn hydrate_external_assertion_context(
+     let scope = scope_info_from_authorization(state, &exec, authorization).await?;
+     scope.validate()?;
+ 
+-    let mapping_req = MappingAuthRequest {
+-        domain_id: Some(domain_id.to_string()),
+-        source,
+-        unique_workload_id: subject.to_string(),
+-        claims,
+-        rule_name: None,
+-    };
++    Ok(PreparedExternalAssertionMapping {
++        scope,
++        request: MappingAuthRequest {
++            domain_id: Some(domain_id.to_string()),
++            source,
++            unique_workload_id: subject.to_string(),
++            claims,
++            rule_name: None,
++        },
++        ruleset_version: ruleset.ruleset_version,
++    })
++}
++
++/// Authenticate and hydrate an already matched external assertion mapping.
++///
++/// # Errors
++/// Returns an authentication error if identity or scope hydration fails.
++pub async fn hydrate_external_assertion_context(
++    state: &ServiceState,
++    mapping: PreparedExternalAssertionMapping,
++) -> Result<(ValidatedSecurityContext, u128), AuthenticationError> {
++    let exec = ExecutionContext::internal(state);
+     let auth_result = state
+         .provider
+         .get_mapping_provider()
+-        .authenticate_by_mapping(&exec, &mapping_req)
++        .authenticate_by_mapping(&exec, &mapping.request)
+         .await
+         .map_err(|e| AuthenticationError::Provider {
+             source: Box::new(e),
+@@ -202,8 +226,8 @@ pub async fn hydrate_external_assertion_context(
+         })?;
+ 
+     let ctx = SecurityContext::try_from(auth_result)?;
+-    let vsc = ValidatedSecurityContext::new_for_scope(ctx, scope, state).await?;
+-    Ok((vsc, ruleset.ruleset_version))
++    let vsc = ValidatedSecurityContext::new_for_scope(ctx, mapping.scope, state).await?;
++    Ok((vsc, mapping.ruleset_version))
+ }
+ 
+ /// Resolve the mapping-matched [`Authorization`] into a [`ScopeInfo`] backed
+diff --git a/crates/keystone/src/api/v4/oauth2/token.rs b/crates/keystone/src/api/v4/oauth2/token.rs
+index 3cf26e07e..9431224d1 100644
+--- a/crates/keystone/src/api/v4/oauth2/token.rs
++++ b/crates/keystone/src/api/v4/oauth2/token.rs
+@@ -98,7 +98,7 @@ pub(super) struct TokenForm {
+     /// token (Fernet or JWS) or external assertion JWT being exchanged.
+     #[serde(default)]
+     subject_token: Option<String>,
+-    /// RFC 8693 subject type: access_token, Keystone-native, or native JWT.
++    /// RFC 8693 subject type: access_token, Keystone-native, or JWT.
+     #[serde(default)]
+     subject_token_type: Option<String>,
+     /// RFC 8693 requested output type; only access_token is supported.
+diff --git a/crates/keystone/src/api/v4/oauth2/token/external_assertion.rs b/crates/keystone/src/api/v4/oauth2/token/external_assertion.rs
+index 96efb617e..abc9dbc89 100644
+--- a/crates/keystone/src/api/v4/oauth2/token/external_assertion.rs
++++ b/crates/keystone/src/api/v4/oauth2/token/external_assertion.rs
+@@ -23,6 +23,7 @@ use serde_json::Value;
+ 
+ use openstack_keystone_config::Oauth2Provider;
+ use openstack_keystone_core::auth::ExecutionContext;
++use openstack_keystone_core::oauth2_client::replay::ReplayError;
+ use openstack_keystone_core::oauth2_client::{
+     SubjectTokenValidationProfile, verify_subject_token_jwt,
+ };
+@@ -50,36 +51,6 @@ pub(super) async fn handle_external_assertion_exchange(
+     confirmation: Option<Confirmation>,
+     scope: String,
+     oauth2_cfg: &Oauth2Provider,
+-) -> Result<Response, Oauth2TokenError> {
+-    handle_external_assertion_exchange_with_replay(
+-        state,
+-        domain_id,
+-        headers,
+-        correlation_id,
+-        form,
+-        client,
+-        subject_token,
+-        confirmation,
+-        scope,
+-        oauth2_cfg,
+-        &ReplayProtectionUnavailable,
+-    )
+-    .await
+-}
+-
+-#[allow(clippy::too_many_arguments)]
+-async fn handle_external_assertion_exchange_with_replay(
+-    state: &ServiceState,
+-    domain_id: &str,
+-    headers: &HeaderMap,
+-    correlation_id: &str,
+-    form: &TokenForm,
+-    client: &OAuth2ClientResource,
+-    subject_token: String,
+-    confirmation: Option<Confirmation>,
+-    scope: String,
+-    oauth2_cfg: &Oauth2Provider,
+-    replay_protection: &dyn AssertionReplayProtection,
+ ) -> Result<Response, Oauth2TokenError> {
+     let unverified_issuer = extract_unverified_issuer(&subject_token)
+         .ok_or_else(|| Oauth2TokenError::invalid_grant("subject_token is not a valid JWT"))?;
+@@ -120,16 +91,22 @@ async fn handle_external_assertion_exchange_with_replay(
+         .get("exp")
+         .and_then(Value::as_i64)
+         .ok_or_else(|| Oauth2TokenError::invalid_grant("subject_token has no valid expiry"))?;
++    // The verifier allows clock skew, but an expired assertion cannot bound
++    // a newly issued token to a positive lifetime.
++    if assertion_exp <= chrono::Utc::now().timestamp() {
++        return Err(Oauth2TokenError::invalid_grant("subject_token has expired"));
++    }
+     let assertion_jti = verified_claims
+         .get("jti")
+         .and_then(Value::as_str)
+         .filter(|jti| !jti.is_empty() && jti.len() <= 256)
+         .ok_or_else(|| Oauth2TokenError::invalid_grant("subject_token has no valid jti"))?;
+ 
+-    replay_protection
+-        .check_and_record(domain_id, &unverified_issuer, assertion_jti, assertion_exp)
+-        .await
+-        .map_err(map_replay_protection_error)?;
++    let replay_cache = state.assertion_replay.as_ref().ok_or_else(|| {
++        Oauth2TokenError::server_error_unavailable(
++            "external assertion replay protection is not available",
++        )
++    })?;
+ 
+     let subject = verified_claims
+         .get("sub")
+@@ -140,16 +117,30 @@ async fn handle_external_assertion_exchange_with_replay(
+             tracing::warn!(error = %error, "external assertion claims could not be mapped");
+             Oauth2TokenError::invalid_grant("subject_token claims could not be mapped")
+         })?;
+-    let (vsc, ruleset_version) =
+-        openstack_keystone_core::oauth2_client::hydrate_external_assertion_context(
+-            state,
++    let mapping = openstack_keystone_core::oauth2_client::prepare_external_assertion_mapping(
++        state,
++        domain_id,
++        &unverified_issuer,
++        subject,
++        flattened,
++    )
++    .await
++    .map_err(map_mapping_error)?;
++
++    replay_cache
++        .check_and_insert(
+             domain_id,
+             &unverified_issuer,
+-            subject,
+-            flattened,
++            assertion_jti,
++            assertion_exp,
++            chrono::Utc::now().timestamp(),
+         )
+-        .await
+-        .map_err(map_mapping_error)?;
++        .map_err(map_replay_protection_error)?;
++
++    let (vsc, ruleset_version) =
++        openstack_keystone_core::oauth2_client::hydrate_external_assertion_context(state, mapping)
++            .await
++            .map_err(map_mapping_error)?;
+ 
+     let audience = requested_audience(state, &form.audience).await?;
+     let issuer = format!("{base}/v4/oauth2/{domain_id}");
+@@ -251,47 +242,17 @@ async fn load_identity_provider_jwks(
+         })
+ }
+ 
+-#[async_trait::async_trait]
+-trait AssertionReplayProtection: Send + Sync {
+-    async fn check_and_record(
+-        &self,
+-        domain_id: &str,
+-        issuer: &str,
+-        jti: &str,
+-        expires_at: i64,
+-    ) -> Result<(), ReplayProtectionError>;
+-}
+-
+-#[derive(Debug)]
+-enum ReplayProtectionError {
+-    Unavailable,
+-    #[cfg_attr(not(test), allow(dead_code))]
+-    Replayed,
+-}
+-
+-struct ReplayProtectionUnavailable;
+-
+-#[async_trait::async_trait]
+-impl AssertionReplayProtection for ReplayProtectionUnavailable {
+-    async fn check_and_record(
+-        &self,
+-        _domain_id: &str,
+-        _issuer: &str,
+-        _jti: &str,
+-        _expires_at: i64,
+-    ) -> Result<(), ReplayProtectionError> {
+-        Err(ReplayProtectionError::Unavailable)
+-    }
+-}
+-
+-fn map_replay_protection_error(error: ReplayProtectionError) -> Oauth2TokenError {
++fn map_replay_protection_error(error: ReplayError) -> Oauth2TokenError {
+     match error {
+-        ReplayProtectionError::Unavailable => Oauth2TokenError::server_error_unavailable(
+-            "external assertion replay protection is not available",
+-        ),
+-        ReplayProtectionError::Replayed => {
++        ReplayError::Replayed => {
+             Oauth2TokenError::invalid_grant("subject_token assertion has already been used")
+         }
++        ReplayError::CacheFull | ReplayError::ScopeQuotaExceeded => {
++            tracing::warn!(error = %error, "external assertion replay cache capacity reached");
++            Oauth2TokenError::server_error_unavailable(
++                "external assertion replay protection is not available",
++            )
++        }
+     }
+ }
+ 
+@@ -318,8 +279,6 @@ fn map_mapping_error(error: AuthenticationError) -> Oauth2TokenError {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use std::{collections::HashSet, sync::Mutex};
+-
+     use httpmock::prelude::*;
+     use serde_json::json;
+ 
+@@ -336,38 +295,17 @@ mod tests {
+     use crate::federation::MockFederationProvider;
+     use crate::federation::api::oidc_utils::fixtures::{TEST_KID, make_jwt, rsa_jwk};
+     use crate::mapping::MockMappingProvider;
++    use crate::oauth2_client::MockOauth2ClientProvider;
+     use crate::provider::Provider;
+     use crate::resource::MockResourceProvider;
+ 
+     const EXTERNAL_ISSUER: &str = "https://issuer.example";
+ 
+-    #[derive(Default)]
+-    struct TestReplayProtection(Mutex<HashSet<(String, String, String)>>);
+-
+-    #[async_trait::async_trait]
+-    impl AssertionReplayProtection for TestReplayProtection {
+-        async fn check_and_record(
+-            &self,
+-            domain_id: &str,
+-            issuer: &str,
+-            jti: &str,
+-            _expires_at: i64,
+-        ) -> Result<(), ReplayProtectionError> {
+-            let Ok(mut seen) = self.0.lock() else {
+-                return Err(ReplayProtectionError::Unavailable);
+-            };
+-            if seen.insert((domain_id.to_string(), issuer.to_string(), jti.to_string())) {
+-                Ok(())
+-            } else {
+-                Err(ReplayProtectionError::Replayed)
+-            }
+-        }
+-    }
+-
+     async fn test_state(
+         issuer: &str,
+         idp: Option<IdentityProvider>,
+         configure_mapping: bool,
++        allow_replay: bool,
+     ) -> crate::keystone::ServiceState {
+         let expected_issuer = issuer.to_string();
+         let mut federation = MockFederationProvider::default();
+@@ -398,6 +336,7 @@ mod tests {
+             let expected_issuer = issuer.to_string();
+             mapping
+                 .expect_authenticate_by_mapping()
++                .times(1)
+                 .returning(move |_, request| {
+                     assert_eq!(request.domain_id.as_deref(), Some("domain-1"));
+                     assert_eq!(request.source, expected_source);
+@@ -406,6 +345,9 @@ mod tests {
+                     assert!(request.claims["sub"].contains(&"external-user".to_string()));
+                     assert!(request.claims["aud"].contains(&assertion_audience()));
+                     assert!(request.claims["jti"].contains(&"assertion-1".to_string()));
++                    assert!(
++                        request.claims["preferred_username"].contains(&"exchange-user".to_string())
++                    );
+                     Ok(successful_auth_result())
+                 });
+         }
+@@ -419,12 +361,42 @@ mod tests {
+             }))
+         });
+ 
++        let client = OAuth2ClientResource {
++            grant_types: vec![
++                openstack_keystone_core_types::oauth2_client::GrantType::TokenExchange,
++            ],
++            ..confidential_client().await
++        };
++        let mut clients = MockOauth2ClientProvider::default();
++        clients
++            .expect_effective_dpop_mode()
++            .returning(|_, _, _| Ok(openstack_keystone_config::DpopMode::Disabled));
++        clients
++            .expect_get_by_client_id()
++            .returning(move |_, _| Ok(Some(client.clone())));
++        let mut tokens = crate::token::MockTokenProvider::default();
++        tokens.expect_validate_to_context().returning(|_, _, _, _| {
++            Err(
++                openstack_keystone_core_types::token::TokenProviderError::InvalidToken {
++                    source: Box::new(std::io::Error::other("not a native token")),
++                },
++            )
++        });
++
+         let provider = Provider::mocked_builder()
+             .mock_federation(federation)
+             .mock_mapping(mapping)
+             .mock_resource(resource)
++            .mock_oauth2_client(clients)
++            .mock_token(tokens)
+             .mock_oauth2_key(ok_key_mock());
+-        openstack_keystone_core::api::tests::get_mocked_state(provider, true, None).await
++        let mut config = openstack_keystone_config::Config::default();
++        config.oauth2.allow_host_header_issuer = true;
++        config.oauth2.allow_per_node_assertion_replay = allow_replay;
++        openstack_keystone_core::api::tests::get_mocked_state_with_config(
++            provider, true, None, config,
++        )
++        .await
+     }
+ 
+     fn test_idp(issuer: &str, jwks_url: &str) -> IdentityProvider {
+@@ -437,13 +409,12 @@ mod tests {
+         }
+     }
+ 
+-    async fn exchange(
++    async fn production_exchange(
+         state: &crate::keystone::ServiceState,
+         subject_token: String,
+-        replay_protection: &dyn AssertionReplayProtection,
+     ) -> Result<Response, Oauth2TokenError> {
+         let client: OAuth2ClientResource = confidential_client().await;
+-        handle_external_assertion_exchange_with_replay(
++        handle_external_assertion_exchange(
+             state,
+             "domain-1",
+             &HeaderMap::new(),
+@@ -457,30 +428,32 @@ mod tests {
+                 access_token_lifetime_minutes: 1,
+                 ..Default::default()
+             },
+-            replay_protection,
+         )
+         .await
+     }
+ 
+-    async fn production_exchange(
++    async fn dispatched_exchange(
+         state: &crate::keystone::ServiceState,
+         subject_token: String,
+     ) -> Result<Response, Oauth2TokenError> {
+-        let client: OAuth2ClientResource = confidential_client().await;
+-        handle_external_assertion_exchange(
++        let form = TokenForm {
++            client_id: Some("client-1".to_string()),
++            client_secret: Some("s3cr3t".to_string()),
++            subject_token: Some(subject_token),
++            subject_token_type: Some(super::super::exchange_request::JWT_TOKEN_TYPE.to_string()),
++            ..Default::default()
++        };
++        super::super::token_exchange::handle_token_exchange_grant(
+             state,
+             "domain-1",
+             &HeaderMap::new(),
+-            "test-correlation",
+-            &TokenForm::default(),
+-            &client,
+-            subject_token,
+             None,
+-            "openstack:api".to_string(),
++            &form,
+             &Oauth2Provider {
+                 access_token_lifetime_minutes: 1,
+                 ..Default::default()
+             },
++            "test-correlation",
+         )
+         .await
+     }
+@@ -501,13 +474,16 @@ mod tests {
+     }
+ 
+     fn assertion_token(issuer: &str, audience: &str, jti: &str, kid: &str) -> (String, i64) {
+-        let exp = chrono::Utc::now().timestamp() + 45;
++        let now = chrono::Utc::now().timestamp();
++        let exp = now + 45;
+         let claims = json!({
+             "iss": issuer,
+             "sub": "external-user",
+             "aud": audience,
++            "iat": now,
+             "exp": exp,
+             "jti": jti,
++            "preferred_username": "exchange-user",
+         });
+         (make_jwt(&claims, Some(kid)), exp)
+     }
+@@ -533,7 +509,7 @@ mod tests {
+     async fn production_handler_fails_closed_before_mapping_without_replay_cache() {
+         let (_server, jwks_url) = jwks_server().await;
+         let idp = test_idp(EXTERNAL_ISSUER, &jwks_url);
+-        let state = test_state(EXTERNAL_ISSUER, Some(idp), false).await;
++        let state = test_state(EXTERNAL_ISSUER, Some(idp), false, false).await;
+         let (token, _) = assertion_token(
+             EXTERNAL_ISSUER,
+             &assertion_audience(),
+@@ -541,7 +517,7 @@ mod tests {
+             TEST_KID,
+         );
+ 
+-        let Err(error) = production_exchange(&state, token).await else {
++        let Err(error) = dispatched_exchange(&state, token).await else {
+             panic!("production exchange must fail closed without replay protection");
+         };
+         assert_eq!(error.error_code(), "server_error");
+@@ -552,16 +528,14 @@ mod tests {
+     async fn external_exchange_verifies_maps_mints_claims_and_rejects_replay() {
+         let (_server, jwks_url) = jwks_server().await;
+         let idp = test_idp(EXTERNAL_ISSUER, &jwks_url);
+-        let state = test_state(EXTERNAL_ISSUER, Some(idp), true).await;
++        let state = test_state(EXTERNAL_ISSUER, Some(idp), true, true).await;
+         let (token, assertion_exp) = assertion_token(
+             EXTERNAL_ISSUER,
+             &assertion_audience(),
+             "assertion-1",
+             TEST_KID,
+         );
+-        let replay_protection = TestReplayProtection::default();
+-
+-        let Ok(response) = exchange(&state, token.clone(), &replay_protection).await else {
++        let Ok(response) = dispatched_exchange(&state, token.clone()).await else {
+             panic!("valid external assertion exchange should succeed");
+         };
+         assert_eq!(response.status(), StatusCode::OK);
+@@ -579,7 +553,7 @@ mod tests {
+         assert_eq!(claims["user_id"], "shadow-1");
+         assert_eq!(claims["roles"][0], "member");
+ 
+-        let Err(error) = exchange(&state, token, &replay_protection).await else {
++        let Err(error) = dispatched_exchange(&state, token).await else {
+             panic!("replayed assertion should be rejected");
+         };
+         assert_eq!(error.error_code(), "invalid_grant");
+@@ -589,7 +563,7 @@ mod tests {
+     #[tokio::test]
+     async fn external_exchange_rejects_untrusted_issuer_before_mapping() {
+         let untrusted_issuer = "https://untrusted.example";
+-        let state = test_state(untrusted_issuer, None, false).await;
++        let state = test_state(untrusted_issuer, None, false, true).await;
+         let (token, _) = assertion_token(
+             untrusted_issuer,
+             &assertion_audience(),
+@@ -597,7 +571,7 @@ mod tests {
+             TEST_KID,
+         );
+ 
+-        let Err(error) = exchange(&state, token, &TestReplayProtection::default()).await else {
++        let Err(error) = production_exchange(&state, token).await else {
+             panic!("untrusted issuer should be rejected");
+         };
+         assert_eq!(error.error_code(), "invalid_grant");
+@@ -608,7 +582,7 @@ mod tests {
+     async fn external_exchange_rejects_bad_signatures_audiences_and_expired_tokens() {
+         let (_server, jwks_url) = jwks_server().await;
+         let idp = test_idp(EXTERNAL_ISSUER, &jwks_url);
+-        let state = test_state(EXTERNAL_ISSUER, Some(idp), false).await;
++        let state = test_state(EXTERNAL_ISSUER, Some(idp), false, true).await;
+ 
+         let (wrong_audience, _) = assertion_token(
+             EXTERNAL_ISSUER,
+@@ -620,7 +594,7 @@ mod tests {
+             "iss": EXTERNAL_ISSUER,
+             "sub": "external-user",
+             "aud": assertion_audience(),
+-            "exp": chrono::Utc::now().timestamp() - 120,
++            "exp": chrono::Utc::now().timestamp() - 1,
+             "jti": "expired",
+         });
+         let expired = make_jwt(&expired_claims, Some(TEST_KID));
+@@ -641,7 +615,7 @@ mod tests {
+         };
+         bad_signature.replace_range(signature_start..signature_start + 1, replacement);
+         for token in [bad_signature, wrong_audience, expired] {
+-            let Err(error) = exchange(&state, token, &TestReplayProtection::default()).await else {
++            let Err(error) = production_exchange(&state, token).await else {
+                 panic!("invalid assertion should be rejected");
+             };
+             assert_eq!(error.error_code(), "invalid_grant");
+@@ -649,6 +623,54 @@ mod tests {
+         }
+     }
+ 
++    #[tokio::test]
++    async fn unmatched_mapping_does_not_consume_replay_capacity() {
++        let (_server, jwks_url) = jwks_server().await;
++        let idp = test_idp(EXTERNAL_ISSUER, &jwks_url);
++        let mut federation = MockFederationProvider::default();
++        federation
++            .expect_get_identity_provider_by_issuer()
++            .returning(move |_, _, _| Ok(Some(idp.clone())));
++        let mut mapping = MockMappingProvider::default();
++        mapping
++            .expect_get_ruleset_by_source()
++            .returning(|_, _, _| Ok(None));
++        mapping.expect_authenticate_by_mapping().times(0);
++        let provider = Provider::mocked_builder()
++            .mock_federation(federation)
++            .mock_mapping(mapping);
++        let mut config = openstack_keystone_config::Config::default();
++        config.oauth2.allow_per_node_assertion_replay = true;
++        let state = openstack_keystone_core::api::tests::get_mocked_state_with_config(
++            provider, true, None, config,
++        )
++        .await;
++        let (token, _) = assertion_token(
++            EXTERNAL_ISSUER,
++            &assertion_audience(),
++            "unmatched",
++            TEST_KID,
++        );
++
++        let Err(error) = production_exchange(&state, token).await else {
++            panic!("assertion with no mapping must be rejected");
++        };
++        assert_eq!(error.error_code(), "invalid_grant");
++        let Some(cache) = &state.assertion_replay else {
++            panic!("test replay cache must be enabled");
++        };
++        assert!(cache.is_empty());
++    }
++
++    #[test]
++    fn replay_cache_quota_errors_fail_closed() {
++        for error in [ReplayError::CacheFull, ReplayError::ScopeQuotaExceeded] {
++            let mapped = map_replay_protection_error(error);
++            assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
++            assert_eq!(mapped.error_code(), "server_error");
++        }
++    }
++
+     #[tokio::test]
+     async fn identity_provider_discovery_resolves_jwks() {
+         let server = MockServer::start_async().await;
+diff --git a/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs b/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
+index 7e3d862c9..61d97faf5 100644
+--- a/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
++++ b/crates/keystone/src/api/v4/oauth2/token/token_exchange.rs
+@@ -109,26 +109,34 @@ pub(super) async fn handle_token_exchange_grant(
+     )
+     .await?;
+ 
+-    if form.subject_token_type.as_deref() == Some(super::exchange_request::JWT_TOKEN_TYPE) {
+-        return super::external_assertion::handle_external_assertion_exchange(
+-            state,
+-            domain_id,
+-            headers,
+-            correlation_id,
+-            form,
+-            &client,
+-            subject_token,
+-            confirmation,
+-            scope,
+-            oauth2_cfg,
+-        )
+-        .await;
+-    }
+-
+-    let (vsc, delegation_context, credential_expires_at) =
+-        openstack_keystone_core::oauth2_client::validate_subject_token(state, &subject_token)
+-            .await
+-            .map_err(exchange_error)?;
++    // Only a token the native driver cannot decode is eligible for external
++    // verification. A valid native token that fails authorization must not
++    // be retried under a different trust path.
++    let native_subject =
++        openstack_keystone_core::oauth2_client::validate_subject_token(state, &subject_token).await;
++    let (vsc, delegation_context, credential_expires_at) = match native_subject {
++        Ok(subject) => subject,
++        Err(openstack_keystone_core::oauth2_client::TokenExchangeError::InvalidSubjectToken(
++            openstack_keystone_core_types::token::TokenProviderError::InvalidToken { .. },
++        )) if form.subject_token_type.as_deref()
++            == Some(super::exchange_request::JWT_TOKEN_TYPE) =>
++        {
++            return super::external_assertion::handle_external_assertion_exchange(
++                state,
++                domain_id,
++                headers,
++                correlation_id,
++                form,
++                &client,
++                subject_token,
++                confirmation,
++                scope,
++                oauth2_cfg,
++            )
++            .await;
++        }
++        Err(error) => return Err(exchange_error(error)),
++    };
+ 
+     // The Keystone-native tokens this grant accepts carry no confirmation
+     // claim. A subject token that does is a sender-constrained token whose
+@@ -645,7 +653,7 @@ mod tests {
+             .with_state(state);
+         api.as_service()
+             .oneshot(request(&format!(
+-                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&client_id=client-1&client_secret=s3cr3t&subject_token=some-existing-token&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Ajwt{extra}"
++                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&client_id=client-1&client_secret=s3cr3t&subject_token=some-existing-token&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token{extra}"
+             )))
+             .await
+             .unwrap()
+@@ -795,7 +803,7 @@ mod tests {
+             .await;
+             let mut api = openapi_router().with_state(state);
+             let response = api.as_service().oneshot(request(
+-                "grant_type=urn:ietf:params:oauth:grant-type:token-exchange&client_id=client-1&client_secret=s3cr3t&subject_token=subject&subject_token_type=urn:ietf:params:oauth:token-type:access_token"
++                "grant_type=urn:ietf:params:oauth:grant-type:token-exchange&client_id=client-1&client_secret=s3cr3t&subject_token=subject&subject_token_type=urn:ietf:params:oauth:token-type:jwt"
+             )).await.unwrap();
+             assert_eq!(response.status(), status, "{kind}");
+             let body = json_body(response).await;
+diff --git a/doc/src/admin/features/oauth2.md b/doc/src/admin/features/oauth2.md
+index a44d6bffb..5571b1fd2 100644
+--- a/doc/src/admin/features/oauth2.md
++++ b/doc/src/admin/features/oauth2.md
+@@ -82,6 +82,7 @@ header instead of a 500.
+ | `dpop_nonce_lifetime_seconds`           | 300     | Length of one DPoP nonce slot. A nonce is valid for the rest of its slot and the next one.                                                       |
+ | `dpop_replay_cache_max_entries`         | 100000  | Live entries of the DPoP replay cache. When full, new proofs are rejected instead of evicting entries.                                           |
+ | `dpop_replay_cache_max_entries_per_key` | 256     | Live replay cache entries one proof key may hold.                                                                                                |
++| `allow_per_node_assertion_replay`       | `false` | Allow external JWT exchange with a process-local replay cache. Replay protection is not shared across nodes and is lost on restart; without this opt-in exchange fails closed. Read at startup. |
+ | `allow_host_header_issuer`              | `false` | **Development only.** Lets the issuer and cookie `Secure` flag follow the request `Host`/`X-Forwarded-Proto` headers when `[DEFAULT] public_endpoint` is unset. |
+ | `templates_dir`                         | unset   | Directory with operator-supplied page templates (see [Customising the login pages](#customising-the-login-pages)). Read once at startup. |
+ | `static_dir`                            | unset   | Directory with operator static assets (stylesheets, logos) served at `/v4/oauth2/static/`.                                                       |
+@@ -98,6 +99,11 @@ header instead of a 500.
+ 
+ Exceeding a rate limit returns `429 Too Many Requests`.
+ 
++The process-local external assertion cache uses the configured per-issuer limit
++and caps its total entries at the smaller of the configured total and per-domain
++limits. This conservative total cap also bounds each domain. It does not provide
++cluster-wide replay protection.
++
+ ## Second factor (TOTP and passkeys)
+ 
+ After the password step a user holding a second factor must pass it on both
+diff --git a/doc/src/user/features/oauth2.md b/doc/src/user/features/oauth2.md
+index f2506f9ab..77e70b806 100644
+--- a/doc/src/user/features/oauth2.md
++++ b/doc/src/user/features/oauth2.md
+@@ -89,7 +89,7 @@ Neither path creates additional delegation rights from request parameters.
+ | --- | --- |
+ | `subject_token` | Required and non-empty. Existing token validation and delegation rules still apply. |
+ | `subject_token_type` | Required. `urn:ietf:params:oauth:token-type:access_token` and `urn:openstack:params:oauth:token-type:keystone` identify supported native inputs. |
+-| JWT subject type | The secret-authenticated path retains the `urn:ietf:params:oauth:token-type:jwt` compatibility arm for JWTs accepted by the native validator. This does not enable external-issuer JWT ingress; its mapping-engine dispatch is tracked in #1018. The SVID path retains its native-versus-hop dispatch. |
++| JWT subject type | The secret-authenticated path first validates `urn:ietf:params:oauth:token-type:jwt` subjects as native tokens. Tokens the native driver cannot decode are verified as external assertions against a trusted identity provider and mapped to an identity. External exchange requires replay protection; see the [operator configuration](../../admin/features/oauth2.md). The SVID path retains its native-versus-hop dispatch. |
+ | `requested_token_type` | Omit or use `urn:ietf:params:oauth:token-type:access_token`. Other values, including an empty value, return `invalid_request`. |
+ | `scope` | Only `openstack:api` is implemented by exchange. Explicit requests must also be allowed by the client. Other values, including empty and mixed scopes, return `invalid_scope`; they are never silently ignored. Omission retains the existing `openstack:api` exchange default. OAuth scope does not select projects or grant extra roles. |
+ | `audience` | Optional, repeatable service types from the catalog. Requests narrow the audience; unknown or empty values and excessive lists return `invalid_target`. On-behalf-of renewal also preserves the subject's audience boundary. |
+
+From 13ebc8b4e75dd7a3d3bfbb9c6845ea0696059523 Mon Sep 17 00:00:00 2001
+From: Thinh Phuc Nguyen <nguyenthinhphuc1901@gmail.com>
+Date: Thu, 12 Nov 2026 16:17:26 -0500
+Subject: [PATCH 5/5] feat(oauth2): Add assertion replay cache
+
+(cherry picked from commit edc7f267003ffcd518477f611f41d5f1a89aad3f)
+
+Signed-off-by: Thinh Phuc Nguyen <nguyenthinhphuc1901@gmail.com>
+Signed-off-by: Dominic Murphy <ddmurphy@bu.edu>
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ crates/core/src/oauth2_client.rs              |   2 +
+ .../src/oauth2_client/assertion_replay.rs     | 182 +++++++++++
+ crates/core/src/oauth2_client/dpop_replay.rs  | 110 ++-----
+ crates/core/src/oauth2_client/replay.rs       | 293 ++++++++++++++++++
+ crates/core/src/oauth2_client/verify.rs       |   2 +-
+ 5 files changed, 496 insertions(+), 93 deletions(-)
+ create mode 100644 crates/core/src/oauth2_client/assertion_replay.rs
+ create mode 100644 crates/core/src/oauth2_client/replay.rs
+
+diff --git a/crates/core/src/oauth2_client.rs b/crates/core/src/oauth2_client.rs
+index ee0acd895..5f5003cff 100644
+--- a/crates/core/src/oauth2_client.rs
++++ b/crates/core/src/oauth2_client.rs
+@@ -17,6 +17,7 @@
+ //! validation only in Phase 2 -- wiring into the mapping engine's
+ //! `IdentitySource` for actual `/token` issuance is Phase 3/4.
+ 
++pub mod assertion_replay;
+ pub mod backend;
+ pub mod bound_bearer;
+ pub mod crypto;
+@@ -32,6 +33,7 @@ pub mod id_token;
+ pub mod on_behalf_of;
+ pub mod pkce;
+ mod provider_api;
++pub mod replay;
+ pub mod service;
+ pub mod token;
+ pub mod token_exchange;
+diff --git a/crates/core/src/oauth2_client/assertion_replay.rs b/crates/core/src/oauth2_client/assertion_replay.rs
+new file mode 100644
+index 000000000..1ff938513
+--- /dev/null
++++ b/crates/core/src/oauth2_client/assertion_replay.rs
+@@ -0,0 +1,182 @@
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++// SPDX-License-Identifier: Apache-2.0
++// Crypto inventory: none (bookkeeping of identifiers only).
++//! # Replay cache for external assertions (ADR 0026 §1, ADR 0036 §6.4)
++//!
++//! A JWT from an external IdP can be presented to the token endpoint more
++//! than once while it is valid. This cache remembers the `jti` of each
++//! accepted assertion, per `(domain, issuer)`, and refuses a second use.
++//!
++//! An entry is kept until the assertion can no longer pass verification: the
++//! profile accepts a token up to the clock skew after its `exp`, so the entry
++//! lives until `exp` plus that skew. The profile also caps the lifetime of
++//! an assertion, so the cache stays small.
++//!
++//! Call it only with the `exp` of a token that
++//! [`verify_subject_token_jwt`](super::verify::verify_subject_token_jwt)
++//! accepted. The bounds, the no-eviction rule and the per-process limits are
++//! those of [`ReplayCache`].
++use super::replay::{ReplayCache, ReplayError};
++use super::verify::PROFILE_CLOCK_SKEW;
++
++/// Replay cache for the `jti` of external assertions.
++pub struct AssertionReplayCache {
++    cache: ReplayCache,
++}
++
++impl AssertionReplayCache {
++    /// Create a cache. `max_per_issuer` bounds the live entries of one
++    /// `(domain, issuer)` so a single IdP cannot fill the cache; `max_total`
++    /// bounds all of them.
++    pub fn new(max_per_issuer: usize, max_total: usize) -> Self {
++        Self {
++            cache: ReplayCache::new(max_per_issuer, max_total),
++        }
++    }
++
++    /// Record the `jti` of a verified assertion, refusing a replay.
++    ///
++    /// `exp` is the `exp` claim of the verified token and `now` the current
++    /// unix time.
++    ///
++    /// # Errors
++    /// [`ReplayError::Replayed`] for a seen `(domain, issuer, jti)`, and the
++    /// quota errors when the bounds are reached; live entries are never
++    /// evicted.
++    pub fn check_and_insert(
++        &self,
++        domain_id: &str,
++        issuer: &str,
++        jti: &str,
++        exp: i64,
++        now: i64,
++    ) -> Result<(), ReplayError> {
++        let skew = i64::try_from(PROFILE_CLOCK_SKEW.as_secs()).unwrap_or(i64::MAX / 4);
++        let expires = exp.saturating_add(skew).saturating_add(1);
++        self.cache
++            .check_and_insert(&scope(domain_id, issuer), jti, expires, now)
++    }
++
++    /// Drop expired entries; meant for a periodic background task.
++    pub fn purge_expired(&self, now: i64) {
++        self.cache.purge_expired(now);
++    }
++
++    /// Number of entries currently held (live or not yet purged).
++    pub fn len(&self) -> usize {
++        self.cache.len()
++    }
++
++    /// Whether the cache holds no entry.
++    pub fn is_empty(&self) -> bool {
++        self.cache.is_empty()
++    }
++}
++
++/// The scope of an entry. The length prefix keeps `(domain, issuer)` pairs
++/// that concatenate to the same text apart.
++fn scope(domain_id: &str, issuer: &str) -> String {
++    format!("{}:{domain_id}{issuer}", domain_id.len())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const NOW: i64 = 1_760_000_000;
++    const ISSUER: &str = "https://token.actions.githubusercontent.com";
++    const SKEW: i64 = 60;
++
++    #[test]
++    fn test_second_use_of_a_jti_is_refused() {
++        let cache = AssertionReplayCache::new(10, 100);
++        let exp = NOW + 300;
++        assert!(cache.check_and_insert("d1", ISSUER, "a", exp, NOW).is_ok());
++        assert_eq!(
++            cache.check_and_insert("d1", ISSUER, "a", exp, NOW + 1),
++            Err(ReplayError::Replayed)
++        );
++        assert!(cache.check_and_insert("d1", ISSUER, "b", exp, NOW).is_ok());
++    }
++
++    #[test]
++    fn test_same_jti_is_independent_per_domain_and_issuer() {
++        let cache = AssertionReplayCache::new(10, 100);
++        let exp = NOW + 300;
++        cache.check_and_insert("d1", ISSUER, "a", exp, NOW).unwrap();
++        assert!(cache.check_and_insert("d2", ISSUER, "a", exp, NOW).is_ok());
++        assert!(
++            cache
++                .check_and_insert("d1", "https://idp.example.com", "a", exp, NOW)
++                .is_ok()
++        );
++    }
++
++    #[test]
++    fn test_scope_is_injective() {
++        // Both pairs concatenate to "ab"; the scopes still differ.
++        assert_ne!(scope("a", "b"), scope("ab", ""));
++        let cache = AssertionReplayCache::new(10, 100);
++        let exp = NOW + 300;
++        cache.check_and_insert("a", "b", "x", exp, NOW).unwrap();
++        assert!(cache.check_and_insert("ab", "", "x", exp, NOW).is_ok());
++    }
++
++    /// The token still passes verification until `exp` plus the skew, so a
++    /// replay up to then must be caught and not a second longer.
++    #[test]
++    fn test_entry_lives_until_exp_plus_skew() {
++        let cache = AssertionReplayCache::new(10, 100);
++        let exp = NOW + 300;
++        cache.check_and_insert("d1", ISSUER, "a", exp, NOW).unwrap();
++        assert_eq!(
++            cache.check_and_insert("d1", ISSUER, "a", exp, exp + SKEW),
++            Err(ReplayError::Replayed)
++        );
++        assert!(
++            cache
++                .check_and_insert("d1", ISSUER, "a", exp + 2 * SKEW, exp + SKEW + 1)
++                .is_ok()
++        );
++    }
++
++    #[test]
++    fn test_one_issuer_cannot_fill_the_cache() {
++        let cache = AssertionReplayCache::new(2, 100);
++        let exp = NOW + 300;
++        cache.check_and_insert("d1", ISSUER, "a", exp, NOW).unwrap();
++        cache.check_and_insert("d1", ISSUER, "b", exp, NOW).unwrap();
++        assert_eq!(
++            cache.check_and_insert("d1", ISSUER, "c", exp, NOW),
++            Err(ReplayError::ScopeQuotaExceeded)
++        );
++        assert!(
++            cache
++                .check_and_insert("d1", "https://idp.example.com", "a", exp, NOW)
++                .is_ok()
++        );
++    }
++
++    #[test]
++    fn test_purge_expired() {
++        let cache = AssertionReplayCache::new(10, 100);
++        cache
++            .check_and_insert("d1", ISSUER, "a", NOW + 300, NOW)
++            .unwrap();
++        cache.purge_expired(NOW + 300 + SKEW);
++        assert_eq!(cache.len(), 1);
++        cache.purge_expired(NOW + 300 + SKEW + 1);
++        assert!(cache.is_empty());
++    }
++}
+diff --git a/crates/core/src/oauth2_client/dpop_replay.rs b/crates/core/src/oauth2_client/dpop_replay.rs
+index 2207ca0ff..3b57937c2 100644
+--- a/crates/core/src/oauth2_client/dpop_replay.rs
++++ b/crates/core/src/oauth2_client/dpop_replay.rs
+@@ -14,21 +14,13 @@
+ // Crypto inventory: none (bookkeeping of identifiers only).
+ //! # DPoP proof replay cache (RFC 9449 §11.1, ADR 0043 §2)
+ //!
+-//! Bounded in-memory set of `(jkt, jti)` pairs, kept for as long as a proof
+-//! can still pass the `iat` window. The cache never evicts a live entry to
+-//! make room: once a key exceeds its share or the cache is full, new proofs
+-//! are rejected instead. Otherwise an attacker could flood the cache with
+-//! proofs from fresh keys, push out the entry of a captured proof and replay
+-//! it.
+-//!
+-//! The cache is per process; see ADR 0043 "Consequences" for the cross-node
+-//! limits.
+-use std::collections::HashMap;
+-use std::sync::{Mutex, PoisonError};
+-
++//! Set of `(jkt, jti)` pairs, kept for as long as a proof can still pass the
++//! `iat` window. The bounds, the no-eviction rule and the per-process
++//! limits are those of [`ReplayCache`].
+ use thiserror::Error;
+ 
+ use super::dpop::VerifiedDpopProof;
++use super::replay::{ReplayCache, ReplayError};
+ 
+ /// Why a proof was refused by the cache.
+ #[derive(Debug, Error, PartialEq, Eq)]
+@@ -46,40 +38,19 @@ pub enum DpopReplayError {
+     Replayed,
+ }
+ 
+-#[derive(Default)]
+-struct Inner {
+-    /// Lower bound of the earliest expiry held. Nothing can be dead before
+-    /// it, so a purge before then is skipped instead of scanning every entry.
+-    earliest: i64,
+-    /// `jkt` -> (`jti` -> unix second after which the entry is dead).
+-    keys: HashMap<String, HashMap<String, i64>>,
+-    total: usize,
+-}
+-
+-impl Inner {
+-    fn purge(&mut self, now: i64) {
+-        if self.earliest > now {
+-            return;
++impl From<ReplayError> for DpopReplayError {
++    fn from(error: ReplayError) -> Self {
++        match error {
++            ReplayError::CacheFull => Self::CacheFull,
++            ReplayError::ScopeQuotaExceeded => Self::KeyQuotaExceeded,
++            ReplayError::Replayed => Self::Replayed,
+         }
+-        let mut removed = 0;
+-        let mut earliest = i64::MAX;
+-        self.keys.retain(|_, jtis| {
+-            let before = jtis.len();
+-            jtis.retain(|_, expires| *expires > now);
+-            removed += before - jtis.len();
+-            earliest = jtis.values().fold(earliest, |acc, e| acc.min(*e));
+-            !jtis.is_empty()
+-        });
+-        self.total -= removed;
+-        self.earliest = earliest;
+     }
+ }
+ 
+ /// Replay cache for DPoP proofs.
+ pub struct DpopReplayCache {
+-    inner: Mutex<Inner>,
+-    max_per_key: usize,
+-    max_total: usize,
++    cache: ReplayCache,
+     /// Seconds an entry outlives its `iat`: the verifier's `max_skew_secs`.
+     window_secs: i64,
+ }
+@@ -94,10 +65,8 @@ impl DpopReplayCache {
+     /// `max_total` bound the live entries.
+     pub fn new(window_secs: u64, max_per_key: usize, max_total: usize) -> Self {
+         Self {
+-            inner: Mutex::new(Inner::default()),
++            cache: ReplayCache::new(max_per_key, max_total),
+             window_secs: i64::try_from(window_secs).unwrap_or(i64::MAX / 4),
+-            max_per_key,
+-            max_total,
+         }
+     }
+ 
+@@ -112,67 +81,24 @@ impl DpopReplayCache {
+         now: i64,
+     ) -> Result<(), DpopReplayError> {
+         let expires = proof.iat.saturating_add(self.window_secs).saturating_add(1);
+-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+-
+-        // Free dead entries only when a bound is about to be hit; the common
+-        // path stays O(1).
+-        if inner.total >= self.max_total
+-            || inner
+-                .keys
+-                .get(&proof.jkt)
+-                .is_some_and(|jtis| jtis.len() >= self.max_per_key)
+-        {
+-            inner.purge(now);
+-        }
+-
+-        // An expired entry for the same `jti` is overwritten, so it neither
+-        // grows the key nor the cache.
+-        let mut overwrites = false;
+-        if let Some(jtis) = inner.keys.get(&proof.jkt) {
+-            match jtis.get(&proof.jti) {
+-                Some(e) if *e > now => return Err(DpopReplayError::Replayed),
+-                Some(_) => overwrites = true,
+-                None => {}
+-            }
+-            if !overwrites && jtis.len() >= self.max_per_key {
+-                return Err(DpopReplayError::KeyQuotaExceeded);
+-            }
+-        }
+-        if !overwrites && inner.total >= self.max_total {
+-            return Err(DpopReplayError::CacheFull);
+-        }
+-
+-        inner
+-            .keys
+-            .entry(proof.jkt.clone())
+-            .or_default()
+-            .insert(proof.jti.clone(), expires);
+-        if !overwrites {
+-            inner.total += 1;
+-        }
+-        inner.earliest = inner.earliest.min(expires);
+-        Ok(())
++        Ok(self
++            .cache
++            .check_and_insert(&proof.jkt, &proof.jti, expires, now)?)
+     }
+ 
+     /// Drop expired entries; meant for a periodic background task.
+     pub fn purge_expired(&self, now: i64) {
+-        self.inner
+-            .lock()
+-            .unwrap_or_else(PoisonError::into_inner)
+-            .purge(now);
++        self.cache.purge_expired(now);
+     }
+ 
+     /// Number of entries currently held (live or not yet purged).
+     pub fn len(&self) -> usize {
+-        self.inner
+-            .lock()
+-            .unwrap_or_else(PoisonError::into_inner)
+-            .total
++        self.cache.len()
+     }
+ 
+     /// Whether the cache holds no entry.
+     pub fn is_empty(&self) -> bool {
+-        self.len() == 0
++        self.cache.is_empty()
+     }
+ }
+ 
+diff --git a/crates/core/src/oauth2_client/replay.rs b/crates/core/src/oauth2_client/replay.rs
+new file mode 100644
+index 000000000..22551f74e
+--- /dev/null
++++ b/crates/core/src/oauth2_client/replay.rs
+@@ -0,0 +1,293 @@
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++// SPDX-License-Identifier: Apache-2.0
++// Crypto inventory: none (bookkeeping of identifiers only).
++//! # Bounded replay cache
++//!
++//! Bounded in-memory set of `(scope, id)` pairs, each kept until the moment
++//! the caller says the credential can no longer be accepted. The cache never
++//! evicts a live entry to make room: once a scope exceeds its share or the
++//! cache is full, new credentials are rejected instead. Otherwise an attacker
++//! could flood the cache with credentials from fresh scopes, push out the
++//! entry of a captured credential and replay it.
++//!
++//! The caller picks what the scope and the id are and when an entry dies:
++//! [`DpopReplayCache`](super::dpop_replay::DpopReplayCache) (RFC 9449 §11.1)
++//! and [`AssertionReplayCache`](super::assertion_replay::AssertionReplayCache)
++//! (`jti` of external assertions) are the two users.
++//!
++//! The cache is per process; see ADR 0043 "Consequences" for the cross-node
++//! limits.
++use std::collections::HashMap;
++use std::sync::{Mutex, PoisonError};
++
++use thiserror::Error;
++
++/// Why a credential was refused by the cache.
++#[derive(Debug, Error, PartialEq, Eq)]
++pub enum ReplayError {
++    /// The cache holds its maximum number of live entries.
++    #[error("replay cache is full")]
++    CacheFull,
++
++    /// The scope already holds its share of live entries.
++    #[error("too many live entries for this scope")]
++    ScopeQuotaExceeded,
++
++    /// The `(scope, id)` pair was already seen and has not expired.
++    #[error("credential was already used")]
++    Replayed,
++}
++
++#[derive(Default)]
++struct Inner {
++    /// Lower bound of the earliest expiry held. Nothing can be dead before
++    /// it, so a purge before then is skipped instead of scanning every entry.
++    earliest: i64,
++    /// scope -> (id -> unix second after which the entry is dead).
++    scopes: HashMap<String, HashMap<String, i64>>,
++    total: usize,
++}
++
++impl Inner {
++    fn purge(&mut self, now: i64) {
++        if self.earliest > now {
++            return;
++        }
++        let mut removed = 0;
++        let mut earliest = i64::MAX;
++        self.scopes.retain(|_, ids| {
++            let before = ids.len();
++            ids.retain(|_, expires| *expires > now);
++            removed += before - ids.len();
++            earliest = ids.values().fold(earliest, |acc, e| acc.min(*e));
++            !ids.is_empty()
++        });
++        self.total -= removed;
++        self.earliest = earliest;
++    }
++}
++
++/// Bounded set of seen `(scope, id)` pairs.
++pub struct ReplayCache {
++    inner: Mutex<Inner>,
++    max_per_scope: usize,
++    max_total: usize,
++}
++
++impl ReplayCache {
++    /// Create a cache. `max_per_scope` and `max_total` bound the live
++    /// entries.
++    pub fn new(max_per_scope: usize, max_total: usize) -> Self {
++        Self {
++            inner: Mutex::new(Inner::default()),
++            max_per_scope,
++            max_total,
++        }
++    }
++
++    /// Record a credential, refusing a replay.
++    ///
++    /// `expires` is the first unix second at which the entry is dead. It must
++    /// not be earlier than the last moment the same credential could still
++    /// pass verification; an earlier value opens a replay gap.
++    ///
++    /// # Errors
++    /// [`ReplayError::Replayed`] for a seen `(scope, id)`, and the quota errors
++    /// when the bounds are reached; live entries are never evicted.
++    pub fn check_and_insert(
++        &self,
++        scope: &str,
++        id: &str,
++        expires: i64,
++        now: i64,
++    ) -> Result<(), ReplayError> {
++        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
++
++        // Free dead entries only when a bound is about to be hit; the common
++        // path stays O(1).
++        if inner.total >= self.max_total
++            || inner
++                .scopes
++                .get(scope)
++                .is_some_and(|ids| ids.len() >= self.max_per_scope)
++        {
++            inner.purge(now);
++        }
++
++        // An expired entry for the same id is overwritten, so it neither
++        // grows the scope nor the cache.
++        let mut overwrites = false;
++        if let Some(ids) = inner.scopes.get(scope) {
++            match ids.get(id) {
++                Some(e) if *e > now => return Err(ReplayError::Replayed),
++                Some(_) => overwrites = true,
++                None => {}
++            }
++            if !overwrites && ids.len() >= self.max_per_scope {
++                return Err(ReplayError::ScopeQuotaExceeded);
++            }
++        }
++        if !overwrites && inner.total >= self.max_total {
++            return Err(ReplayError::CacheFull);
++        }
++
++        inner
++            .scopes
++            .entry(scope.to_owned())
++            .or_default()
++            .insert(id.to_owned(), expires);
++        if !overwrites {
++            inner.total += 1;
++        }
++        inner.earliest = inner.earliest.min(expires);
++        Ok(())
++    }
++
++    /// Drop expired entries; meant for a periodic background task.
++    pub fn purge_expired(&self, now: i64) {
++        self.inner
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .purge(now);
++    }
++
++    /// Number of entries currently held (live or not yet purged).
++    pub fn len(&self) -> usize {
++        self.inner
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .total
++    }
++
++    /// Whether the cache holds no entry.
++    pub fn is_empty(&self) -> bool {
++        self.len() == 0
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const NOW: i64 = 1_760_000_000;
++    const LIFETIME: i64 = 60;
++
++    fn insert(cache: &ReplayCache, scope: &str, id: &str, at: i64) -> Result<(), ReplayError> {
++        cache.check_and_insert(scope, id, at + LIFETIME, at)
++    }
++
++    #[test]
++    fn test_replay_rejected_and_other_id_or_scope_accepted() {
++        let cache = ReplayCache::new(10, 100);
++        assert!(insert(&cache, "s1", "a", NOW).is_ok());
++        assert_eq!(insert(&cache, "s1", "a", NOW), Err(ReplayError::Replayed));
++        assert!(insert(&cache, "s1", "b", NOW).is_ok());
++        assert!(insert(&cache, "s2", "a", NOW).is_ok());
++    }
++
++    #[test]
++    fn test_entry_dies_exactly_at_expires() {
++        let cache = ReplayCache::new(10, 100);
++        cache
++            .check_and_insert("s1", "a", NOW + LIFETIME, NOW)
++            .unwrap();
++        // One second before the expiry the entry is still live.
++        assert_eq!(
++            cache.check_and_insert("s1", "a", NOW + 2 * LIFETIME, NOW + LIFETIME - 1),
++            Err(ReplayError::Replayed)
++        );
++        // From the expiry on it is dead and the id can be recorded again.
++        assert!(
++            cache
++                .check_and_insert("s1", "a", NOW + 2 * LIFETIME, NOW + LIFETIME)
++                .is_ok()
++        );
++    }
++
++    #[test]
++    fn test_scope_quota_does_not_evict() {
++        let cache = ReplayCache::new(2, 100);
++        insert(&cache, "s1", "a", NOW).unwrap();
++        insert(&cache, "s1", "b", NOW).unwrap();
++        assert_eq!(
++            insert(&cache, "s1", "c", NOW),
++            Err(ReplayError::ScopeQuotaExceeded)
++        );
++        // The earlier entries are still protected.
++        assert_eq!(insert(&cache, "s1", "a", NOW), Err(ReplayError::Replayed));
++        // Other scopes are unaffected.
++        assert!(insert(&cache, "s2", "a", NOW).is_ok());
++    }
++
++    #[test]
++    fn test_fresh_scope_flood_sheds_load_and_keeps_live_entries() {
++        let cache = ReplayCache::new(10, 3);
++        insert(&cache, "victim", "x", NOW).unwrap();
++        insert(&cache, "f1", "a", NOW).unwrap();
++        insert(&cache, "f2", "a", NOW).unwrap();
++        assert_eq!(insert(&cache, "f3", "a", NOW), Err(ReplayError::CacheFull));
++        assert_eq!(cache.len(), 3);
++        // The victim's captured credential is still rejected as a replay.
++        assert_eq!(
++            insert(&cache, "victim", "x", NOW),
++            Err(ReplayError::Replayed)
++        );
++    }
++
++    #[test]
++    fn test_expired_entries_free_room() {
++        let cache = ReplayCache::new(10, 2);
++        insert(&cache, "s1", "a", NOW).unwrap();
++        insert(&cache, "s2", "a", NOW).unwrap();
++        let later = NOW + 100;
++        assert!(insert(&cache, "s3", "a", later).is_ok());
++        assert_eq!(cache.len(), 1);
++    }
++
++    #[test]
++    fn test_reusing_expired_id_does_not_inflate_count() {
++        let cache = ReplayCache::new(10, 2);
++        // Each round reuses the id once the previous entry has expired,
++        // without a purge in between.
++        for round in 0..5 {
++            insert(&cache, "s1", "a", NOW + round * 100).unwrap();
++        }
++        assert_eq!(cache.len(), 1);
++        // The cache is not spuriously full.
++        assert!(insert(&cache, "s2", "a", NOW + 500).is_ok());
++        assert_eq!(cache.len(), 2);
++    }
++
++    #[test]
++    fn test_overwrite_allowed_at_quota() {
++        let cache = ReplayCache::new(1, 1);
++        insert(&cache, "s1", "a", NOW).unwrap();
++        assert!(insert(&cache, "s1", "a", NOW + 100).is_ok());
++        assert_eq!(cache.len(), 1);
++    }
++
++    #[test]
++    fn test_purge_expired() {
++        let cache = ReplayCache::new(10, 100);
++        insert(&cache, "s1", "a", NOW).unwrap();
++        insert(&cache, "s1", "b", NOW + 30).unwrap();
++        // Nothing dead yet: the entries stay.
++        cache.purge_expired(NOW + 10);
++        assert_eq!(cache.len(), 2);
++        cache.purge_expired(NOW + 70);
++        assert_eq!(cache.len(), 1);
++        cache.purge_expired(NOW + 91);
++        assert!(cache.is_empty());
++    }
++}
+diff --git a/crates/core/src/oauth2_client/verify.rs b/crates/core/src/oauth2_client/verify.rs
+index 6ed174bbf..5bcbca12b 100644
+--- a/crates/core/src/oauth2_client/verify.rs
++++ b/crates/core/src/oauth2_client/verify.rs
+@@ -275,7 +275,7 @@ const NATIVE_REQUIRED_CLAIMS: &[&str] = &["exp", "iat", "nbf", "iss", "aud", "su
+ const EXTERNAL_REQUIRED_CLAIMS: &[&str] = &["exp", "iss", "aud", "sub"];
+ const ASSERTION_REQUIRED_CLAIMS: &[&str] = &["exp", "iat", "iss", "aud", "sub", "jti"];
+ const PROFILE_STRING_CLAIMS: &[&str] = &["iss", "sub", "jti"];
+-const PROFILE_CLOCK_SKEW: Duration = Duration::from_secs(60);
++pub(crate) const PROFILE_CLOCK_SKEW: Duration = Duration::from_secs(60);
+ const EXTERNAL_MAX_AGE: Duration = Duration::from_secs(300);
+ /// Algorithms an external profile allows unless the caller narrows or widens
+ /// the list with [`SubjectTokenValidationProfile::with_allowed_algorithms`].
