@@ -8,8 +8,8 @@
 1. [Issue](https://github.com/openstack-experimental/keystone/issues/1636) :: [PR](https://github.com/openstack-experimental/keystone/pull/1639) :: Each token validation profile now has a list of allowed signing algorithms. External tokens accept RS256 and ES256 by default. HMAC and `alg: none` tokens are rejected. Merged. Code diff under: `src/demo-3/allowed-algorithms/1639.patch`
 2. [Issue](https://github.com/openstack-experimental/keystone/issues/1636) :: [PR](https://github.com/openstack-experimental/keystone/pull/1642) :: Follow-up to #1639 for the maintainer's review: an allowlist instead of a banned list, a separate error for a bad list, and wrong-key-type tests. Code diff under: `src/demo-3/allowed-algorithms/1642.patch`
 3. [Issue](https://github.com/openstack-experimental/keystone/issues/1636) :: [PR](https://github.com/openstack-experimental/keystone/pull/1640) :: A replay cache that remembers the `jti` of external tokens so the same token can't be used twice. Code diff under: `src/demo-3/replay-cache/1640.patch`
-4. [Issue](https://github.com/openstack-experimental/keystone/issues/1353) || [PR](https://github.com/openstack-experimental/keystone/pull/1616) :: Follow-up to previous token expiration PR, this applies a default token expiration on a token that does not come with a expiration instead of silently dropped or erroring.
-5. [No Direct Issue](https://github.com/openstack-experimental/keystone/issues/1353) || [PR](https://github.com/openstack-experimental/keystone/pull/1645) 
+4. [Issue](https://github.com/openstack-experimental/keystone/issues/1353) :: [PR](https://github.com/openstack-experimental/keystone/pull/1616) :: Follow-up to previous token expiration PR, this applies a default token expiration on a token that does not come with a expiration instead of silently dropped or erroring.
+5. [No Direct Issue](https://github.com/openstack-experimental/keystone/issues/1353) :: [PR](https://github.com/openstack-experimental/keystone/pull/1645) 
 :: From the project mentor, checks service grant chain and applies a default expiration on any service grants. This is based on a chain of if: grant has a specific expiration, client has a set max_grant_lifetime, then default_access_lifetime.
 6. [Issue](https://github.com/openstack-experimental/keystone/issues/1354) :: [PR](https://github.com/openstack-experimental/keystone/pull/1575) :: Added RFC 8693 request validation to Keystone’s token exchange endpoint. Missing, empty, or unsupported subject token types return `invalid_request`, and successful responses include `issued_token_type`. Merged.  Code diff under: src/demo-3/1575.patch
 7. [Issue](https://github.com/openstack-experimental/keystone/issues/1366) :: [PR](https://github.com/openstack-experimental/keystone/pull/1646) :: Added a test fixture for user and service account JWTs from Keycloak. The full token exchange test in k3s is still in progress.
@@ -17,7 +17,7 @@
 
 ## 2. Design decisions
 ### 1. PR 1639/1642/1640
-**Background.** A JWT has a header, claims and a signature. The signature shows the identity provider made the token and nobody changed it, and the `alg` header says how it was signed.
+**Background** A JWT has a header, claims and a signature. The signature shows the identity provider made the token and nobody changed it, and the `alg` header says how it was signed.
 - **RS256** is an RSA signature with SHA-256. The provider signs with a private key and Keystone checks with the public key.
 - **ES256** is the same idea with an elliptic curve (ECDSA, P-256), so the keys and signatures are smaller.
 - **HS256** uses one shared secret to sign and check. Keystone only has the provider's public key, so an attacker could use that public key as the secret and forge a token that passes. That is why HMAC is rejected.
@@ -25,8 +25,8 @@
 2. The maintainer asked for three changes in review, done in #1642. The HMAC check was a list of banned algorithms, so a new HMAC algorithm would get through. It is now a list of allowed ones (RS256/384/512, PS256/384/512, ES256/384, EdDSA). A bad list used `InvalidProfile`, whose message is about issuers and audiences, so it now has its own error, `InvalidAlgorithmList`. Tests were also added for a key of the wrong type (ES256 token with an RSA-only JWKS, RS256 token with an EC-only JWKS). The crypto library already rejects these, so no code changed. `crypto-inventory.md` is updated too.
 3. An external token is valid for a few minutes, so a copied one could be used again. The replay cache stores each accepted `jti` per domain and issuer until `exp` plus the 60 second clock skew, and refuses it a second time. When full it refuses new tokens and never deletes live entries, otherwise an attacker could flood it to push out a copied token's entry and replay it. The DPoP cache logic moved into a general `ReplayCache` that `DpopReplayCache` and the new `AssertionReplayCache` both use. The 9 existing DPoP tests are unchanged.
 
-### 2. PR 1616
-While permanent tokens (those without an expiry) are possibles are not technically against RFC guidelines, they can present significant securrity risks if not handled properly. We force all tokens to have an expiry and if one come that does not have one, we apply a default limit of 15 minutes. This applies to both subject tokens and application credentials.
+### 2. Service Grant & Token Expirations
+**Background** While permanent tokens (those without an expiry) are possibles are not technically against RFC guidelines, they can present significant securrity risks if not handled properly. We force all tokens to have an expiry and if one come that does not have one, we apply a default limit of 15 minutes. This applies to both subject tokens and application credentials.
 
 Focusing on applications then, we move onto a service grant chain which is a type of delegation chain, two of which exist in Keystone. We focus on service grant, which is like 'giving permission in advance'.
 
@@ -38,9 +38,9 @@ The service (etc Cinder) redeems it with the custom `urn:openstack:params:oauth:
 Essentially, a user tells Keystone "Let this service act for me on this project, with these roles". The service then proves its identity via a SPIFFE certificate and asks Keystone for a short-lived access token. Keystone checks that the grant is still valid and that the user still has the relevant roles. The token says who the user is (sub) and which service is acting (act). The service can request another token later by redeeming the grant again. Revoking the grant prevents future redemptions, though already-issued tokens remain usable until they expire.
 
 Permanent or overly long-lived service grants are dangerous because they violate the Principle of Least Privilege. Service tokens travel extensively across internal control plane networks to facilitate inter-service communication (e.g., Nova talking to Cinder or Neutron). If an internal control plane node is compromised, or if a service token accidentally leaks into debug logs or unencrypted databases, a permanent grant gives an attacker an indefinite, unexpiring key to cloud infrastructure.
-### 3. PR #1575 — RFC 8693 token exchange validation
 
-**Background.** In token exchange, `subject_token_type` let Keystone know what kind of token the client is sending. `requested_token_type` let Keystone know what kind of token the client wants back. Keystone only read these fields without validating them in the past.In another hand, it did not report what type of token it had issued when a successful response occur.
+### 3. PR #1575 — RFC 8693 token exchange validation
+**Background** In token exchange, `subject_token_type` let Keystone know what kind of token the client is sending. `requested_token_type` let Keystone know what kind of token the client wants back. Keystone only read these fields without validating them in the past.In another hand, it did not report what type of token it had issued when a successful response occur.
 
 **Validate the token types.** In first version, it allow 'jwt' subject token type to token exchange,but I find an existing API test sent `access_token`. Then I changed the handler to use an explicit match that keeps `access_token` working, check the Keystone-specific type, and preserves the existing JWT compatibility path. A missing, empty, or unsupported subject type now returns HTTP 400 with `invalid_request`. 
 **Use the same rules across both exchange paths.** I made a request check for standard and on-behalf-of flows. Keystone applies the per-client rate limit.  For unsupported things now return errors that tell the client what went wrong. For example, an unsupported `resource` returns `invalid_target`.
@@ -50,7 +50,7 @@ Permanent or overly long-lived service grants are dangerous because they violate
 
 ### 4. PR#1646 — Keycloak test setup for token exchange
 
-**Background.** Issue #1366 calls for testing token exchange with JWTs from a real identity provider. we need building the test that obtains real input tokens from Keycloak for both a user and a client.
+**Background** Issue #1366 calls for testing token exchange with JWTs from a real identity provider. we need building the test that obtains real input tokens from Keycloak for both a user and a client.
 
 1. **Use an isolated Keycloak realm.** The test creates a temporary realm,it obtains a user JWT by the password grant and a client account JWT  `client_credentials`, then deletes the realm. It runs without Selenium.
 2. **Use the exact audience Keystone advertises.** The test reads Keystone’s token endpoint from their document and configures Keycloak to use that URL as the sole audience of both JWTs. For example, if Keystone advertises `http://keystone-rs.local/v4/oauth2/default/token`, that exact URL must appear in `aud`. The test also checks everything about token exchange, including the issuer, usernames, distinct subject and token IDs, and short token lifetimes.
@@ -60,7 +60,7 @@ Permanent or overly long-lived service grants are dangerous because they violate
 
 ### 5. External JWT exchange — millionsouls/keystone#10
 
-**Background.** Earlier contributions supplied JWT verification, mapping, request validation, and replay-cache components. This change connects those components so an external assertion can be exchanged for a Keystone access token.
+**Background** Earlier contributions supplied JWT verification, mapping, request validation, and replay-cache components. This change connects those components so an external assertion can be exchanged for a Keystone access token.
 
 1. **Preserve native-token validation.** JWT subjects first pass through the existing native validator. External verification is attempted only when the native driver cannot decode the token. A native token that fails authorization is not retried through another trust path.
 
@@ -128,7 +128,7 @@ Run every command inside the fork clone from Setup (`millionsouls/keystone`, bra
 | --- | --- |
 | Supports | Presented token with no expiry should have a default of 15 minutes applied. |
 | Command | Instructions in: `experiments/README.md` |
-| Expected runtime |  |
+| Expected runtime | Few minutes if on first compile, otherwise seconds |
 | Expected output | All tests should pass with no failures. Ignored tests are expected as these are not relevent. |
 
 ## [4] Service Chain Expiration
@@ -136,7 +136,7 @@ Run every command inside the fork clone from Setup (`millionsouls/keystone`, bra
 | --- | --- |
 | Supports | Service delegation chain for service grants should have an expiration, and generated tokens should have an expiry. |
 | Command | Instructions in: `experiments/README.md` |
-| Expected runtime |  |
+| Expected runtime | Few minutes if on first compile, otherwise seconds |
 | Expected output | All tests should pass with no failures. Ignored tests are expected as these are not relevent. |
 ### [5] RFC 8693 token exchange validation
 
@@ -206,8 +206,7 @@ __Limitations__
 - A token without a `jti` can't be checked. Whether to reject those is not decided yet.
 - #1640 is in review and could change.
 
-### [3] RFC 8693 Token Exchange Validation (PR #1575)
-
+### [3] RFC 8693 Token Exchange Validation
 **Claims**
 
 - Keystone requires `subject_token_type`. A missing, empty, or unsupported value returns HTTP 400 with `invalid_request`.
@@ -222,7 +221,7 @@ __Limitations__
 - Clients that previously omitted `subject_token_type` must now send it.
 - PR #1575 was merged upstream.
 
-### [4] Keycloak JWT Test Setup (PR #1646)
+### [4] Keycloak JWT Test Setup
 
 **Claims**
 
@@ -236,7 +235,7 @@ __Limitations__
 - The fixture does not submit the JWTs for exchange or check the resulting identities and roles. 
 - PR #1646 is a draft and does not complete #1366.
 
-### [5] External JWT Exchange — millionsouls/keystone#10
+### [5] External JWT Exchange
 
 **Claims**
 
@@ -256,6 +255,11 @@ __Limitations__
 - The exchange handler's external-assertion profile uses its configured defaults; this change does not add per-identity-provider algorithm configuration.
 - The handler tests use mocked providers and local HTTP fixtures. The external-exchange success test inspects the minted token's claims but does not independently verify its signature.
 - The Keycloak fixture remains separate: obtaining JWTs does not demonstrate their successful exchange or downstream API acceptance.
+
+## [6] Service Grant and Token expiration
+Service grant and issued token should all be limited to an expiration time. Service grant expirations should first look to any user applied expirations, then any pre configured max_access_lifetime set by the client, then finally the default lifetime stated in `Config.oauth2` under `lib.rs`. 
+
+All oauth2 tokens, subject and applicational credentials, require an expire_at field to be listed. If none is provided, a default of 15 minutes is applied. The lifetime, whether already applied or default is used, should be: in the future, will not immediatly expire upon issuance, and will be set to the lowest possible value if given more than one valid option.
 
 ### Functionality Tests We Contributed to the Testing Suites
 #### Verify tests (#1639):
