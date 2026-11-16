@@ -44,7 +44,7 @@ cargo test -p openstack-keystone-core oauth2_client::token_exchange::tests
 cargo test -p openstack-keystone api::v4::oauth2::token::token_exchange::tests
 ```
 
-### RFC 8693 Token Exchange Validation (PR #1575)
+### Token Exchange Validation
 Run from the root of the `demo-3` fork clone. The checkout must include PR #1575.
 
 ```bash
@@ -61,7 +61,7 @@ subject token types are rejected, and that successful responses include
 depends on the branch revision.
 
 
-### External JWT Exchange — millionsouls/keystone#10
+### External JWT Exchange
 
 Run these commands from the root of the `millionsouls/keystone`
 fork checkout on branch `demo-3`, not from the documentation repository.
