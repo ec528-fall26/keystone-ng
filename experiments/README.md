@@ -61,6 +61,72 @@ subject token types are rejected, and that successful responses include
 depends on the branch revision.
 
 
+### External JWT Exchange — millionsouls/keystone#10
+
+Run these commands from the root of the `millionsouls/keystone`
+fork checkout on branch `demo-3`, not from the documentation repository.
+
+#### 1. External assertion handler
+
+```bash
+cargo test -p openstack-keystone external_assertion::tests
+```
+
+Exercises the external JWT exchange handler using mocked providers and
+local HTTP fixtures. Coverage includes:
+
+- Trusted-issuer selection and OIDC discovery/JWKS retrieval.
+- Successful signature verification, identity mapping, and token issuance.
+- Issued identity, roles, audience, mapping version, and expiry claims.
+- Rejection of untrusted issuers, invalid signatures, incorrect audiences,
+  expired assertions, and replayed assertions.
+- Failure before mapping when replay protection is unavailable.
+- Mapping failures that do not consume replay-cache capacity.
+- HTTP 503 responses when replay-cache capacity is exhausted.
+
+**Verified result:** `8 passed; 0 failed` on commit `7aab548f`.
+
+#### 2. Issued-token lifetime
+
+```bash
+cargo test -p openstack-keystone-core external_token_expiry_never_exceeds_assertion_expiry
+```
+
+Checks that the issued token expires no later than either the configured
+access-token expiry or the external assertion's expiry. It also checks
+rejection when no positive lifetime remains.
+
+**Verified result:** `1 passed; 0 failed` on commit `7aab548f`.
+
+#### 3. Replay configuration validation
+
+```bash
+cargo test -p openstack-keystone-config assertion_replay
+```
+
+Checks valid default limits and rejects invalid replay-cache bounds,
+including zero capacity and nested limits exceeding their totals.
+
+**Verified result:** `1 passed; 0 failed` on commit `7aab548f`.
+
+**Expected runtime:** Initial compilation may take several minutes.
+With dependencies already built, the verification run took approximately
+52 seconds, 24 seconds, and less than one second respectively, including
+incremental compilation. Runtime varies by machine and build cache.
+
+**Expected output:** Each command reports the matching tests as passed
+with `0 failed`. Additional test targets may report zero matching tests.
+Counts may change on later branch revisions.
+
+**Dependencies and limitations:** These tests require the Rust and system
+build dependencies described in the design document. They create their
+own test state and do not require a running Keystone server, Keycloak,
+or changes to `keystone.conf`.
+
+This experiment demonstrates unit/component behavior, not a live
+Keycloak-to-Keystone exchange. The success test inspects the issued
+token's claims but does not independently verify its signature.
+
 ## Conform with contributor and security expectations
 1. ```cargo clippy -p openstack-keystone-core --all-targets``` Catch common mistakes, optimize code, and enforce style guidelines
 2. ```cargo check -p openstack-keystone --message-format=short``` Verifies everything complies together
