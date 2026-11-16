@@ -25,7 +25,7 @@
 2. The maintainer asked for three changes in review, done in #1642. The HMAC check was a list of banned algorithms, so a new HMAC algorithm would get through. It is now a list of allowed ones (RS256/384/512, PS256/384/512, ES256/384, EdDSA). A bad list used `InvalidProfile`, whose message is about issuers and audiences, so it now has its own error, `InvalidAlgorithmList`. Tests were also added for a key of the wrong type (ES256 token with an RSA-only JWKS, RS256 token with an EC-only JWKS). The crypto library already rejects these, so no code changed. `crypto-inventory.md` is updated too.
 3. An external token is valid for a few minutes, so a copied one could be used again. The replay cache stores each accepted `jti` per domain and issuer until `exp` plus the 60 second clock skew, and refuses it a second time. When full it refuses new tokens and never deletes live entries, otherwise an attacker could flood it to push out a copied token's entry and replay it. The DPoP cache logic moved into a general `ReplayCache` that `DpopReplayCache` and the new `AssertionReplayCache` both use. The 9 existing DPoP tests are unchanged.
 
-### 3. PR 1616
+### 2. PR 1616
 While permanent tokens (those without an expiry) are possibles are not technically against RFC guidelines, they can present significant securrity risks if not handled properly. We force all tokens to have an expiry and if one come that does not have one, we apply a default limit of 15 minutes. This applies to both subject tokens and application credentials.
 
 Focusing on applications then, we move onto a service grant chain which is a type of delegation chain, two of which exist in Keystone. We focus on service grant, which is like 'giving permission in advance'.
@@ -38,7 +38,7 @@ The service (etc Cinder) redeems it with the custom `urn:openstack:params:oauth:
 Essentially, a user tells Keystone "Let this service act for me on this project, with these roles". The service then proves its identity via a SPIFFE certificate and asks Keystone for a short-lived access token. Keystone checks that the grant is still valid and that the user still has the relevant roles. The token says who the user is (sub) and which service is acting (act). The service can request another token later by redeeming the grant again. Revoking the grant prevents future redemptions, though already-issued tokens remain usable until they expire.
 
 Permanent or overly long-lived service grants are dangerous because they violate the Principle of Least Privilege. Service tokens travel extensively across internal control plane networks to facilitate inter-service communication (e.g., Nova talking to Cinder or Neutron). If an internal control plane node is compromised, or if a service token accidentally leaks into debug logs or unencrypted databases, a permanent grant gives an attacker an indefinite, unexpiring key to cloud infrastructure.
-### 4. PR #1575 — RFC 8693 token exchange validation
+### 3. PR #1575 — RFC 8693 token exchange validation
 
 **Background.** In token exchange, `subject_token_type` let Keystone know what kind of token the client is sending. `requested_token_type` let Keystone know what kind of token the client wants back. Keystone only read these fields without validating them in the past.In another hand, it did not report what type of token it had issued when a successful response occur.
 
@@ -48,7 +48,7 @@ Permanent or overly long-lived service grants are dangerous because they violate
 
 **Status.** [PR #1575](https://github.com/openstack-experimental/keystone/pull/1575) was merged upstream.
 
-### 5. PR#1646 — Keycloak test setup for token exchange
+### 4. PR#1646 — Keycloak test setup for token exchange
 
 **Background.** Issue #1366 calls for testing token exchange with JWTs from a real identity provider. we need building the test that obtains real input tokens from Keycloak for both a user and a client.
 
@@ -58,7 +58,7 @@ Permanent or overly long-lived service grants are dangerous because they violate
 4. 
 **Status.** [PR #1646](https://github.com/openstack-experimental/keystone/pull/1646) is a draft. It prepares the inputs for #1366. 
 
-### 8. External JWT exchange — millionsouls/keystone#10
+### 5. External JWT exchange — millionsouls/keystone#10
 
 **Background.** Earlier contributions supplied JWT verification, mapping, request validation, and replay-cache components. This change connects those components so an external assertion can be exchanged for a Keystone access token.
 
@@ -158,6 +158,18 @@ Run this experiment on a checkout that contains draft PR #1646.
 | Expected runtime | Depends on the build cache. |
 | Expected output | Cargo builds the `keycloak_token_exchange` test executable. |
 | Current status | Compilation passed, and a separate run confirmed that an unreachable Keystone causes a failure rather than a skip|
+
+### [7] External JWT exchange
+
+| Item | Details |
+| --- | --- |
+| Supports | External assertion verification, identity mapping, issued-token claims and lifetime, replay rejection, fail-closed behavior, and replay configuration validation. |
+| Instructions | Follow **External JWT Exchange** in [the experiments README](../experiments/README.md#external-jwt-exchange--millionsoulskeystone10). |
+| Where to run | The root of the `millionsouls/keystone` fork checkout, branch `demo-3`. |
+| Dependencies | Rust and the system build dependencies from Section 3. No running Keystone or Keycloak is required. |
+| Expected runtime | Several minutes for an initial build; cached runs are substantially faster. |
+| Expected output | All selected tests pass with `0 failed`. Verified on commit `7aab548f`: 8 handler tests, 1 token-lifetime test, and 1 configuration-validation test passed. |
+| Limitations | Uses mocked providers and local HTTP fixtures. |
 
 
 ## 5. Claims and limitations
