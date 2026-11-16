@@ -13,6 +13,7 @@
 :: From the project mentor, checks service grant chain and applies a default expiration on any service grants. This is based on a chain of if: grant has a specific expiration, client has a set max_grant_lifetime, then default_access_lifetime.
 6. [Issue](https://github.com/openstack-experimental/keystone/issues/1354) :: [PR](https://github.com/openstack-experimental/keystone/pull/1575) :: Added RFC 8693 request validation to Keystone’s token exchange endpoint. Missing, empty, or unsupported subject token types return `invalid_request`, and successful responses include `issued_token_type`. Merged.  Code diff under: src/demo-3/1575.patch
 7. [Issue](https://github.com/openstack-experimental/keystone/issues/1366) :: [PR](https://github.com/openstack-experimental/keystone/pull/1646) :: Added a test fixture for user and service account JWTs from Keycloak. The full token exchange test in k3s is still in progress.
+8. [Issues #1018 and #945](https://github.com/openstack-experimental/keystone/issues/1018) :: [PR](https://github.com/millionsouls/keystone/pull/10) :: Connected external JWT assertions to the RFC 8693 token-exchange endpoint. Keystone verifies assertions using trusted identity-provider configuration, maps their claims to an identity and authorization scope, and issues a scoped Keystone access token whose lifetime cannot exceed the assertion's expiry. The demo branch also integrates a cherry-picked snapshot of the replay cache from openstack-experimental/keystone#1640. This work was merged into the fork's `demo-3` branch; it is not an upstream merge pending OpenStack collaborator review of dependencies.
 
 ## 2. Design decisions
 ### 1. PR 1639/1642/1640
@@ -57,6 +58,23 @@ Permanent or overly long-lived service grants are dangerous because they violate
 4. 
 **Status.** [PR #1646](https://github.com/openstack-experimental/keystone/pull/1646) is a draft. It prepares the inputs for #1366. 
 
+### 8. External JWT exchange — millionsouls/keystone#10
+
+**Background.** Earlier contributions supplied JWT verification, mapping, request validation, and replay-cache components. This change connects those components so an external assertion can be exchanged for a Keystone access token.
+
+1. **Preserve native-token validation.** JWT subjects first pass through the existing native validator. External verification is attempted only when the native driver cannot decode the token. A native token that fails authorization is not retried through another trust path.
+
+2. **Trust the issuer before fetching keys.** Keystone uses the assertion's unverified `iss` only to select a configured identity provider within the requested domain. It then obtains keys from the provider's JWKS URL or OIDC discovery configuration and verifies the assertion using the shared external-assertion profile. The audience must match Keystone's exact token endpoint. Invalid assertions and DPoP-bound subject tokens are rejected.
+
+3. **Match mapping rules before recording replay state.** Verified claims are flattened and evaluated against the issuer's enabled token-exchange mapping. The mapping must resolve one authorization scope, backed by valid resource records. Unmatched assertions do not consume replay-cache capacity.
+
+4. **Record replay state before identity hydration.** After a mapping matches, Keystone records the assertion's domain, issuer, and `jti`. Only then does it hydrate the mapped identity, including federated-user creation and group synchronization where applicable, and construct a validated security context.
+
+5. **Issue a new, bounded access token.** The token contains the mapped identity, effective roles, authorization scope, and mapping ruleset version. Its expiry is the earlier of the configured access-token expiry and the assertion's expiry. Keystone signs the token and emits a successful authentication audit event. The RFC 8693 response includes `issued_token_type`; this flow does not return an ID token or refresh token.
+
+6. **Require explicit opt-in for the demo replay backend.** The demo integrates the process-local cache from openstack-experimental/keystone#1640. External exchange fails closed unless `allow_per_node_assertion_replay` is enabled. Replayed assertions are rejected; unavailable or exhausted replay protection returns HTTP 503. Cache entries are not shared across nodes and are lost on restart.
+
+**Contribution boundary.** Commit `674904e6` supplies the demo-specific replay integration and native JWT compatibility changes. Commit `13ebc8b4` cherry-picks the collaborator's replay-cache implementation. These are separate from the original `oauth2-external-jwt-exchange` work and must be revisited when the upstream replay implementation is finalized. This is a result of eagerness to develop a working end-to-end system while operating under robust review and testing requirements. 
 
 ## 3. Setup
 _Exact dependencies, versions, and hardware assumptions. Written so that someone
@@ -206,6 +224,27 @@ __Limitations__
 - The fixture does not submit the JWTs for exchange or check the resulting identities and roles. 
 - PR #1646 is a draft and does not complete #1366.
 
+### [5] External JWT Exchange — millionsouls/keystone#10
+
+**Claims**
+
+- The demo connects external JWT verification, identity mapping, replay protection, and access-token issuance.
+- Native JWT subjects retain the native validation path. Native authorization failures do not fall through to external verification.
+- Identity providers are selected by issuer within the requested domain before fetching verification keys.
+- Mapping evaluation precedes replay insertion; replay insertion precedes identity hydration.
+- Issued tokens contain mapped identity information and effective roles, and cannot outlive the external assertion.
+- External assertions require a valid expiry and non-empty `jti`.
+- Focused tests cover successful exchange and rejection paths, including replay and unavailable replay protection.
+
+**Limitations**
+
+- The replay implementation is a cherry-picked development snapshot, not a finalized upstream dependency.
+- External exchange requires explicit opt-in to process-local replay protection. Protection is neither shared across nodes nor retained across restarts.
+- Identity providers configured only with `jwt_validation_pubkeys` are not supported by this exchange path; JWKS or discovery configuration is required.
+- The exchange handler's external-assertion profile uses its configured defaults; this change does not add per-identity-provider algorithm configuration.
+- The handler tests use mocked providers and local HTTP fixtures. The external-exchange success test inspects the minted token's claims but does not independently verify its signature.
+- The Keycloak fixture remains separate: obtaining JWTs does not demonstrate their successful exchange or downstream API acceptance.
+
 ### Functionality Tests We Contributed to the Testing Suites
 #### Verify tests (#1639):
 external_profile_defaults_to_rs256_and_es256
@@ -252,6 +291,20 @@ test_purge_expired
 - `test_token_exchange_requires_subject_token_type` and `test_token_exchange_rejects_unsupported_subject_token_type` — check that the HTTP API rejects missing and unsupported types.
 - `test_token_exchange_rejects_unsupported_rfc8693_parameters` — checks rejection of unsupported request parameters at the API level.
 - `test_token_exchange_accepts_requested_output_type_and_scope` — checks that a valid request succeeds and the response reports the issued token type and scope.
+
+#### External JWT exchange tests — millionsouls/keystone#10
+
+- `issuer_extraction_only_selects_a_candidate` — checks that issuer extraction selects a candidate provider rather than establishing trust.
+- `production_handler_fails_closed_before_mapping_without_replay_cache` — checks that unavailable replay protection blocks exchange before mapping.
+- `external_exchange_verifies_maps_mints_claims_and_rejects_replay` — exercises external dispatch, verification, mapping, issued claims and expiry, then rejects reuse of the assertion.
+- `external_exchange_rejects_untrusted_issuer_before_mapping` — rejects an issuer without a trusted provider.
+- `external_exchange_rejects_bad_signatures_audiences_and_expired_tokens` — rejects invalid signatures, incorrect audiences, and expired assertions.
+- `unmatched_mapping_does_not_consume_replay_capacity` — verifies that missing mappings neither hydrate identities nor consume replay-cache entries.
+- `replay_cache_quota_errors_fail_closed` — checks that replay-capacity errors produce HTTP 503 rather than allowing exchange.
+- `identity_provider_discovery_resolves_jwks` — checks JWKS resolution through a local OIDC discovery fixture.
+- `external_token_expiry_never_exceeds_assertion_expiry` — checks both expiry ceilings and rejection when no positive lifetime remains.
+
+These tests cover the demo integration. They do not constitute a live external-identity-provider system test.
 
 #### Keycloak test setup — PR #1646 (draft)
 
