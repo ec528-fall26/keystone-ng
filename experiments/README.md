@@ -15,6 +15,81 @@ git branch --show-current
 ```
 The last command should print `demo-3`. You need Rust and `protoc` (see Setup in the design document).
 
+### Allowed Signing Algorithms
+Covers PRs #1639 and #1642 (issue #1636).
+
+```bash
+cargo test -p openstack-keystone-core --lib -- oauth2_client::verify::tests::external_profile oauth2_client::verify::tests::profile_allows_only
+```
+
+Runs the subject-token profile tests for signing algorithms. It checks that:
+
+- An external profile accepts RS256 and ES256 by default, and accepts a
+  configured list such as PS256 or EdDSA.
+- A token signed with an algorithm outside the profile's list is rejected
+  before any key is looked up.
+- HS256 tokens and `alg: none` tokens are rejected, so a public key cannot be
+  used as an HMAC secret to forge a token.
+- A profile that lists an HMAC algorithm, or lists nothing, is invalid and
+  returns `InvalidAlgorithmList`.
+- A token whose key is the wrong type for its algorithm is rejected (an ES256
+  token against an RSA-only JWKS, and an RS256 token against an EC-only JWKS).
+
+**Verified result:** `9 passed; 0 failed` on commit `7aab548f`.
+
+To run the whole verify module instead, which includes these tests:
+```bash
+cargo test -p openstack-keystone-core --lib oauth2_client::verify
+```
+**Verified result:** `65 passed; 0 failed` on commit `7aab548f`.
+
+**Expected runtime:** About 3 to 10 minutes the first time, because the core
+crate is compiled. The verified run compiled in 3 minutes 16 seconds and the
+tests then took 11 seconds. Later runs take a few seconds.
+
+**Dependencies and limitations:** Rust and `protoc`, as in the design document
+Setup. The tests build their own keys and tokens, so no Keystone server,
+Keycloak or config file is needed. The allowed list is set in code per profile,
+not per identity provider.
+
+### Replay Cache
+Covers PR #1640 (issue #1636). The same code is on `demo-3` through the
+cherry-pick in millionsouls/keystone#10.
+
+```bash
+cargo test -p openstack-keystone-core --lib replay
+```
+
+Runs every replay cache test: the general `ReplayCache`, the new
+`AssertionReplayCache` and the existing DPoP cache. It checks that:
+
+- The second use of the same `jti` from the same domain and issuer is refused.
+- The same `jti` from another domain or issuer is unaffected, and the scope
+  encoding cannot be confused (`("a", "b")` and `("ab", "")` differ).
+- An entry lives until `exp` plus the 60 second clock skew, and the `jti` is
+  accepted again after that.
+- A full cache refuses new entries instead of deleting live ones, so a flood
+  cannot push out a captured token's entry.
+- One issuer cannot use up the space of the others.
+- The 9 existing DPoP cache tests still pass unchanged.
+
+**Verified result:** `23 passed; 0 failed` on commit `7aab548f` (8 general
+cache, 6 assertion cache, 9 DPoP cache).
+
+To run only the two new modules, without the DPoP tests:
+```bash
+cargo test -p openstack-keystone-core --lib -- oauth2_client::replay::tests oauth2_client::assertion_replay::tests
+```
+**Verified result:** `14 passed; 0 failed` on commit `7aab548f`.
+
+**Expected runtime:** Under a second once the crate is built by the experiment
+above. From a clean checkout, the build takes a few minutes first.
+
+**Dependencies and limitations:** No server or config file is needed; the tests
+pass the current time in, so nothing waits on a clock. The cache is in memory
+in one process, so entries are not shared between Keystone nodes and are lost
+on restart. Size limits come from the code, not the configuration file.
+
 ### Service Grant Chain
 1. Builds the core crate and runs every unit test whose path contains service_grant. That is everything in the service_grant module, including the provider tests in service.rs. It may also pick up other tests with that string in their name, such as lifecycle hooks. It then runs the crate's doc-tests, with the same filter.
 ```
