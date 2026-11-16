@@ -108,7 +108,7 @@ cargo test -p openstack-keystone-core-types service_grant
 
 4. This builds the API-types crate with every feature enabled, then runs all of its tests and doc-tests with no filter. The --all-features flag turns on validate (the validator derives) and openapi (the utoipa::ToSchema and IntoParams derives). It tests no new behaviour. The change here is doc comments on ServiceGrant.expires_at and ServiceGrantCreate.expires_at, and the command confirms the crate still compiles with the derives that turn those comments into OpenAPI schema descriptions. Any serialization tests in the crate also run.
 ```
-cargo test -p openstack-keystone-api-types --all-features`
+cargo test -p openstack-keystone-api-types --all-features
 ```
 
 ### Token Expiry Rules
